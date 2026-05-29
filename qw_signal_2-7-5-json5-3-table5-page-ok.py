@@ -4176,9 +4176,13 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
 
 
 
-    # ⚡ PERFORMANCE: Skip heavy stats calculation on page-only navigation
-    # This is the CRITICAL FIX - stats are calculated ONLY when version changes (data reload/recalc)
-    if is_page_only_nav:
+    # ⚡ PERFORMANCE: Skip heavy table-local signal stats on page navigation and
+    # JSON load. The dedicated summary callback already computes the full
+    # all-task summaries from golden-store-version, so the first 300-row page
+    # should not wait behind duplicate stats work.
+    version_changed = prev_golden_version is not None and current_golden_version != prev_golden_version
+    use_cached_signal_stats = is_page_only_nav or (version_changed and triggered_id != "analysis-complete-trigger") or triggered_id == "golden-store-version"
+    if use_cached_signal_stats:
         # Return minimal stats for page navigation (no heavy iteration over all tasks)
         # But we still need to show basic stats from ALL tasks (consistent across pages)
         total_tasks = len(tasks)
@@ -6929,24 +6933,32 @@ def load_tasks_from_json(n, filepath):
             skipped += 1
             
     # 🔧 ATOMIC & THREAD-SAFE MEMORY UPDATE
+    # Keep Golden Store in sync with loaded JSON so the paginated table can render
+    # page 1 directly from its fast display source instead of falling back to tm.tasks
+    # or reusing stale rows from a previous load.
+    global golden_task_store_data, golden_store_version, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     with tm.lock:
         tm.tasks.clear()
         tm.tasks.update(new_tasks)
+        golden_task_store_data = list(tm.tasks.values())
 
     # 🔧 CRITICAL: Reset Version to Force Stats & Table Re-render
-    # Since we split the callback, we just increment the version to trigger both new callbacks
-    global golden_store_version
+    # Since we split the callback, increment the version store to trigger both new callbacks.
     golden_store_version += 1
+    _page_html_cache.clear()
+    _cached_golden_version = None
+    cached_signal_stats_html = None
+    cached_small_stats_data = None
+    stats_cache_version = None
         
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
     if skipped > 0:
         msg += f" | ⚠️ Skipped {skipped} corrupted tasks"
-    # 🔧 Increment trigger to force UI refresh after load
-    import time
-    trigger_val = int(time.time()) 
-    
-    return msg, loaded_ids, count, 0, trigger_val, golden_store_version
+    # golden-store-version is the table/stat refresh trigger. Avoid also bumping
+    # analysis-complete-trigger here because that path performs heavier
+    # recalculation-oriented work before the first page can paint on older Macs.
+    return msg, loaded_ids, count, 0, dash.no_update, golden_store_version
 
 @app.callback(
     Output("save-load-status", "children", allow_duplicate=True),
@@ -6961,8 +6973,15 @@ def manual_clear_all(n):
     global STOP_REQUESTED
     STOP_REQUESTED = True  # 🔧 Safely halt background recalc (sync with STOP_REQUESTED)
     recalc_bg["stop_flag"] = True  # 🔧 Also set recalc_bg flag for UI
+    global golden_task_store_data, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     with tm.lock:
         tm.tasks.clear()
+        golden_task_store_data = []
+    _page_html_cache.clear()
+    _cached_golden_version = None
+    cached_signal_stats_html = None
+    cached_small_stats_data = None
+    stats_cache_version = None
     return "🗑️ All tasks cleared.", [], 0, 0
 
 @app.callback(
