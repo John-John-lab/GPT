@@ -3054,7 +3054,7 @@ def render_tab(tab):
                 html.Div([
                     dcc.Checklist(
                         id="hide-logs-checkbox",
-                        options=[{"label": "Hide all logs from the log field", "value": "hide"}],
+                        options=[{"label": "Hide detailed logs in task table (faster)", "value": "hide"}],
                         value=["hide"]  # Default: checked
                     ),
                 ], style={"marginBottom": "10px"}),
@@ -3973,9 +3973,10 @@ def cache_task_page(cache_key, page):
     Input("golden-store-version", "data"),
     Input("recalc-lock-store", "data"),
     Input("analysis-complete-trigger", "data"),  # 🔧 NEW: Trigger UI refresh after recalculation completes
+    Input("hide-logs-checkbox", "value"),  # UI-only: live toggle for table log rendering
     prevent_initial_call=False
 )
-def update_task_table_only(current_page, version, lock_state, analysis_trigger):
+def update_task_table_only(current_page, version, lock_state, analysis_trigger, hide_logs_value):
     """Render task table ONLY. Uses aggressive caching to skip HTML generation on page changes."""
     global golden_task_store_data, golden_store_version, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     
@@ -4048,8 +4049,13 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
     print(f"[TRACE] ✂️ Sliced tasks [{start_idx}:{end_idx}] → {len(visible_tasks)} visible")
     timer.check(f"Step 2: Pagination Slice")
 
-    # ⚡ CRITICAL FIX: Cache MUST use the normalized page and version in key to avoid stale data.
-    cache_key = f"page_{current_page}_v{current_golden_version}"
+    # UI-only table log toggle. Checked means keep table rows lightweight.
+    # This does not modify task.log, JSON, or the Disable event logs processing flag.
+    show_table_logs = "hide" not in (hide_logs_value or ["hide"])
+    log_cache_mode = "logs_on" if show_table_logs else "logs_off"
+
+    # ⚡ CRITICAL FIX: Cache MUST use the normalized page, version, and log display mode.
+    cache_key = f"page_{current_page}_v{current_golden_version}_{log_cache_mode}"
 
     # Return cached page if available (INSTANT - no HTML generation)
     cached_page = get_cached_task_page(cache_key)
@@ -4139,7 +4145,7 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
     # Keep this presentation-only: it formats fields that are already present on tasks.
     print(f"[TRACE] 🚀 Starting table HTML generation for {len(visible_tasks)} tasks using optimized HTML string renderer...")
     t_table_start = time.time()
-    table_html, row_count = render_task_table_html(visible_tasks)
+    table_html, row_count = render_task_table_html(visible_tasks, show_table_logs=show_table_logs)
     table_elapsed = time.time() - t_table_start
     per_row_ms = (table_elapsed / row_count * 1000) if row_count else 0
     print(f"[TRACE] ✓ Generated table HTML for {row_count} rows in {table_elapsed:.2f}s ({per_row_ms:.1f}ms per row) - USING RAW HTML STRINGS")
@@ -4458,15 +4464,18 @@ def render_task_table_header_html():
     return TASK_TABLE_HEADER_HTML
 
 
-def render_task_table_html(visible_tasks):
+def render_task_table_html(visible_tasks, show_table_logs=False):
     """Render one already-sliced task-table page as raw HTML plus row count.
 
     This helper is intentionally presentation-only: it receives the 300-row page
     slice from the callback and only formats fields that already exist on each
     task, preserving the Golden Store/data-flow and calculation logic.
+    The show_table_logs flag is a UI-only display mode; it never changes saved logs.
     """
     row_count = len(visible_tasks)
-    body_html = "<tbody>" + "".join(render_task_table_row(t) for t in visible_tasks) + "</tbody>"
+    body_html = "<tbody>" + "".join(
+        render_task_table_row(t, show_table_logs=show_table_logs) for t in visible_tasks
+    ) + "</tbody>"
     table_html = (
         '<table style="width:100%;border-collapse:collapse">'
         + render_task_table_header_html()
@@ -4475,7 +4484,7 @@ def render_task_table_html(visible_tasks):
     )
     return table_html, row_count
 
-def render_task_table_row(t):
+def render_task_table_row(t, show_table_logs=False):
     """Render a single task row for the table. Returns RAW HTML STRING (<tr>...</tr>) for performance."""
     # Extract and format display variables from task attributes
     direction_display = t.signal_direction if t.signal_direction else '-'
@@ -4499,13 +4508,18 @@ def render_task_table_row(t):
     impulse_count = sum(1 for sig in t.strategy_signals if sig.get('type') == 'impulse')
     impulse_display = str(impulse_count)
     
-    # Format log display based on hide_logs setting - RETURN AS TEXT FOR HTML STRING
-    if t.hide_logs:
-        log_html = '<span style="color:#888;font-style:italic;font-size:12px">Logs are hidden</span>'
+    # Format log display for the table only. When hidden, do not join/pass full
+    # task logs into row HTML; this keeps the 300-row page lightweight.
+    log_count = len(t.log) if getattr(t, "log", None) else 0
+    if not show_table_logs:
+        log_html = (
+            '<span style="color:#888;font-style:italic;font-size:12px">'
+            f'Logs hidden — {log_count} lines'
+            '</span>'
+        )
     else:
-        log_text = "\n".join(t.log) if t.log else "No logs yet..."
-        # Escape HTML special characters in log text
         import html as html_lib
+        log_text = "\n".join(t.log) if t.log else "No logs yet..."
         log_escaped = html_lib.escape(log_text)
         log_html = f'<div style="width:100%;max-height:100px;min-height:50px;font-family:monospace;font-size:11px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word;padding:4px;border:1px solid #ddd;border-radius:3px;background-color:#fafafa">{log_escaped}</div>'
     
