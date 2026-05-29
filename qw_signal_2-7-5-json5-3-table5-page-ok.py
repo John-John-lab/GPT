@@ -2667,6 +2667,7 @@ app.layout = html.Div([
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
+    dcc.Store(id="volume-visible-store", data=False),  # default: Volume hidden
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
@@ -2748,6 +2749,16 @@ app.layout = html.Div([
                                 "cursor": "pointer",
                                 "fontSize": "14px",
                                 "minWidth": "100px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Toggle Volume", id="toggle-volume-btn", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "8px 16px",
+                                "cursor": "pointer",
+                                "fontSize": "14px",
+                                "minWidth": "120px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Strategy", id="toggle-strategy-btn", style={
@@ -5355,6 +5366,15 @@ def toggle_rsi(n_clicks, current):
     return not current
 
 @app.callback(
+    Output("volume-visible-store", "data"),
+    Input("toggle-volume-btn", "n_clicks"),
+    State("volume-visible-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_volume(n_clicks, current):
+    return not current
+
+@app.callback(
     Output("strategy-visible-store", "data"),
     Input("toggle-strategy-btn", "n_clicks"),
     State("strategy-visible-store", "data"),
@@ -5677,6 +5697,7 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Output("task-chart", "figure"),
     Input("chart-task-id", "data"),
     Input("rsi-visible-store", "data"),
+    Input("volume-visible-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
@@ -5685,7 +5706,7 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -5721,6 +5742,35 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         return rsi
+
+    has_volume = 'volume' in df.columns
+    if volume_visible and has_volume:
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+
+    def add_main_candles(target_fig):
+        target_fig.add_trace(go.Candlestick(
+            x=df['x'], open=df['open'], high=df['high'],
+            low=df['low'], close=df['close'], name="OHLC",
+            customdata=df[['close', 'timestamp']].values,
+            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+        ), row=1, col=1)
+        # Invisible close-price points make the Measure tool reliable because
+        # candlestick clickData can omit a usable y/price value.
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df['close'], mode='markers',
+            name='_measure_click_points', showlegend=False, hoverinfo='skip',
+            marker=dict(size=18, color='rgba(0,0,0,0)')
+        ), row=1, col=1)
+
+    def add_volume_trace(target_fig, row, title="Volume"):
+        colors = np.where(df['close'] >= df['open'], '#26a69a', '#ef5350')
+        target_fig.add_trace(go.Bar(
+            x=df['x'], y=df['volume'], name="Volume",
+            marker_color=colors, showlegend=False,
+            hovertemplate='Volume: %{y:,.0f}<extra></extra>'
+        ), row=row, col=1)
+        target_fig.update_yaxes(title_text=title, row=row, col=1)
+
     # Low-spec chart cache: compute RSI once per period view
     cache_key = (start_ms, end_ms)
     if cache_key not in task._chart_cache:
@@ -5730,23 +5780,13 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
     else:
         df = task._chart_cache[cache_key]
     # Create figure
-    if rsi_visible:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.7, 0.3])
-        # Candlestick
-        fig.add_trace(go.Candlestick(
-            x=df['x'], open=df['open'], high=df['high'],
-            low=df['low'], close=df['close'], name="OHLC",
-            customdata=df[['close', 'timestamp']].values,
-            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
-        ), row=1, col=1)
-        # Invisible close-price points make the Measure tool reliable because
-        # candlestick clickData can omit a usable y/price value.
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=df['close'], mode='markers',
-            name='_measure_click_points', showlegend=False, hoverinfo='skip',
-            marker=dict(size=18, color='rgba(0,0,0,0)')
-        ), row=1, col=1)
+    volume_enabled = bool(volume_visible and has_volume)
+    if rsi_visible and volume_enabled:
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            vertical_spacing=0.04, row_heights=[0.62, 0.20, 0.18]
+        )
+        add_main_candles(fig)
         # RSI line
         fig.add_trace(go.Scatter(
             x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
@@ -5758,32 +5798,52 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
             name='_spike_helper_rsi', showlegend=False, hoverinfo='skip',
             line=dict(width=1, color='rgba(0,0,0,0.01)')
         ), row=2, col=1)
-        # RSI levels
         fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
         fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
         fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
+        add_volume_trace(fig, row=3)
+    elif rsi_visible:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.05, row_heights=[0.7, 0.3])
+        add_main_candles(fig)
+        # RSI line
+        fig.add_trace(go.Scatter(
+            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
+            line=dict(color='purple', width=1.5), connectgaps=True
+        ), row=2, col=1)
+        # Helper trace on RSI (ensures hover line works – kept for consistency)
+        fig.add_trace(go.Scatter(
+            x=df['x'], y=[50]*len(df), mode='lines',
+            name='_spike_helper_rsi', showlegend=False, hoverinfo='skip',
+            line=dict(width=1, color='rgba(0,0,0,0.01)')
+        ), row=2, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
+    elif volume_enabled:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.05, row_heights=[0.72, 0.28])
+        add_main_candles(fig)
+        add_volume_trace(fig, row=2)
     else:
         fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
-        fig.add_trace(go.Candlestick(
-            x=df['x'], open=df['open'], high=df['high'],
-            low=df['low'], close=df['close'], name="OHLC",
-            customdata=df[['close', 'timestamp']].values,
-            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
-        ))
-        # Invisible close-price points make the Measure tool reliable because
-        # candlestick clickData can omit a usable y/price value.
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=df['close'], mode='markers',
-            name='_measure_click_points', showlegend=False, hoverinfo='skip',
-            marker=dict(size=18, color='rgba(0,0,0,0)')
-        ), row=1, col=1)
-        # Helper trace on main chart (ensures hover line works – kept)
-        y_mid = (df['high'].max() + df['low'].min()) / 2
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=[y_mid]*len(df), mode='lines',
-            name='_spike_helper_main', showlegend=False, hoverinfo='skip',
-            line=dict(width=1, color='rgba(0,0,0,0.01)')
-        ), row=1, col=1)
+        add_main_candles(fig)
+
+    if volume_visible and not has_volume:
+        fig.add_annotation(
+            text="Volume data is not available in this parquet file.",
+            xref="paper", yref="paper", x=0.5, y=0.02,
+            showarrow=False, bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#999", font=dict(color="#555", size=12)
+        )
+
+    # Helper trace on main chart (ensures hover line works – kept)
+    y_mid = (df['high'].max() + df['low'].min()) / 2
+    fig.add_trace(go.Scatter(
+        x=df['x'], y=[y_mid]*len(df), mode='lines',
+        name='_spike_helper_main', showlegend=False, hoverinfo='skip',
+        line=dict(width=1, color='rgba(0,0,0,0.01)')
+    ), row=1, col=1)
     # Signal level
     signal_price = task.signal_price
     fig.add_hline(y=signal_price, line_dash="dash", line_color="yellow",
@@ -5901,7 +5961,7 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
         hovermode="x unified",
         clickmode="event+select",
         dragmode="pan",
-        height=700 if rsi_visible else 500,
+        height=780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500),
         margin=dict(l=50, r=50, t=50, b=50)
     )
     # X-axis tick format
