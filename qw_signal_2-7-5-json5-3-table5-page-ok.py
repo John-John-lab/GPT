@@ -2695,6 +2695,16 @@ app.layout = html.Div([
                                 "minWidth": "100px",
                                 "whiteSpace": "nowrap"
                             }),
+                            html.Button("Clear Measure", id="clear-measure-btn", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "8px 16px",
+                                "cursor": "pointer",
+                                "fontSize": "14px",
+                                "minWidth": "110px",
+                                "whiteSpace": "nowrap"
+                            }),
                             html.Button("Toggle Impulses", id="toggle-impulses-btn", style={
                                 "background": "transparent",
                                 "color": "black",
@@ -2724,7 +2734,11 @@ app.layout = html.Div([
                             }),
                         ]
                     ),
-                    dcc.Graph(id="task-chart", style={"flex": "1", "minHeight": "0"}),
+                    dcc.Graph(
+                        id="task-chart",
+                        style={"flex": "1", "minHeight": "0"},
+                        config={"scrollZoom": True, "displaylogo": False}
+                    ),
                     html.Div(id="measure-hint", style={"color": "#333", "fontSize": "12px", "textAlign": "center", "marginTop": "5px"}),
                     html.Div(id="measure-result", style={"color": "black", "marginTop": "10px", "textAlign": "center", "fontSize": "14px"})
                 ]
@@ -5186,32 +5200,135 @@ def toggle_measure(n_clicks, current):
     return not current
 
 @app.callback(
+    Output("toggle-measure-btn", "children"),
+    Output("toggle-measure-btn", "style"),
+    Input("measure-mode-store", "data"),
+    prevent_initial_call=False
+)
+def update_measure_button(active):
+    base_style = {
+        "background": "#e3f2fd" if active else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if active else "1px solid black",
+        "padding": "8px 16px",
+        "cursor": "pointer",
+        "fontSize": "14px",
+        "minWidth": "100px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if active else "normal"
+    }
+    return ("📏 Measuring" if active else "Measure"), base_style
+
+def _extract_measure_point(click_data):
+    """Return {'x': ..., 'y': ...} from Plotly clickData.
+
+    Plotly candlestick clicks do not consistently expose a `y` key.  The chart
+    therefore also adds an invisible close-price scatter trace, and this parser
+    accepts both normal `y` clicks and candlestick/customdata close values.
+    """
+    if not click_data or not click_data.get('points'):
+        return None
+    point = click_data['points'][0]
+    x_val = point.get('x')
+    y_val = point.get('y')
+
+    if y_val is None:
+        if point.get('close') is not None:
+            y_val = point.get('close')
+        else:
+            custom = point.get('customdata')
+            if isinstance(custom, (list, tuple)) and custom:
+                y_val = custom[0]
+            elif isinstance(custom, dict):
+                y_val = custom.get('close')
+
+    if x_val is None or y_val is None:
+        return None
+
+    try:
+        y_val = float(y_val)
+    except (TypeError, ValueError):
+        return None
+    return {"x": x_val, "y": y_val}
+
+def _format_measure_time_delta(first_x, second_x, timeframe=None):
+    try:
+        first_ts = pd.to_datetime(first_x, utc=True)
+        second_ts = pd.to_datetime(second_x, utc=True)
+        delta = second_ts - first_ts
+        total_seconds = abs(delta.total_seconds())
+    except Exception:
+        return "time n/a", "bars n/a"
+
+    if total_seconds < 60:
+        time_text = f"{total_seconds:.0f}s"
+    elif total_seconds < 3600:
+        time_text = f"{total_seconds / 60:.1f}m"
+    elif total_seconds < 86400:
+        time_text = f"{total_seconds / 3600:.2f}h"
+    else:
+        time_text = f"{total_seconds / 86400:.2f}d"
+
+    bars_text = "bars n/a"
+    interval_ms = INTERVAL_MS.get(timeframe) if timeframe else None
+    if interval_ms:
+        bars = total_seconds * 1000 / interval_ms
+        bars_text = f"{bars:.1f} candles"
+    return time_text, bars_text
+
+@app.callback(
     Output("measure-points-store", "data"),
     Output("measure-result-store", "data"),
     Input("task-chart", "clickData"),
     State("measure-mode-store", "data"),
     State("measure-points-store", "data"),
+    State("chart-task-id", "data"),
     prevent_initial_call=True
 )
-def capture_click(clickData, measure_mode, points):
+def capture_click(clickData, measure_mode, points, task_id):
     if not measure_mode or not clickData:
         return dash.no_update, dash.no_update
+
+    clicked = _extract_measure_point(clickData)
+    if clicked is None:
+        return dash.no_update, {
+            "text": "📏 Could not read that candle price. Try clicking near the candle body/close marker.",
+            "first": None,
+            "second": None
+        }
+
+    points = points or {"first": None, "second": None}
+
+    # First click, or start a fresh measurement after a completed one.
+    if points.get('first') is None or points.get('second') is not None:
+        result = {
+            "text": f"📍 First point selected at {clicked['y']:.6g}. Click the second candle to measure price %, time, and candle distance.",
+            "first": clicked,
+            "second": None
+        }
+        return {"first": clicked, "second": None}, result
+
+    first = points['first']
+    second = clicked
     try:
-        x_val = clickData['points'][0]['x']
-        y_val = clickData['points'][0]['y']
-        if points['first'] is None:
-            # First click
-            return {"first": {"x": x_val, "y": y_val}, "second": None}, None
-        else:
-            # Second click
-            first = points['first']
-            second = {"x": x_val, "y": y_val}
-            price_diff = second['y'] - first['y']
-            pct_change = (price_diff / first['y']) * 100
-            result = f"📏 Δ Price: {price_diff:+.4f} ({pct_change:+.2f}%)"
-            return {"first": None, "second": None}, result
+        price_diff = second['y'] - first['y']
+        pct_change = (price_diff / first['y']) * 100 if first['y'] else 0
     except Exception:
         return dash.no_update, dash.no_update
+
+    task = tm.get_task(task_id) if task_id else None
+    timeframe = task.timeframe if task else None
+    time_text, bars_text = _format_measure_time_delta(first['x'], second['x'], timeframe)
+    result = {
+        "text": f"📏 Δ Price: {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
+        "first": first,
+        "second": second,
+        "price_diff": price_diff,
+        "pct_change": pct_change,
+        "time_text": time_text,
+        "bars_text": bars_text
+    }
+    return {"first": first, "second": second}, result
 
 @app.callback(
     Output("measure-points-store", "data", allow_duplicate=True),
@@ -5225,11 +5342,22 @@ def reset_measure_on_mode_exit(mode):
     return dash.no_update, dash.no_update
 
 @app.callback(
-    Output("measure-result", "children"),
-    Input("measure-result-store", "data"),
+    Output("measure-points-store", "data", allow_duplicate=True),
+    Output("measure-result-store", "data", allow_duplicate=True),
+    Input("clear-measure-btn", "n_clicks"),
     prevent_initial_call=True
 )
+def clear_measure(_):
+    return {"first": None, "second": None}, None
+
+@app.callback(
+    Output("measure-result", "children"),
+    Input("measure-result-store", "data"),
+    prevent_initial_call=False
+)
 def show_measure_result(result):
+    if isinstance(result, dict):
+        return result.get("text", "")
     if result:
         return result
     return ""
@@ -5237,12 +5365,12 @@ def show_measure_result(result):
 @app.callback(
     Output("measure-hint", "children"),
     Input("measure-mode-store", "data"),
-    prevent_initial_call=True
+    prevent_initial_call=False
 )
 def measure_hint(active):
     if active:
-        return "📏 Measure mode active: click two points on the chart to measure price difference."
-    return ""
+        return "📏 Measure mode active: click one candle, then another. The chart measures close-price %, elapsed time, and candle count."
+    return "Click Measure to enable the TradingView-style ruler."
 
 # ----- Strategy details modal callbacks (using data-action pattern) -----
 @app.callback(
@@ -5350,9 +5478,12 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
+    Input("measure-mode-store", "data"),
+    Input("measure-points-store", "data"),
+    Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, events_visible):
+def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -5404,7 +5535,15 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
         fig.add_trace(go.Candlestick(
             x=df['x'], open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
+            customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+        ), row=1, col=1)
+        # Invisible close-price points make the Measure tool reliable because
+        # candlestick clickData can omit a usable y/price value.
+        fig.add_trace(go.Scatter(
+            x=df['x'], y=df['close'], mode='markers',
+            name='_measure_click_points', showlegend=False, hoverinfo='skip',
+            marker=dict(size=18, color='rgba(0,0,0,0)')
         ), row=1, col=1)
         # RSI line
         fig.add_trace(go.Scatter(
@@ -5426,8 +5565,16 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
         fig.add_trace(go.Candlestick(
             x=df['x'], open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
+            customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
         ))
+        # Invisible close-price points make the Measure tool reliable because
+        # candlestick clickData can omit a usable y/price value.
+        fig.add_trace(go.Scatter(
+            x=df['x'], y=df['close'], mode='markers',
+            name='_measure_click_points', showlegend=False, hoverinfo='skip',
+            marker=dict(size=18, color='rgba(0,0,0,0)')
+        ), row=1, col=1)
         # Helper trace on main chart (ensures hover line works – kept)
         y_mid = (df['high'].max() + df['low'].min()) / 2
         fig.add_trace(go.Scatter(
@@ -5507,12 +5654,51 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
                     text=sig.get('extra_info', ''),
                     hoverinfo='text+y'
                 ), row=1, col=1)
+    # TradingView-style measurement overlay: first click marker, then a ruler
+    # line with a compact result label after the second click.
+    measure_first = None
+    measure_second = None
+    measure_text = ""
+    if isinstance(measure_result, dict):
+        measure_first = measure_result.get('first')
+        measure_second = measure_result.get('second')
+        measure_text = measure_result.get('text', '')
+    if isinstance(measure_points, dict):
+        measure_first = measure_points.get('first') or measure_first
+        measure_second = measure_points.get('second') or measure_second
+
+    if measure_mode and measure_first and not measure_second:
+        fig.add_trace(go.Scatter(
+            x=[measure_first['x']], y=[measure_first['y']],
+            mode='markers', showlegend=False, name='Measure start',
+            marker=dict(size=12, color='#1976d2', symbol='circle', line=dict(width=2, color='white')),
+            hovertemplate='Measure start<br>%{x}<br>%{y}<extra></extra>'
+        ), row=1, col=1)
+    elif measure_first and measure_second:
+        fig.add_trace(go.Scatter(
+            x=[measure_first['x'], measure_second['x']],
+            y=[measure_first['y'], measure_second['y']],
+            mode='lines+markers', showlegend=False, name='Measure',
+            line=dict(color='#1976d2', width=2, dash='dot'),
+            marker=dict(size=10, color='#1976d2', line=dict(width=2, color='white')),
+            hovertemplate='Measure<br>%{x}<br>%{y}<extra></extra>'
+        ), row=1, col=1)
+        short_text = measure_text.replace('📏 ', '')
+        fig.add_annotation(
+            x=measure_second['x'], y=measure_second['y'], xref='x', yref='y',
+            text=short_text, showarrow=True, arrowhead=2, ax=40, ay=-40,
+            bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
+            font=dict(color='white', size=11)
+        )
+
     # Layout (light theme)
     fig.update_layout(
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         xaxis_rangeslider_visible=False,
         template="plotly_white",
         hovermode="x unified",
+        clickmode="event+select",
+        dragmode="pan",
         height=700 if rsi_visible else 500,
         margin=dict(l=50, r=50, t=50, b=50)
     )
