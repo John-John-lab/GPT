@@ -356,6 +356,72 @@ class PerfTimer:
             print(f"[TRACE] ✅ END: {self.label} ({total:.4f}s)")
         return self
 
+
+# ---------- Task field catalog (documentation-first; preserves current behavior) ----------
+# These groups make JSON/recalc changes safer by naming the field types in one
+# place. They do not change formulas, event detection, downloading, validation,
+# or the current broad JSON snapshot behavior.
+STATIC_TASK_FIELDS = {
+    "task_id", "symbols", "timeframe", "mode", "start_date", "end_date",
+    "overwrite", "price_continuity_check", "signal_time", "signal_price",
+    "signal_symbol", "signal_direction", "analyze_beyond", "enable_strategy",
+    "enable_impulse", "pre_buffer_minutes",
+}
+
+DERIVED_TASK_FIELDS = {
+    "first_event_time", "first_event_type", "first_event_is_pin", "first_event_close",
+    "price_change_pct", "reached_level", "reversed_direction", "events",
+    "strategy_signals", "strategy_log_summary", "strategy_confidence",
+    "hit_1", "hit_1_5", "hit_2",
+    "first_hit_1_expected", "first_hit_1_5_expected", "first_hit_2_expected",
+    "first_hit_1_expected_time", "first_hit_1_5_expected_time", "first_hit_2_expected_time",
+    "first_hit_1_opposite", "first_hit_1_5_opposite", "first_hit_2_opposite",
+    "first_hit_1_opposite_time", "first_hit_1_5_opposite_time", "first_hit_2_opposite_time",
+    "drawdown_before_level", "drawdown_before_level_time",
+    "drawdown_before_1pct", "drawdown_before_1pct_time",
+    "drawdown_before_1_5pct", "drawdown_before_1_5pct_time",
+    "drawdown_before_2pct", "drawdown_before_2pct_time",
+    "max_adverse_move_pct", "max_adverse_time",
+    "max_expected_move_pct", "max_expected_time",
+    "max_adverse_before_return_pct", "max_adverse_before_return_time",
+    "returned_to_signal", "max_adverse_sgnl_pct", "max_adverse_sgnl_time",
+    "max_adverse_before_return_sgnl_pct", "max_adverse_before_return_sgnl_time",
+    "returned_to_sgnl", "max_expected_sgnl_pct", "max_expected_sgnl_time",
+}
+
+STATE_TASK_FIELDS = {
+    "status", "progress", "log", "total_candles", "downloaded_candles",
+    "paused", "last_ts", "last_count",
+}
+
+UI_TASK_FIELDS = {"log_events", "hide_logs"}
+
+# Current JSON/recalc exclusion list. Keep this exact unless intentionally changing
+# backward compatibility or runtime persistence behavior.
+RUNTIME_TASK_FIELDS = {
+    "stop_event", "pause_event", "state_lock", "raw_batches",
+    "_chart_cache", "symbol_ranges",
+}
+
+TASK_DATETIME_FIELDS = {
+    "start_date", "end_date", "first_event_time", "max_adverse_time",
+    "max_expected_time", "max_adverse_sgnl_time", "max_expected_sgnl_time",
+    "max_adverse_before_return_time", "max_adverse_before_return_sgnl_time",
+    "drawdown_before_level_time", "drawdown_before_1pct_time",
+    "drawdown_before_1_5pct_time", "drawdown_before_2pct_time",
+}
+
+TASK_INIT_FIELDS = (
+    "task_id", "symbols", "timeframe", "mode", "start_date", "end_date",
+    "overwrite", "price_continuity_check", "signal_time", "signal_price",
+    "signal_symbol", "signal_direction", "analyze_beyond", "enable_strategy",
+    "enable_impulse", "pre_buffer_minutes", "log_events", "hide_logs",
+)
+
+SERIALIZED_TASK_FIELDS = (
+    STATIC_TASK_FIELDS | DERIVED_TASK_FIELDS | STATE_TASK_FIELDS | UI_TASK_FIELDS
+)
+
 # 🔧 GOLDEN STORE: Pre-processed task data cache
 golden_task_store_data = None
 golden_store_version = 0
@@ -6794,7 +6860,7 @@ def save_tasks_to_json(n, filename):
             # Iterate through all attributes, excluding non-serializable threading objects
             for k, v in t.__dict__.items():
                 # Skip threading/synchronization objects and internal caches
-                if k in ('stop_event', 'pause_event', 'state_lock', 'raw_batches', '_chart_cache', 'symbol_ranges'):
+                if k in RUNTIME_TASK_FIELDS:
                     continue
                 
                 # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
@@ -6851,11 +6917,7 @@ def load_tasks_from_json(n, filepath):
     seen_ids = set()  # P3 IMPROVEMENT: Track unique task IDs
     
     # 🔧 DATETIME FIELDS that need restoration on load
-    datetime_fields = {'start_date', 'end_date', 'first_event_time', 'max_adverse_time',
-                       'max_expected_time', 'max_adverse_sgnl_time', 'max_expected_sgnl_time',
-                       'max_adverse_before_return_time', 'max_adverse_before_return_sgnl_time',
-                       'drawdown_before_level_time', 'drawdown_before_1pct_time', 
-                       'drawdown_before_1_5pct_time', 'drawdown_before_2pct_time'}
+    datetime_fields = TASK_DATETIME_FIELDS
     
     # 🔧 Use global _parse_timestamp for UTC-aware datetime parsing
     # This ensures all timestamps are converted to UTC-aware datetime objects
@@ -6875,10 +6937,7 @@ def load_tasks_from_json(n, filepath):
             seen_ids.add(task_id_candidate)
             
             # 1. Initialize Task with Core Attributes
-            init_kwargs = {k: d.get(k) for k in ['task_id', 'symbols', 'timeframe', 'mode', 'start_date', 'end_date',
-                'overwrite', 'price_continuity_check', 'signal_time', 'signal_price',
-                'signal_symbol', 'signal_direction', 'analyze_beyond', 'enable_strategy',
-                'enable_impulse', 'pre_buffer_minutes', 'log_events', 'hide_logs']}
+            init_kwargs = {k: d.get(k) for k in TASK_INIT_FIELDS}
 
             # Parse Datetimes for Init
             for k in datetime_fields:
@@ -6977,7 +7036,7 @@ def recalc_table_flags(n):
         d = {}
         for k, v in t.__dict__.items():
             # Skip non-serializable objects (locks, events, caches)
-            if k in ('stop_event', 'pause_event', 'state_lock', 'raw_batches', '_chart_cache', 'symbol_ranges'):
+            if k in RUNTIME_TASK_FIELDS:
                 continue
             # Handle datetime objects
             if isinstance(v, (datetime, pd.Timestamp)):
@@ -7056,11 +7115,7 @@ def _run_recalc_background(tasks_list):
     sys.stdout.flush()
     
     # 🔧 DATETIME FIELDS that need restoration from ISO strings
-    datetime_fields = {'start_date', 'end_date', 'first_event_time', 'max_adverse_time',
-                       'max_expected_time', 'max_adverse_sgnl_time', 'max_expected_sgnl_time',
-                       'max_adverse_before_return_time', 'max_adverse_before_return_sgnl_time',
-                       'drawdown_before_level_time', 'drawdown_before_1pct_time', 
-                       'drawdown_before_1_5pct_time', 'drawdown_before_2pct_time'}
+    datetime_fields = TASK_DATETIME_FIELDS
     
     # 🔧 Use global _parse_timestamp for UTC-aware datetime parsing
     # (Defined at module level for consistency across save/load operations)
@@ -7090,10 +7145,7 @@ def _run_recalc_background(tasks_list):
             
             if task is None:
                 # Reconstruct task from dictionary
-                init_kwargs = {k: t_dict.get(k) for k in ['task_id', 'symbols', 'timeframe', 'mode', 'start_date', 'end_date',
-                    'overwrite', 'price_continuity_check', 'signal_time', 'signal_price',
-                    'signal_symbol', 'signal_direction', 'analyze_beyond', 'enable_strategy',
-                    'enable_impulse', 'pre_buffer_minutes', 'log_events', 'hide_logs']}
+                init_kwargs = {k: t_dict.get(k) for k in TASK_INIT_FIELDS}
                 
                 # Parse Datetimes
                 for k in datetime_fields:
