@@ -2434,6 +2434,15 @@ document.addEventListener('click', function(e) {
     }
     
     if (!button) return;
+
+    if (button.id === 'close-chart-modal') {
+        applyChartRowHighlight(null);
+        return;
+    }
+    if (button.id === 'prev-chart-btn' || button.id === 'next-chart-btn') {
+        highlightAdjacentVisibleChartRow(button.id === 'prev-chart-btn' ? 'prev' : 'next');
+        return;
+    }
     
     try {
         // P1 IMPROVEMENT: Use data attributes instead of JSON parsing for better reliability
@@ -2474,6 +2483,7 @@ document.addEventListener('click', function(e) {
                     // Set the appropriate hidden store to trigger Dash callback
                     // Use CustomEvent to trigger Dash updates (Dash 4.x compatible)
                     if (actionType === 'chart') {
+                        applyChartRowHighlight(taskId);
                         pushDashStore('chart-button-trigger', {task_id: taskId, action: actionType}, 'dash-chart-trigger');
                     } else if (actionType === 'details') {
                         pushDashStore('strategy-details-trigger', {task_id: taskId, action: actionType}, 'dash-details-trigger');
@@ -2563,12 +2573,44 @@ document.addEventListener('dblclick', function(e) {
         hiddenColumns.add(colIndex);
     }
 });
+function cssEscapeValue(value) {
+    const strValue = String(value);
+    if (window.CSS && typeof window.CSS.escape === 'function') {
+        return window.CSS.escape(strValue);
+    }
+    return strValue.replace(/"/g, '\\22 ');
+}
 function applyChartRowHighlight(taskId) {
-    document.querySelectorAll('tr.chart-active-row').forEach(row => row.classList.remove('chart-active-row'));
+    // Keep this very cheap: table scrolling should not pay for a full-row scan.
+    // The previous implementation queried every highlighted row on each sync.
+    if (window.activeChartRow && window.activeChartRow.isConnected) {
+        window.activeChartRow.classList.remove('chart-active-row');
+    } else {
+        const oldRow = document.querySelector('tr.chart-active-row');
+        if (oldRow) oldRow.classList.remove('chart-active-row');
+    }
+    window.activeChartTaskId = taskId || null;
+    window.activeChartRow = null;
     if (!taskId) return;
-    const safeTaskId = String(taskId).replace(/"/g, '\"');
-    const row = document.querySelector(`tr[data-task-row="${safeTaskId}"]`);
-    if (row) row.classList.add('chart-active-row');
+    const row = document.querySelector(`tr[data-task-row="${cssEscapeValue(taskId)}"]`);
+    if (row) {
+        row.classList.add('chart-active-row');
+        window.activeChartRow = row;
+    }
+}
+function highlightAdjacentVisibleChartRow(direction) {
+    if (!window.activeChartTaskId) return;
+    const rows = Array.from(document.querySelectorAll('#task-table-container tr[data-task-row]'));
+    const currentIndex = rows.findIndex(row => row.getAttribute('data-task-row') === String(window.activeChartTaskId));
+    if (currentIndex < 0) return;
+    const step = direction === 'prev' ? -1 : 1;
+    for (let i = currentIndex + step; i >= 0 && i < rows.length; i += step) {
+        const chartButton = rows[i].querySelector('[data-action="chart"]');
+        if (chartButton && chartButton.style.opacity !== '0.6') {
+            applyChartRowHighlight(rows[i].getAttribute('data-task-row'));
+            return;
+        }
+    }
 }
 window.applyChartRowHighlight = applyChartRowHighlight;
 </script>
