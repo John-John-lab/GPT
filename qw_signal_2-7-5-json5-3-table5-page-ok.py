@@ -4,6 +4,7 @@ with Database Verification Tool and Real‑time Integrity Checks.
 Now with signal‑based downloading, candle analysis, and per‑task interactive charts.
 """
 import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functools, sys, bisect, math
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 import dash
 from dash import dcc, html, Input, Output, State, MATCH, ALL, no_update, ctx, clientside_callback
@@ -3945,8 +3946,26 @@ def update_summary_stats_only(version, lock_state):
 
 # ⚡ CRITICAL OPTIMIZATION: Page-level HTML cache
 # Stores pre-rendered HTML rows for each page to avoid re-rendering on navigation
-_page_html_cache = {}
+_PAGE_HTML_CACHE_MAX_PAGES = 8
+_page_html_cache = OrderedDict()
 _cached_golden_version = None
+
+
+def get_cached_task_page(cache_key):
+    """Return a cached rendered task page and mark it recent, if present."""
+    if cache_key not in _page_html_cache:
+        return None
+    _page_html_cache.move_to_end(cache_key)
+    return _page_html_cache[cache_key]
+
+
+def cache_task_page(cache_key, page):
+    """Cache rendered task-table pages with a small LRU bound for slow machines."""
+    _page_html_cache[cache_key] = page
+    _page_html_cache.move_to_end(cache_key)
+    while len(_page_html_cache) > _PAGE_HTML_CACHE_MAX_PAGES:
+        evicted_key, _ = _page_html_cache.popitem(last=False)
+        print(f"[TRACE] 🧹 Evicted cached task page '{evicted_key}' to keep cache <= {_PAGE_HTML_CACHE_MAX_PAGES}")
 
 @app.callback(
     Output("task-table-container", "children"),
@@ -4019,20 +4038,6 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
         _cached_golden_version = current_golden_version
         timer.check("Cache Invalidated")
     
-    # ⚡ CRITICAL FIX: Cache MUST use version in key to avoid stale data
-    cache_key = f"page_{current_page}_v{current_golden_version}"
-    
-    # Return cached page if available (INSTANT - no HTML generation)
-    if cache_key in _page_html_cache:
-        print(f"[TRACE] ⚡ CACHE HIT for key '{cache_key}'! Returning cached page {current_page}")
-        timer.check("Cache Hit").end()
-        return _page_html_cache[cache_key]
-    
-    print(f"[TRACE] ❌ CACHE MISS for key '{cache_key}'. Will generate rows.")
-    timer.check("Cache Miss Confirmed")
-    
-    force_refresh = version is not None and version > 0
-    
     # Pagination Slicing
     PAGE_SIZE = 300
     total_pages = max(1, (len(tasks) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -4042,6 +4047,19 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
     visible_tasks = tasks[start_idx:end_idx]
     print(f"[TRACE] ✂️ Sliced tasks [{start_idx}:{end_idx}] → {len(visible_tasks)} visible")
     timer.check(f"Step 2: Pagination Slice")
+
+    # ⚡ CRITICAL FIX: Cache MUST use the normalized page and version in key to avoid stale data.
+    cache_key = f"page_{current_page}_v{current_golden_version}"
+
+    # Return cached page if available (INSTANT - no HTML generation)
+    cached_page = get_cached_task_page(cache_key)
+    if cached_page is not None:
+        print(f"[TRACE] ⚡ CACHE HIT for key '{cache_key}'! Returning cached page {current_page}")
+        timer.check("Cache Hit").end()
+        return cached_page
+
+    print(f"[TRACE] ❌ CACHE MISS for key '{cache_key}'. Will generate rows.")
+    timer.check("Cache Miss Confirmed")
     
     # Detect if this is ONLY a page navigation (no data change)
     prev_golden_version = getattr(update_task_table_only, '_last_golden_version', None)
@@ -4357,7 +4375,7 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
     
     # ⚡ CACHE THE RESULT with version key for instant page switching (ALWAYS cache, regardless of stats)
     # The table HTML is the same whether we calculated full stats or page-only stats
-    _page_html_cache[cache_key] = result
+    cache_task_page(cache_key, result)
     timer.check("Step 9: Cache Result")
     
     # Print final timing
@@ -4425,17 +4443,19 @@ TASK_TABLE_HEADERS = [
 ]
 
 
-def render_task_table_header_html():
-    """Render the raw sticky table header HTML used by the fast task table."""
-    header_cells = [
+TASK_TABLE_HEADER_HTML = (
+    '<thead style="position:sticky;top:0;background-color:#f0f0f0;z-index:10"><tr>'
+    + "".join(
         f'<th style="min-width:{width}">{label}</th>'
         for label, width in TASK_TABLE_HEADERS
-    ]
-    return (
-        '<thead style="position:sticky;top:0;background-color:#f0f0f0;z-index:10"><tr>'
-        + "".join(header_cells)
-        + "</tr></thead>"
     )
+    + "</tr></thead>"
+)
+
+
+def render_task_table_header_html():
+    """Return the prebuilt raw sticky table header HTML used by the fast task table."""
+    return TASK_TABLE_HEADER_HTML
 
 
 def render_task_table_html(visible_tasks):
@@ -4445,15 +4465,15 @@ def render_task_table_html(visible_tasks):
     slice from the callback and only formats fields that already exist on each
     task, preserving the Golden Store/data-flow and calculation logic.
     """
-    rows = [render_task_table_row(t) for t in visible_tasks]
-    body_html = "<tbody>" + "".join(rows) + "</tbody>"
+    row_count = len(visible_tasks)
+    body_html = "<tbody>" + "".join(render_task_table_row(t) for t in visible_tasks) + "</tbody>"
     table_html = (
         '<table style="width:100%;border-collapse:collapse">'
         + render_task_table_header_html()
         + body_html
         + "</table>"
     )
-    return table_html, len(rows)
+    return table_html, row_count
 
 def render_task_table_row(t):
     """Render a single task row for the table. Returns RAW HTML STRING (<tr>...</tr>) for performance."""
