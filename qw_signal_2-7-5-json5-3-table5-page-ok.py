@@ -2334,6 +2334,10 @@ app.index_string = '''
 .highlight-row td {
     background-color: #c8e6c9 !important;
 }
+/* Active chart row light blue – controlled by chart modal/navigation */
+.chart-active-row td {
+    background-color: #bbdefb !important;
+}
 /* Hide column – use visibility:collapse to keep table layout stable */
 .hidden-column td,
 .hidden-column th {
@@ -2559,6 +2563,14 @@ document.addEventListener('dblclick', function(e) {
         hiddenColumns.add(colIndex);
     }
 });
+function applyChartRowHighlight(taskId) {
+    document.querySelectorAll('tr.chart-active-row').forEach(row => row.classList.remove('chart-active-row'));
+    if (!taskId) return;
+    const safeTaskId = String(taskId).replace(/"/g, '\"');
+    const row = document.querySelector(`tr[data-task-row="${safeTaskId}"]`);
+    if (row) row.classList.add('chart-active-row');
+}
+window.applyChartRowHighlight = applyChartRowHighlight;
 </script>
 </footer>
 </body>
@@ -2611,6 +2623,7 @@ app.layout = html.Div([
     dcc.Store(id="strategy-details-trigger", data=None),  # Hidden trigger for strategy details button clicks (JS sets this)
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
+    dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
@@ -2665,6 +2678,26 @@ app.layout = html.Div([
                     html.Div(
                         style={"position": "absolute", "top": "10px", "right": "10px", "display": "flex", "gap": "10px"},
                         children=[
+                            html.Button("‹", id="prev-chart-btn", title="Previous task chart", n_clicks=0, style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "8px 14px",
+                                "cursor": "pointer",
+                                "fontSize": "18px",
+                                "minWidth": "44px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("›", id="next-chart-btn", title="Next task chart", n_clicks=0, style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "8px 14px",
+                                "cursor": "pointer",
+                                "fontSize": "18px",
+                                "minWidth": "44px",
+                                "whiteSpace": "nowrap"
+                            }),
                             html.Button("Toggle RSI", id="toggle-rsi-btn", style={
                                 "background": "transparent",
                                 "color": "black",
@@ -4414,7 +4447,7 @@ def render_task_table_row(t):
     button_html = f'<div>{stop_btn}{pause_btn}{chart_btn}{details_btn}{impulse_btn}{rerun_strat_btn}{rerun_impulse_btn}{tv_btn}</div>'
 
     # Build and return RAW HTML STRING for the entire row
-    return f"""<tr>
+    return f"""<tr data-task-row="{task_id_str}">
         <td style="min-width:80px">{task_id_str[:8]}</td>
         <td style="min-width:80px">{t.status}</td>
         <td style="min-width:70px">{t.progress:.1f}%</td>
@@ -5108,6 +5141,90 @@ def handle_page_nav(n_clicks_list, count, current_page):
     elif isinstance(action, int):
         return action
     return current_page
+
+def get_ordered_tasks_for_navigation():
+    """Return tasks in the same order used by the paginated table."""
+    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
+        return list(golden_task_store_data)
+    with tm.lock:
+        return list(tm.tasks.values())
+
+def get_chartable_tasks_for_navigation():
+    """Return tasks that should have usable charts, preserving table order."""
+    tasks = get_ordered_tasks_for_navigation()
+    chartable = [t for t in tasks if getattr(t, 'status', None) == "completed"]
+    return tasks, chartable
+
+def page_for_task(task_id, tasks):
+    for idx, task in enumerate(tasks):
+        if str(getattr(task, 'task_id', '')) == str(task_id):
+            return idx // PAGE_SIZE
+    return no_update
+
+@app.callback(
+    Output("prev-chart-btn", "disabled"),
+    Output("next-chart-btn", "disabled"),
+    Input("chart-task-id", "data"),
+    Input("golden-store-version", "data"),
+    prevent_initial_call=False
+)
+def update_chart_nav_buttons(task_id, version):
+    if not task_id:
+        return True, True
+    _, chartable = get_chartable_tasks_for_navigation()
+    chart_ids = [str(t.task_id) for t in chartable]
+    if task_id not in chart_ids:
+        return True, True
+    idx = chart_ids.index(task_id)
+    return idx <= 0, idx >= len(chart_ids) - 1
+
+@app.callback(
+    Output("chart-task-id", "data", allow_duplicate=True),
+    Output("task-page-store", "data", allow_duplicate=True),
+    Output("chart-click-store", "data", allow_duplicate=True),
+    Input("prev-chart-btn", "n_clicks"),
+    Input("next-chart-btn", "n_clicks"),
+    State("chart-task-id", "data"),
+    prevent_initial_call=True
+)
+def navigate_chart_task(prev_clicks, next_clicks, current_task_id):
+    triggered = ctx.triggered_id
+    if triggered not in ("prev-chart-btn", "next-chart-btn") or not current_task_id:
+        return no_update, no_update, no_update
+
+    all_tasks, chartable = get_chartable_tasks_for_navigation()
+    chart_ids = [str(t.task_id) for t in chartable]
+    if current_task_id not in chart_ids:
+        return no_update, no_update, no_update
+
+    current_idx = chart_ids.index(current_task_id)
+    next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
+    if next_idx < 0 or next_idx >= len(chartable):
+        return no_update, no_update, no_update
+
+    target_id = str(chartable[next_idx].task_id)
+    target_page = page_for_task(target_id, all_tasks)
+    return target_id, target_page, {f"{target_id}_chart": time.time()}
+
+clientside_callback(
+    """
+function(taskId, page) {
+    function apply() {
+        if (window.applyChartRowHighlight) {
+            window.applyChartRowHighlight(taskId);
+        }
+    }
+    apply();
+    setTimeout(apply, 50);
+    setTimeout(apply, 250);
+    return {task_id: taskId || null, page: page, ts: Date.now()};
+}
+""",
+    Output("chart-highlight-dummy", "data"),
+    Input("chart-task-id", "data"),
+    Input("task-page-store", "data"),
+    prevent_initial_call=False
+)
 
 @app.callback(
     Output("progress-interval", "disabled"),
