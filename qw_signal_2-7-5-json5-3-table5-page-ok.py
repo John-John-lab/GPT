@@ -3189,6 +3189,9 @@ def render_tab(tab):
                 ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px", "marginTop": "10px", "maxHeight": "400px", "overflowY": "auto"})
             ], style={"marginBottom": "20px"}),
             html.Hr(),
+            # Hidden target keeps the dedicated summary-stat cache callback active;
+            # visible summaries remain embedded in the task table below.
+            html.Div(id="summary-stats-container", style={"display": "none"}),
             html.Div(id="task-table-container", style={"width": "100%"}),
         ])
     else:
@@ -3733,7 +3736,7 @@ def update_progress(_, stores):
 def update_summary_stats_only(version, lock_state):
     """Calculate summary statistics ONLY when golden_store_version changes.
     Does NOT run on page navigation - this is the key fix for 10-minute freeze."""
-    global golden_task_store_data, golden_store_version, recalculation_complete_timestamp
+    global golden_task_store_data, golden_store_version, recalculation_complete_timestamp, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     
     # Validate global state
     if not hasattr(app, 'layout') or app.layout is None:
@@ -3926,6 +3929,9 @@ def update_summary_stats_only(version, lock_state):
         html.Tr([html.Td("Delta Price 4%+ Total", style=td_style), html.Td(str(delta_4_plus_total), style=td_style)]),
     ]
     signal_stats_table = html.Table([html.Tbody(signal_stats_rows)], style={"border": "1px solid #4a90e2", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f0f7ff"})
+    cached_signal_stats_html = signal_stats_table
+    cached_small_stats_data = {"completed": completed_count, "total": total_tasks, "avg_adv": avg_adv, "avg_dd": avg_dd}
+    stats_cache_version = golden_store_version
     
     return html.Div([
         stats_table,
@@ -4153,211 +4159,30 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
 
 
 
-    # ⚡ PERFORMANCE: Skip heavy table-local signal stats on page navigation and
-    # JSON load. The dedicated summary callback already computes the full
-    # all-task summaries from golden-store-version, so the first 300-row page
-    # should not wait behind duplicate stats work.
-    version_changed = prev_golden_version is not None and current_golden_version != prev_golden_version
-    use_cached_signal_stats = is_page_only_nav or (version_changed and triggered_id != "analysis-complete-trigger") or triggered_id == "golden-store-version"
-    if use_cached_signal_stats:
-        # Return minimal stats for page navigation (no heavy iteration over all tasks)
-        # But we still need to show basic stats from ALL tasks (consistent across pages)
-        total_tasks = len(tasks)
-        completed_count = sum(1 for t in tasks if t.status == "completed")
-        
-        # ALL-task averages (still fast - just iterating, not generating HTML) - NO pandas
-        avg_adv = np.mean([t.max_adverse_move_pct for t in tasks if t.max_adverse_move_pct is not None and not is_na(t.max_adverse_move_pct)] or [0])
-        avg_dd = np.mean([t.drawdown_before_level for t in tasks if t.drawdown_before_level is not None and not is_na(t.drawdown_before_level)] or [0])
-        
-        stats_rows = [
-            html.Tr([html.Td("✅ Task Completed (Total)"), html.Td(str(completed_count))]),
-            html.Tr([html.Td("📦 Total Tasks"), html.Td(str(total_tasks))]),
-            html.Tr([html.Td("📉 Avg Max Adverse (All)"), html.Td(fmt_dd(avg_adv))]),
-            html.Tr([html.Td("📉 Avg Drawdown Lvl (All)"), html.Td(fmt_dd(avg_dd))])
-        ]
-        stats_table = html.Table([html.Tbody(stats_rows)], style={"border": "1px solid #ccc", "padding": "5px", "fontSize": "13px", "backgroundColor": "#f9f9f9"})
-        
-        # 🔧 FIX: Use cached signal stats from ALL tasks (calculated once per version)
-        print(f"[DEBUG] ⏭️ USING CACHED SIGNAL STATS")
-        stats_elapsed = 0.0
-        # Access global cache (already declared at function level)
-        signal_stats_table = cached_signal_stats_html if cached_signal_stats_html else html.Div("ℹ️ Stats loading...", style={"textAlign": "center", "padding": "10px", "color": "#555", "fontStyle": "italic"})
+    # ⚡ PERFORMANCE: the dedicated summary callback owns the full all-task
+    # Signal Performance Summary. The task-table callback should only render the
+    # current 300-row page, otherwise first page paint can block for a long time
+    # on old hardware and page/chart clicks can show a transient "Stats loading".
+    if cached_small_stats_data and stats_cache_version == current_golden_version:
+        stats_table = render_basic_stats_table(
+            cached_small_stats_data.get("completed", 0),
+            cached_small_stats_data.get("total", len(tasks)),
+            cached_small_stats_data.get("avg_adv", 0),
+            cached_small_stats_data.get("avg_dd", 0),
+        )
     else:
-        # 🔧 CRITICAL: Calculate signal stats on ALL tasks when data loads/recalculates
-        print(f"[DEBUG] 🚀 CALCULATING SIGNAL STATS for {len(tasks)} tasks...")
-        
-        t_stats_start = time.time()
+        stats_table = html.Div(
+            "ℹ️ Summary stats are updating...",
+            style={"textAlign": "center", "padding": "8px", "color": "#555", "fontStyle": "italic"}
+        )
 
-        # ✅ BASIC STATS: Calculate only when data changes (not on page nav) - NOW USES ALL TASKS
-        total_tasks = len(tasks)
-        completed_count = sum(1 for t in tasks if t.status == "completed")
-
-        # ALL-task averages (consistent across all pages)
-        avg_adv = np.mean([t.max_adverse_move_pct for t in tasks if t.max_adverse_move_pct is not None and not is_na(t.max_adverse_move_pct)] or [0])
-        avg_dd = np.mean([t.drawdown_before_level for t in tasks if t.drawdown_before_level is not None and not is_na(t.drawdown_before_level)] or [0])
-
-        stats_rows = [
-            html.Tr([html.Td("✅ Task Completed (Total)"), html.Td(str(completed_count))]),
-            html.Tr([html.Td("📦 Total Tasks"), html.Td(str(total_tasks))]),
-            html.Tr([html.Td("📉 Avg Max Adverse (All)"), html.Td(fmt_dd(avg_adv))]),
-            html.Tr([html.Td("📉 Avg Drawdown Lvl (All)"), html.Td(fmt_dd(avg_dd))])
-        ]
-        stats_table = html.Table([html.Tbody(stats_rows)], style={"border": "1px solid #ccc", "padding": "5px", "fontSize": "13px", "backgroundColor": "#f9f9f9"})
-
-        # ✅ SIGNAL STATS: Calculated on ALL in-memory tasks (consistent denominator)
-        reached_level_cnt = sum(1 for t in tasks if t.reached_level)
-        reversed_dir_cnt = sum(1 for t in tasks if t.reversed_direction)
-        hit_1_cnt = sum(1 for t in tasks if t.reached_level and t.hit_1)
-        hit_1_5_cnt = sum(1 for t in tasks if t.reached_level and t.hit_1_5)
-        hit_2_cnt = sum(1 for t in tasks if t.reached_level and t.hit_2)
-        
-        def fmt_stat(stat_count, total):
-            if total == 0: return "0 / 0 (0.0%)"
-            return f"{stat_count} / {total} ({(stat_count/total)*100:.1f}%)"
-
-        # ----- Max Adverse Distribution Stats (compact format) -----
-        def get_adverse_range(pct):
-            if pct is None or (isinstance(pct, float) and is_na(pct)):
-                return None
-            if 0 <= pct < 0.5: return "0-0.5%"
-            elif 0.5 <= pct < 1: return "0.5-1%"
-            elif 1 <= pct < 2: return "1-2%"
-            elif 2 <= pct < 3: return "2-3%"
-            elif 3 <= pct < 4: return "3-4%"
-            elif 4 <= pct < 5: return "4-5%"
-            elif 5 <= pct < 10: return "5-10%"
-            elif 10 <= pct < 20: return "10-20%"
-            elif 20 <= pct < 30: return "20-30%"
-            elif pct >= 30: return ">30%"
-            return None
-
-        # Count tasks in each adverse range (only for reached_level tasks)
-        adverse_counts = {}
-        for t in tasks:
-            adv = t.max_adverse_move_pct
-            if t.reached_level and adv is not None and not (isinstance(adv, float) and is_na(adv)):
-                range_key = get_adverse_range(adv)
-                if range_key:
-                    adverse_counts[range_key] = adverse_counts.get(range_key, 0) + 1
-
-        # Format as two compact rows (5 ranges each) to save vertical space
-        ranges = ["0-0.5%", "0.5-1%", "1-2%", "2-3%", "3-4%", "4-5%", "5-10%", "10-20%", "20-30%", ">30%"]
-        row1_adv = " | ".join([f"{r}:{adverse_counts.get(r,0)}" for r in ranges[:5]])
-        row2_adv = " | ".join([f"{r}:{adverse_counts.get(r,0)}" for r in ranges[5:]])
-
-        # 🔧 Calculate cumulative totals for Max Adverse
-        adv_05_plus_total = 0
-        adv_4_plus_total = 0
-        for t in tasks:
-            adv = t.max_adverse_move_pct
-            if t.reached_level and adv is not None and not (isinstance(adv, float) and is_na(adv)):
-                if adv >= 0.5:
-                    adv_05_plus_total += 1
-                if adv >= 4.0:
-                    adv_4_plus_total += 1
-
-        # 🔧 NEW: Calculate distribution & cumulative totals for Max Expected
-        exp_counts = {}
-        exp_05_plus_total = 0
-        exp_4_plus_total = 0
-        for t in tasks:
-            exp = t.max_expected_move_pct
-            if t.reached_level and exp is not None and not (isinstance(exp, float) and is_na(exp)):
-                range_key = get_adverse_range(exp)
-                if range_key:
-                    exp_counts[range_key] = exp_counts.get(range_key, 0) + 1
-                if exp >= 0.5:
-                    exp_05_plus_total += 1
-                if exp >= 4.0:
-                    exp_4_plus_total += 1
-                
-        row1_exp = " | ".join([f"{r}:{exp_counts.get(r,0)}" for r in ranges[:5]])
-        row2_exp = " | ".join([f"{r}:{exp_counts.get(r,0)}" for r in ranges[5:]])
-
-        # Define uniform style for all cells in the summary table
-        td_style = {"fontSize": "13px", "fontWeight": "normal", "padding": "2px 5px"}
-        
-        # Calculate (sgnl) statistics for Adverse & Expected - OPTIMIZED with direct attribute access
-        adv_sgnl_counts = {}; exp_sgnl_counts = {}
-        adv_sgnl_05 = 0; adv_sgnl_4 = 0; exp_sgnl_05 = 0; exp_sgnl_4 = 0
-        for t in tasks:
-            adv_s = t.max_adverse_sgnl_pct
-            if adv_s is not None and not (isinstance(adv_s, float) and is_na(adv_s)):
-                r = get_adverse_range(adv_s)
-                if r: adv_sgnl_counts[r] = adv_sgnl_counts.get(r, 0) + 1
-                if adv_s >= 0.5: adv_sgnl_05 += 1
-                if adv_s >= 4.0: adv_sgnl_4 += 1
-            exp_s = t.max_expected_sgnl_pct
-            if exp_s is not None and not (isinstance(exp_s, float) and is_na(exp_s)):
-                r = get_adverse_range(exp_s)
-                if r: exp_sgnl_counts[r] = exp_sgnl_counts.get(r, 0) + 1
-                if exp_s >= 0.5: exp_sgnl_05 += 1
-                if exp_s >= 4.0: exp_sgnl_4 += 1
-                
-        row1_adv_s = " | ".join([f"{r}:{adv_sgnl_counts.get(r,0)}" for r in ranges[:5]])
-        row2_adv_s = " | ".join([f"{r}:{adv_sgnl_counts.get(r,0)}" for r in ranges[5:]])
-        row1_exp_s = " | ".join([f"{r}:{exp_sgnl_counts.get(r,0)}" for r in ranges[:5]])
-        row2_exp_s = " | ".join([f"{r}:{exp_sgnl_counts.get(r,0)}" for r in ranges[5:]])
-        
-        # Delta Price (sgnl to lvl) Distribution
-        delta_counts = {k: 0 for k in ranges}
-        delta_05_plus_total = 0
-        delta_4_plus_total = 0
-        for t in tasks:
-            dp = t.price_change_pct
-            if dp is not None and not (isinstance(dp, float) and is_na(dp)):
-                val = abs(dp)
-                r = get_adverse_range(val)
-                if r:
-                    delta_counts[r] += 1
-                if val >= 0.5: delta_05_plus_total += 1
-                if val >= 4.0: delta_4_plus_total += 1
-
-        row1_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[:5]])
-        row2_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[5:]])
-
-        signal_stats_rows = [
-            html.Tr([html.Td("Reached Level", style=td_style), html.Td(fmt_stat(reached_level_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Reversed Direction", style=td_style), html.Td(fmt_stat(reversed_dir_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
-            # Max Adverse (lvl) Rows
-            html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
-            html.Tr([html.Td("Max Adv 0.5%+ Total (lvl)", style=td_style), html.Td(str(adv_05_plus_total), style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ Total (lvl)", style=td_style), html.Td(str(adv_4_plus_total), style=td_style)]),
-            # Max Expected (lvl) Rows
-            html.Tr([html.Td("Max Exp 0-4% (lvl)", style=td_style), html.Td(row1_exp, style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ (lvl)", style=td_style), html.Td(row2_exp, style=td_style)]),
-            html.Tr([html.Td("Max Exp 0.5%+ Total (lvl)", style=td_style), html.Td(str(exp_05_plus_total), style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ Total (lvl)", style=td_style), html.Td(str(exp_4_plus_total), style=td_style)]),
-            # Max Adverse (sgnl) Rows
-            html.Tr([html.Td("Max Adv 0-4% (sgnl)", style=td_style), html.Td(row1_adv_s, style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ (sgnl)", style=td_style), html.Td(row2_adv_s, style=td_style)]),
-            html.Tr([html.Td("Max Adv 0.5%+ Total (sgnl)", style=td_style), html.Td(str(adv_sgnl_05), style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ Total (sgnl)", style=td_style), html.Td(str(adv_sgnl_4), style=td_style)]),
-            # Max Expected (sgnl) Rows
-            html.Tr([html.Td("Max Exp 0-4% (sgnl)", style=td_style), html.Td(row1_exp_s, style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ (sgnl)", style=td_style), html.Td(row2_exp_s, style=td_style)]),
-            html.Tr([html.Td("Max Exp 0.5%+ Total (sgnl)", style=td_style), html.Td(str(exp_sgnl_05), style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ Total (sgnl)", style=td_style), html.Td(str(exp_sgnl_4), style=td_style)]),
-            # Delta Price Rows
-            html.Tr([html.Td("Delta Price 0-4%", style=td_style), html.Td(row1_delta, style=td_style)]),
-            html.Tr([html.Td("Delta Price 4%+", style=td_style), html.Td(row2_delta, style=td_style)]),
-            html.Tr([html.Td("Delta Price 0.5%+ Total", style=td_style), html.Td(str(delta_05_plus_total), style=td_style)]),
-            html.Tr([html.Td("Delta Price 4%+ Total", style=td_style), html.Td(str(delta_4_plus_total), style=td_style)]),
-        ]
-        signal_stats_table = html.Table([html.Tbody(signal_stats_rows)], style={"border": "1px solid #4a90e2", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f0f7ff"})
-        
-        # Cache the stats for ALL tasks (calculated once per version)
-        cached_signal_stats_html = signal_stats_table
-        cached_small_stats_data = {"completed": completed_count, "total": total_tasks, "avg_adv": avg_adv, "avg_dd": avg_dd}
-        stats_cache_version = golden_store_version
-        
-        stats_elapsed = time.time() - t_stats_start
-        print(f"[DEBUG] ✅ SIGNAL STATS COMPLETE in {stats_elapsed:.2f}s (cached for version {stats_cache_version})")
-    
+    if cached_signal_stats_html and stats_cache_version == current_golden_version:
+        signal_stats_table = cached_signal_stats_html
+    else:
+        signal_stats_table = html.Div(
+            "ℹ️ Signal Performance Summary is updating...",
+            style={"textAlign": "center", "padding": "10px", "color": "#555", "fontStyle": "italic"}
+        )
     # 🔧 PAGINATION NAVIGATION
     nav_container = render_pagination_nav(current_page, total_pages)
     timer.check("Step 7: Build Pagination Nav")
