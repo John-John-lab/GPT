@@ -2317,13 +2317,7 @@ def task_action():
     return jsonify({'error': 'Invalid action'}), 400
 
 # ----- JavaScript for immediate button feedback – unchanged -----
-def build_index_string():
-    """Build the Dash HTML shell and client-side table/chart helpers.
-
-    UI layout builder only: keep business logic, calculations, callbacks,
-    Golden Store updates, and Dash component IDs out of this function.
-    """
-    return '''
+app.index_string = '''
 <!DOCTYPE html>
 <html>
 <head>
@@ -2625,8 +2619,6 @@ window.applyChartRowHighlight = applyChartRowHighlight;
 </html>
 '''
 
-app.index_string = build_index_string()
-
 # ----- Flask route for task card HTML – unchanged -----
 @app.server.route('/task-card/<task_id>')
 def serve_task_card(task_id):
@@ -2660,13 +2652,7 @@ def serve_task_card(task_id):
 '''
     return html_str
 
-def build_root_layout():
-    """Build the root Dash layout.
-
-    UI layout builder only: this must only assemble Dash components and keep
-    existing component IDs unchanged so callbacks remain wired exactly as before.
-    """
-    return html.Div([
+app.layout = html.Div([
     dcc.Store(id="task-ids-store", data=[]),
     dcc.Store(id="task-count-store", data=0),
     dcc.Store(id="recalc-complete-trigger", data=0),
@@ -2921,8 +2907,6 @@ def build_root_layout():
     dcc.Store(id="recalc-lock-store", data={"locked": False, "message": ""}),  # 🔧 RECALC LOCK STATE
     dcc.Interval(id="recalc-poller", interval=1000, n_intervals=0, disabled=True),
 ])
-
-app.layout = build_root_layout()
 
 @app.callback(
     Output("tab-content", "children"),
