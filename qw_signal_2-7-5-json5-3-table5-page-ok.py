@@ -4117,89 +4117,15 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
     
     timer.check("Step 3: Helper Functions Setup")
     
-    # Generate rows for visible tasks ONLY (300 max)
-    # ⚡ PERFORMANCE OPTIMIZATION: Use render_task_table_row() helper which returns raw HTML strings
-    # This avoids creating 15,600+ nested Python objects (300 rows × 52 columns)
-    print(f"[TRACE] 🚀 Starting row generation for {len(visible_tasks)} tasks using optimized HTML string renderer...")
-    t_row_start = time.time()
-    
-    # 🔧 CRITICAL FIX: Call render_task_table_row() which now returns raw HTML strings (<tr>...</tr>)
-    # instead of html.Tr objects. This eliminates Dash serialization overhead.
-    rows = [render_task_table_row(t) for t in visible_tasks]
-    row_count = len(rows)
-    
-    row_elapsed = time.time() - t_row_start
-    print(f"[TRACE] ✓ Generated {row_count} rows in {row_elapsed:.2f}s ({row_elapsed/row_count*1000:.1f}ms per row) - USING RAW HTML STRINGS")
-    timer.check(f"Step 4: Row Generation ({row_count} rows)")
-    
-    # Build table HTML as raw string
+    # Generate the visible table page ONLY (300 max) as raw HTML strings.
+    # Keep this presentation-only: it formats fields that are already present on tasks.
+    print(f"[TRACE] 🚀 Starting table HTML generation for {len(visible_tasks)} tasks using optimized HTML string renderer...")
     t_table_start = time.time()
-    
-    # 🔧 HEADER: Build table header as raw HTML string
-    header_cells = [
-        "<th style=\"min-width:80px\">ID</th>",
-        "<th style=\"min-width:80px\">Status</th>",
-        "<th style=\"min-width:70px\">Progress</th>",
-        "<th style=\"min-width:100px\">Symbols</th>",
-        "<th style=\"min-width:70px\">Mode</th>",
-        "<th style=\"min-width:80px\">Direction</th>",
-        "<th style=\"min-width:120px\">Signal Time</th>",
-        "<th style=\"min-width:120px\">First Event</th>",
-        "<th style=\"min-width:60px\">Pin?</th>",
-        "<th style=\"min-width:80px\">Price Δ% (sgnl-lvl)</th>",
-        "<th style=\"min-width:70px\">Reached</th>",
-        "<th style=\"min-width:70px\">Reversed</th>",
-        "<th style=\"min-width:50px\">Hit 1% (lvl-fwd.dir)</th>",
-        "<th style=\"min-width:60px\">Hit 1.5% (lvl-fwd.dir)</th>",
-        "<th style=\"min-width:50px\">Hit 2% (lvl-fwd.dir)</th>",
-        "<th style=\"min-width:50px\">1st 1% Exp</th>",
-        "<th style=\"min-width:140px\">Time 1% Exp</th>",
-        "<th style=\"min-width:60px\">1st 1.5% Exp</th>",
-        "<th style=\"min-width:140px\">Time 1.5% Exp</th>",
-        "<th style=\"min-width:50px\">1st 2% Exp</th>",
-        "<th style=\"min-width:140px\">Time 2% Exp</th>",
-        "<th style=\"min-width:50px\">1st 1% Opp</th>",
-        "<th style=\"min-width:140px\">Time 1% Opp</th>",
-        "<th style=\"min-width:60px\">1st 1.5% Opp</th>",
-        "<th style=\"min-width:140px\">Time 1.5% Opp</th>",
-        "<th style=\"min-width:50px\">1st 2% Opp</th>",
-        "<th style=\"min-width:140px\">Time 2% Opp</th>",
-        "<th style=\"min-width:100px\">Max Adv %(lvl)</th>",
-        "<th style=\"min-width:140px\">Max Adv T(lvl)</th>",
-        "<th style=\"min-width:100px\">Max Exp %(lvl)</th>",
-        "<th style=\"min-width:140px\">Max Exp T(lvl)</th>",
-        "<th style=\"min-width:100px\">Max Adv %(sgnl)</th>",
-        "<th style=\"min-width:140px\">Max Adv T(sgnl)</th>",
-        "<th style=\"min-width:100px\">Max Exp %(sgnl)</th>",
-        "<th style=\"min-width:140px\">Max Exp T(sgnl)</th>",
-        "<th style=\"min-width:140px\">Max Adv %(bef ret lvl)</th>",
-        "<th style=\"min-width:140px\">Time (bef ret lvl)</th>",
-        "<th style=\"min-width:140px\">Max Adv %(bef ret sgnl)</th>",
-        "<th style=\"min-width:140px\">Time (bef ret sgnl)</th>",
-        "<th style=\"min-width:80px\">DD% (Lvl)</th>",
-        "<th style=\"min-width:140px\">DD Time (Lvl)</th>",
-        "<th style=\"min-width:80px\">DD% (1%)</th>",
-        "<th style=\"min-width:140px\">DD Time (1%)</th>",
-        "<th style=\"min-width:80px\">DD% (1.5%)</th>",
-        "<th style=\"min-width:140px\">DD Time (1.5%)</th>",
-        "<th style=\"min-width:80px\">DD% (2%)</th>",
-        "<th style=\"min-width:140px\">DD Time (2%)</th>",
-        "<th style=\"min-width:120px\">Strategy</th>",
-        "<th style=\"min-width:80px\">Confidence</th>",
-        "<th style=\"min-width:80px\">Impulse #</th>",
-        "<th style=\"min-width:200px\">Log</th>",
-        "<th style=\"min-width:180px\">Actions</th>"
-    ]
-    header_html = "<thead style=\"position:sticky;top:0;background-color:#f0f0f0;z-index:10\"><tr>" + "".join(header_cells) + "</tr></thead>"
-    
-    # 🔧 BODY: Join all row HTML strings (each row is already a <tr>...</tr> string from render_task_table_row)
-    body_html = "<tbody>" + "".join(rows) + "</tbody>"
-    
-    # 🔧 TABLE: Assemble complete table as raw HTML string
-    table_html = f"<table style=\"width:100%;border-collapse:collapse\">{header_html}{body_html}</table>"
-    
-    print(f"[TRACE] ✓ Built table HTML string in {time.time() - t_table_start:.2f}s")
-    timer.check("Step 5: Build Table HTML")
+    table_html, row_count = render_task_table_html(visible_tasks)
+    table_elapsed = time.time() - t_table_start
+    per_row_ms = (table_elapsed / row_count * 1000) if row_count else 0
+    print(f"[TRACE] ✓ Generated table HTML for {row_count} rows in {table_elapsed:.2f}s ({per_row_ms:.1f}ms per row) - USING RAW HTML STRINGS")
+    timer.check(f"Step 4-5: Table HTML Generation ({row_count} rows)")
 
 
 
@@ -4409,13 +4335,7 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
         print(f"[DEBUG] ✅ SIGNAL STATS COMPLETE in {stats_elapsed:.2f}s (cached for version {stats_cache_version})")
     
     # 🔧 PAGINATION NAVIGATION
-    nav_buttons = []
-    nav_buttons.append(html.Button("<< Prev", id={"type":"page-nav","index":"prev"}, disabled=(current_page==0), style={"margin":"2px"}))
-    for p in range(total_pages):
-        btn_style = {"margin":"2px", "padding":"2px 6px", "fontWeight":"bold" if p==current_page else "normal"}
-        nav_buttons.append(html.Button(str(p+1), id={"type":"page-nav","index":p}, style=btn_style))
-    nav_buttons.append(html.Button("Next >>", id={"type":"page-nav","index":"next"}, disabled=(current_page==total_pages-1), style={"margin":"2px"}))
-    nav_container = html.Div(nav_buttons, style={"display":"flex", "alignItems":"center", "marginBottom":"8px", "justifyContent":"center"})
+    nav_container = render_pagination_nav(current_page, total_pages)
     timer.check("Step 7: Build Pagination Nav")
 
     result = html.Div([
@@ -4447,6 +4367,93 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
     
 
     return result
+
+
+TASK_TABLE_HEADERS = [
+    ("ID", "80px"),
+    ("Status", "80px"),
+    ("Progress", "70px"),
+    ("Symbols", "100px"),
+    ("Mode", "70px"),
+    ("Direction", "80px"),
+    ("Signal Time", "120px"),
+    ("First Event", "120px"),
+    ("Pin?", "60px"),
+    ("Price Δ% (sgnl-lvl)", "80px"),
+    ("Reached", "70px"),
+    ("Reversed", "70px"),
+    ("Hit 1% (lvl-fwd.dir)", "50px"),
+    ("Hit 1.5% (lvl-fwd.dir)", "60px"),
+    ("Hit 2% (lvl-fwd.dir)", "50px"),
+    ("1st 1% Exp", "50px"),
+    ("Time 1% Exp", "140px"),
+    ("1st 1.5% Exp", "60px"),
+    ("Time 1.5% Exp", "140px"),
+    ("1st 2% Exp", "50px"),
+    ("Time 2% Exp", "140px"),
+    ("1st 1% Opp", "50px"),
+    ("Time 1% Opp", "140px"),
+    ("1st 1.5% Opp", "60px"),
+    ("Time 1.5% Opp", "140px"),
+    ("1st 2% Opp", "50px"),
+    ("Time 2% Opp", "140px"),
+    ("Max Adv %(lvl)", "100px"),
+    ("Max Adv T(lvl)", "140px"),
+    ("Max Exp %(lvl)", "100px"),
+    ("Max Exp T(lvl)", "140px"),
+    ("Max Adv %(sgnl)", "100px"),
+    ("Max Adv T(sgnl)", "140px"),
+    ("Max Exp %(sgnl)", "100px"),
+    ("Max Exp T(sgnl)", "140px"),
+    ("Max Adv %(bef ret lvl)", "140px"),
+    ("Time (bef ret lvl)", "140px"),
+    ("Max Adv %(bef ret sgnl)", "140px"),
+    ("Time (bef ret sgnl)", "140px"),
+    ("DD% (Lvl)", "80px"),
+    ("DD Time (Lvl)", "140px"),
+    ("DD% (1%)", "80px"),
+    ("DD Time (1%)", "140px"),
+    ("DD% (1.5%)", "80px"),
+    ("DD Time (1.5%)", "140px"),
+    ("DD% (2%)", "80px"),
+    ("DD Time (2%)", "140px"),
+    ("Strategy", "120px"),
+    ("Confidence", "80px"),
+    ("Impulse #", "80px"),
+    ("Log", "200px"),
+    ("Actions", "180px"),
+]
+
+
+def render_task_table_header_html():
+    """Render the raw sticky table header HTML used by the fast task table."""
+    header_cells = [
+        f'<th style="min-width:{width}">{label}</th>'
+        for label, width in TASK_TABLE_HEADERS
+    ]
+    return (
+        '<thead style="position:sticky;top:0;background-color:#f0f0f0;z-index:10"><tr>'
+        + "".join(header_cells)
+        + "</tr></thead>"
+    )
+
+
+def render_task_table_html(visible_tasks):
+    """Render one already-sliced task-table page as raw HTML plus row count.
+
+    This helper is intentionally presentation-only: it receives the 300-row page
+    slice from the callback and only formats fields that already exist on each
+    task, preserving the Golden Store/data-flow and calculation logic.
+    """
+    rows = [render_task_table_row(t) for t in visible_tasks]
+    body_html = "<tbody>" + "".join(rows) + "</tbody>"
+    table_html = (
+        '<table style="width:100%;border-collapse:collapse">'
+        + render_task_table_header_html()
+        + body_html
+        + "</table>"
+    )
+    return table_html, len(rows)
 
 def render_task_table_row(t):
     """Render a single task row for the table. Returns RAW HTML STRING (<tr>...</tr>) for performance."""
