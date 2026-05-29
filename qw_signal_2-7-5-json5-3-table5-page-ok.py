@@ -5964,8 +5964,19 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         height=780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500),
         margin=dict(l=50, r=50, t=50, b=50)
     )
-    # X-axis tick format
-    fig.update_xaxes(tickformat="%H:%M", ticklabelmode="period", ticks="outside")
+    # X-axis tick format and native Plotly spike lines.
+    # showspikes + spikemode="across" keeps the thin dashed hover line synced
+    # across price, RSI, and volume panes without Python callbacks or custom JS.
+    fig.update_xaxes(
+        tickformat="%H:%M",
+        ticklabelmode="period",
+        ticks="outside",
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikethickness=1,
+        spikedash="dash"
+    )
     return fig
 
 # =============================================================================
