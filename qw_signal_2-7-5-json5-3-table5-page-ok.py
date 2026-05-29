@@ -376,6 +376,43 @@ cached_signal_stats_html = None  # Full Signal Performance Summary table
 cached_small_stats_data = None   # Small summary stats dict
 stats_cache_version = -1         # Version of data these stats belong to
 
+
+
+def reset_display_caches(reason=""):
+    """Clear UI-only rendered page and summary caches after Golden Store changes."""
+    global _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
+    if "_page_html_cache" in globals():
+        _page_html_cache.clear()
+    _cached_golden_version = None
+    cached_signal_stats_html = None
+    cached_small_stats_data = None
+    stats_cache_version = -1
+    if reason:
+        print(f"🔄 [GOLDEN] Display caches reset: {reason}")
+
+
+def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
+    """Publish the final task snapshot used by UI callbacks and reset display caches.
+
+    This is intentionally small and behavior-preserving: it only centralizes the
+    existing global Golden Store assignment, version bump, and cache clearing.
+    """
+    global golden_task_store_data, golden_store_version
+    golden_task_store_data = list(tasks)
+    if bump_version:
+        golden_store_version += 1
+    reset_display_caches(reason or "publish")
+    print(f"🔄 [GOLDEN] Published {len(golden_task_store_data)} tasks, version={golden_store_version}, reason={reason or '-'}")
+    return golden_store_version
+
+
+def get_display_tasks_snapshot():
+    """Return the Golden Store task snapshot, falling back to TaskManager if empty."""
+    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
+        return golden_task_store_data
+    with tm.lock:
+        return list(tm.tasks.values())
+
 # ---------- Low-RAM Parquet Cache ----------
 @functools.lru_cache(maxsize=4)  # Holds max 4 DFs to protect old Mac RAM
 def _load_parquet_cached(file_path: str, mtime: float) -> pd.DataFrame:
@@ -3428,11 +3465,9 @@ def _process_signals_sync(signals, period_type, start_date, end_date, hours, tf,
     
     # 🔧 CRITICAL FIX: Update golden store so UI table sees newly created tasks immediately
     # This syncs tm.tasks (working storage) → golden_task_store_data (UI display source)
-    global golden_task_store_data, golden_store_version
     with tm.lock:
-        golden_task_store_data = list(tm.tasks.values())
-        golden_store_version += 1  # Invalidate page caches to force refresh
-    print(f"🔄 [PARSE] Golden store updated: {len(golden_task_store_data)} tasks, version={golden_store_version}")
+        task_snapshot = list(tm.tasks.values())
+    publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
     
     return new_ids, new_count
 
@@ -3556,11 +3591,9 @@ def _run_parse_background(parse_data):
     
     # 🔧 CRITICAL FIX: Update golden store so UI table sees newly created tasks immediately (background thread)
     # This syncs tm.tasks (working storage) → golden_task_store_data (UI display source)
-    global golden_task_store_data, golden_store_version
     with tm.lock:
-        golden_task_store_data = list(tm.tasks.values())
-        golden_store_version += 1  # Invalidate page caches to force refresh
-    print(f"🔄 [PARSE THREAD] Golden store updated: {len(golden_task_store_data)} tasks, version={golden_store_version}")
+        task_snapshot = list(tm.tasks.values())
+    publish_golden_task_snapshot(task_snapshot, reason="parse_background")
     
     # Final summary
     summary_msg = f"✅ Parse complete: {processed_count} created, {failed_count} failed out of {total_signals} signals"
@@ -3755,7 +3788,7 @@ def update_summary_stats_only(version, lock_state):
     # Try to get data from store first, fallback to global
     try:
         # In a real dcc.Store setup, we'd get this from Input, but for now use global
-        tasks = golden_task_store_data if golden_task_store_data else (list(tm.tasks.values()) if hasattr(tm, 'tasks') else [])
+        tasks = get_display_tasks_snapshot() if hasattr(tm, 'tasks') else []
     except:
         tasks = []
     
@@ -3770,11 +3803,7 @@ def update_summary_stats_only(version, lock_state):
         ])
     
     # Get tasks from Golden Store
-    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
-        tasks = golden_task_store_data
-    else:
-        with tm.lock:
-            tasks = list(tm.tasks.values())
+    tasks = get_display_tasks_snapshot()
         
     if not tasks:
         return "No tasks."
@@ -4020,13 +4049,9 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     
     # Get tasks from Golden Store
     t0 = time.time()
-    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
-        tasks = golden_task_store_data
-        print(f"[TRACE] ✓ Loaded {len(tasks)} tasks from golden store")
-    else:
-        with tm.lock:
-            tasks = list(tm.tasks.values())
-        print(f"[TRACE] ✓ Loaded {len(tasks)} tasks from task_manager")
+    tasks = get_display_tasks_snapshot()
+    source = "golden store" if golden_task_store_data is not None and len(golden_task_store_data) > 0 else "task_manager"
+    print(f"[TRACE] ✓ Loaded {len(tasks)} tasks from {source}")
     timer.check(f"Step 1: Get Data ({len(tasks)} tasks)")
     
     if not tasks:
@@ -5083,10 +5108,7 @@ def handle_page_nav(n_clicks_list, count, current_page):
 
 def get_ordered_tasks_for_navigation():
     """Return tasks in the same order used by the paginated table."""
-    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
-        return list(golden_task_store_data)
-    with tm.lock:
-        return list(tm.tasks.values())
+    return list(get_display_tasks_snapshot())
 
 def get_chartable_tasks_for_navigation():
     """Return tasks that should have usable charts, preserving table order."""
@@ -6889,20 +6911,14 @@ def load_tasks_from_json(n, filepath):
     # Keep Golden Store in sync with loaded JSON so the paginated table can render
     # page 1 directly from its fast display source instead of falling back to tm.tasks
     # or reusing stale rows from a previous load.
-    global golden_task_store_data, golden_store_version, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     with tm.lock:
         tm.tasks.clear()
         tm.tasks.update(new_tasks)
-        golden_task_store_data = list(tm.tasks.values())
+        task_snapshot = list(tm.tasks.values())
 
     # 🔧 CRITICAL: Reset Version to Force Stats & Table Re-render
     # Since we split the callback, increment the version store to trigger both new callbacks.
-    golden_store_version += 1
-    _page_html_cache.clear()
-    _cached_golden_version = None
-    cached_signal_stats_html = None
-    cached_small_stats_data = None
-    stats_cache_version = None
+    published_version = publish_golden_task_snapshot(task_snapshot, reason="json_load")
         
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
@@ -6911,7 +6927,7 @@ def load_tasks_from_json(n, filepath):
     # golden-store-version is the table/stat refresh trigger. Avoid also bumping
     # analysis-complete-trigger here because that path performs heavier
     # recalculation-oriented work before the first page can paint on older Macs.
-    return msg, loaded_ids, count, 0, dash.no_update, golden_store_version
+    return msg, loaded_ids, count, 0, dash.no_update, published_version
 
 @app.callback(
     Output("save-load-status", "children", allow_duplicate=True),
@@ -6926,15 +6942,9 @@ def manual_clear_all(n):
     global STOP_REQUESTED
     STOP_REQUESTED = True  # 🔧 Safely halt background recalc (sync with STOP_REQUESTED)
     recalc_bg["stop_flag"] = True  # 🔧 Also set recalc_bg flag for UI
-    global golden_task_store_data, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     with tm.lock:
         tm.tasks.clear()
-        golden_task_store_data = []
-    _page_html_cache.clear()
-    _cached_golden_version = None
-    cached_signal_stats_html = None
-    cached_small_stats_data = None
-    stats_cache_version = None
+    publish_golden_task_snapshot([], reason="manual_clear", bump_version=False)
     return "🗑️ All tasks cleared.", [], 0, 0
 
 @app.callback(
@@ -7156,10 +7166,9 @@ def _run_recalc_background(tasks_list):
         current_tasks = list(tm.tasks.values())
     
     # 🔧 GOLDEN STORE: Populate pre-processed cache for instant pagination
-    global golden_task_store_data, golden_store_version
     with tm.lock:
-        golden_task_store_data = list(tm.tasks.values())
-        golden_store_version += 1  # Increment version to invalidate page caches
+        task_snapshot = list(tm.tasks.values())
+    publish_golden_task_snapshot(task_snapshot, reason="recalc_complete")
 
     # 🔧 RECALC LOCK: Release lock to allow UI interaction
     global recalc_lock
