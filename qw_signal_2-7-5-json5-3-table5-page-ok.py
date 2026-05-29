@@ -5172,6 +5172,17 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
     return no_update
 
 @app.callback(
+    Output("chart-task-id", "data", allow_duplicate=True),
+    Output("chart-button-trigger", "data", allow_duplicate=True),
+    Output("chart-click-store", "data", allow_duplicate=True),
+    Input("close-chart-modal", "n_clicks"),
+    prevent_initial_call=True
+)
+def clear_chart_context_on_close(_):
+    """Drop the selected chart and click trigger history when the modal closes."""
+    return None, None, {}
+
+@app.callback(
     Output("rsi-visible-store", "data"),
     Input("toggle-rsi-btn", "n_clicks"),
     State("rsi-visible-store", "data"),
@@ -5198,6 +5209,31 @@ def toggle_strategy(n_clicks, current):
 )
 def toggle_measure(n_clicks, current):
     return not current
+
+@app.callback(
+    Output("measure-mode-store", "data", allow_duplicate=True),
+    Output("measure-points-store", "data", allow_duplicate=True),
+    Output("measure-result-store", "data", allow_duplicate=True),
+    Output("task-chart", "clickData", allow_duplicate=True),
+    Output("task-chart", "selectedData", allow_duplicate=True),
+    Output("task-chart", "relayoutData", allow_duplicate=True),
+    Input("chart-task-id", "data"),
+    Input("close-chart-modal", "n_clicks"),
+    prevent_initial_call=True
+)
+def reset_measure_on_chart_context_change(task_id, close_clicks):
+    """Clear measurement state whenever the chart is closed or switched.
+
+    Measurement points are in the coordinate space of the currently displayed
+    task.  If they survive closing the modal or opening another task, Plotly can
+    autorange around stale x/y coordinates and make the next chart look shifted
+    or show unexpected candles.  Clearing the measure state and volatile Graph
+    click/selection data gives each chart open a clean ruler context.
+    """
+    triggered = ctx.triggered_id
+    if triggered == "close-chart-modal" or (triggered == "chart-task-id" and task_id):
+        return False, {"first": None, "second": None}, None, None, None, None
+    return no_update, no_update, no_update, no_update, no_update, no_update
 
 @app.callback(
     Output("toggle-measure-btn", "children"),
@@ -5297,16 +5333,18 @@ def capture_click(clickData, measure_mode, points, task_id):
             "second": None
         }
 
-    points = points or {"first": None, "second": None}
+    points = points or {"first": None, "second": None, "task_id": task_id}
 
-    # First click, or start a fresh measurement after a completed one.
-    if points.get('first') is None or points.get('second') is not None:
+    # First click, a completed measurement, or a click after switching tasks starts
+    # a fresh ruler for the current chart only.
+    if points.get('task_id') != task_id or points.get('first') is None or points.get('second') is not None:
         result = {
             "text": f"📍 First point selected at {clicked['y']:.6g}. Click the second candle to measure price %, time, and candle distance.",
+            "task_id": task_id,
             "first": clicked,
             "second": None
         }
-        return {"first": clicked, "second": None}, result
+        return {"task_id": task_id, "first": clicked, "second": None}, result
 
     first = points['first']
     second = clicked
@@ -5321,6 +5359,7 @@ def capture_click(clickData, measure_mode, points, task_id):
     time_text, bars_text = _format_measure_time_delta(first['x'], second['x'], timeframe)
     result = {
         "text": f"📏 Δ Price: {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
+        "task_id": task_id,
         "first": first,
         "second": second,
         "price_diff": price_diff,
@@ -5328,7 +5367,7 @@ def capture_click(clickData, measure_mode, points, task_id):
         "time_text": time_text,
         "bars_text": bars_text
     }
-    return {"first": first, "second": second}, result
+    return {"task_id": task_id, "first": first, "second": second}, result
 
 @app.callback(
     Output("measure-points-store", "data", allow_duplicate=True),
@@ -5659,11 +5698,11 @@ def update_task_chart(task_id, rsi_visible, strategy_visible, impulse_visible, e
     measure_first = None
     measure_second = None
     measure_text = ""
-    if isinstance(measure_result, dict):
+    if isinstance(measure_result, dict) and measure_result.get('task_id') == task_id:
         measure_first = measure_result.get('first')
         measure_second = measure_result.get('second')
         measure_text = measure_result.get('text', '')
-    if isinstance(measure_points, dict):
+    if isinstance(measure_points, dict) and measure_points.get('task_id') == task_id:
         measure_first = measure_points.get('first') or measure_first
         measure_second = measure_points.get('second') or measure_second
 
