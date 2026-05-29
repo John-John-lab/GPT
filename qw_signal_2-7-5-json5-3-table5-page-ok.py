@@ -2402,6 +2402,21 @@ function applyHiddenColumns() {
 }
 // ✅ OPTIMIZED: Removed MutationObserver - it was causing infinite loops and race conditions
 // Column hiding is now handled by CSS rules in the stylesheet, applied automatically on render
+// Push an action payload into a Dash Store immediately.  The previous
+// CustomEvent -> hidden button -> clientside callback bridge can miss clicks
+// in some Dash/browser combinations, leaving Chart/Details/Impulse buttons
+// visually clickable but with no Store update for the Python callback.
+function pushDashStore(storeId, payload, fallbackEventName) {
+    const eventPayload = Object.assign({ts: Date.now()}, payload);
+
+    if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
+        window.dash_clientside.set_props(storeId, {data: eventPayload});
+        return;
+    }
+
+    const event = new CustomEvent(fallbackEventName, {detail: eventPayload});
+    document.dispatchEvent(event);
+}
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
@@ -2455,14 +2470,11 @@ document.addEventListener('click', function(e) {
                     // Set the appropriate hidden store to trigger Dash callback
                     // Use CustomEvent to trigger Dash updates (Dash 4.x compatible)
                     if (actionType === 'chart') {
-                        const event = new CustomEvent('dash-chart-trigger', { detail: { task_id: taskId, action: actionType } });
-                        document.dispatchEvent(event);
+                        pushDashStore('chart-button-trigger', {task_id: taskId, action: actionType}, 'dash-chart-trigger');
                     } else if (actionType === 'details') {
-                        const event = new CustomEvent('dash-details-trigger', { detail: { task_id: taskId } });
-                        document.dispatchEvent(event);
+                        pushDashStore('strategy-details-trigger', {task_id: taskId, action: actionType}, 'dash-details-trigger');
                     } else if (actionType === 'impulse') {
-                        const event = new CustomEvent('dash-impulse-trigger', { detail: { task_id: taskId, action: actionType } });
-                        document.dispatchEvent(event);
+                        pushDashStore('impulse-button-trigger', {task_id: taskId, action: actionType}, 'dash-impulse-trigger');
                     } else if (actionType === 'rerun-strat' || actionType === 'rerun-impulse') {
                         // Use fetch for rerun actions since they modify server state
                         fetch('/task-action', {
@@ -5114,6 +5126,9 @@ def set_chart_task_id(trigger_data, click_store):
     
     if not task_id or action != "chart":
         return no_update, no_update
+
+    if click_store is None:
+        click_store = {}
     
     # Deduplication logic
     key = f"{task_id}_chart"
@@ -5131,10 +5146,11 @@ def set_chart_task_id(trigger_data, click_store):
 @app.callback(
     Output("chart-modal", "style"),
     Input("chart-task-id", "data"),
+    Input("chart-click-store", "data"),
     Input("close-chart-modal", "n_clicks"),
     prevent_initial_call=True
 )
-def toggle_chart_modal(task_id, close_clicks):
+def toggle_chart_modal(task_id, click_store, close_clicks):
     triggered = ctx.triggered_id
     if triggered == "close-chart-modal":
         return {"display": "none"}
