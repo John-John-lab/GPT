@@ -4187,6 +4187,52 @@ _page_html_cache = OrderedDict()
 _cached_golden_version = None
 
 
+def get_golden_store_version():
+    """Return the current Golden Store version used by UI cache keys."""
+    return golden_store_version
+
+
+def normalize_task_page(current_page, total_pages):
+    """Clamp a requested page index to the available task-table page range."""
+    try:
+        page = int(current_page or 0)
+    except (TypeError, ValueError):
+        page = 0
+    return max(0, min(page, max(1, total_pages) - 1))
+
+
+def get_display_page_slice(current_page, page_size=PAGE_SIZE, tasks=None):
+    """Return the Golden Store task snapshot and one visible page slice.
+
+    This is UI pagination only: it keeps the 300-row page model, preserves task
+    order, and does not calculate or mutate any task fields.
+    """
+    task_list = get_display_tasks_snapshot() if tasks is None else tasks
+    total_pages = max(1, (len(task_list) + page_size - 1) // page_size)
+    page = normalize_task_page(current_page, total_pages)
+    start_idx = page * page_size
+    end_idx = start_idx + page_size
+    return {
+        "tasks": task_list,
+        "visible_tasks": task_list[start_idx:end_idx],
+        "total_pages": total_pages,
+        "current_page": page,
+        "start_idx": start_idx,
+        "end_idx": end_idx,
+    }
+
+
+def should_show_table_logs(hide_logs_value):
+    """Return True when the UI-only table log column should render logs."""
+    return "hide" not in (hide_logs_value or ["hide"])
+
+
+def make_task_page_cache_key(current_page, version, show_table_logs):
+    """Build the versioned task-table page cache key used by the LRU cache."""
+    log_cache_mode = "logs_on" if show_table_logs else "logs_off"
+    return f"page_{current_page}_v{version}_{log_cache_mode}"
+
+
 def get_cached_task_page(cache_key):
     """Return a cached rendered task page and mark it recent, if present."""
     if cache_key not in _page_html_cache:
@@ -4249,8 +4295,8 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
         return html.Div("⏳ Recalculating... Please wait", style={"textAlign": "center", "padding": "20px", "fontSize": "16px", "color": "#666"})
     
     # Get tasks from Golden Store
-    t0 = time.time()
-    tasks = get_display_tasks_snapshot()
+    page_slice = get_display_page_slice(current_page)
+    tasks = page_slice["tasks"]
     source = "golden store" if golden_task_store_data is not None and len(golden_task_store_data) > 0 else "task_manager"
     perf_log(f"[TRACE] ✓ Loaded {len(tasks)} tasks from {source}")
     timer.check(f"Step 1: Get Data ({len(tasks)} tasks)")
@@ -4261,7 +4307,7 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
         return "No tasks."
     
     # CRITICAL CACHE CHECK
-    current_golden_version = golden_store_version
+    current_golden_version = get_golden_store_version()
     perf_log(f"[TRACE] Version check: cached={_cached_golden_version}, current={current_golden_version}")
     
     # Invalidate cache if data changed
@@ -4272,22 +4318,20 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
         timer.check("Cache Invalidated")
     
     # Pagination Slicing
-    PAGE_SIZE = 300
-    total_pages = max(1, (len(tasks) + PAGE_SIZE - 1) // PAGE_SIZE)
-    current_page = max(0, min(current_page or 0, total_pages - 1))
-    start_idx = current_page * PAGE_SIZE
-    end_idx = start_idx + PAGE_SIZE
-    visible_tasks = tasks[start_idx:end_idx]
+    current_page = page_slice["current_page"]
+    total_pages = page_slice["total_pages"]
+    start_idx = page_slice["start_idx"]
+    end_idx = page_slice["end_idx"]
+    visible_tasks = page_slice["visible_tasks"]
     perf_log(f"[TRACE] ✂️ Sliced tasks [{start_idx}:{end_idx}] → {len(visible_tasks)} visible")
     timer.check(f"Step 2: Pagination Slice")
 
     # UI-only table log toggle. Checked means keep table rows lightweight.
     # This does not modify task.log, JSON, or the Disable event logs processing flag.
-    show_table_logs = "hide" not in (hide_logs_value or ["hide"])
-    log_cache_mode = "logs_on" if show_table_logs else "logs_off"
+    show_table_logs = should_show_table_logs(hide_logs_value)
 
     # ⚡ CRITICAL FIX: Cache MUST use the normalized page, version, and log display mode.
-    cache_key = f"page_{current_page}_v{current_golden_version}_{log_cache_mode}"
+    cache_key = make_task_page_cache_key(current_page, current_golden_version, show_table_logs)
 
     # Return cached page if available (INSTANT - no HTML generation)
     cached_page = get_cached_task_page(cache_key)
