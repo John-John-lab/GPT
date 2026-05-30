@@ -465,6 +465,85 @@ def report_unclassified_task_fields(tasks, reason=""):
         print(f"⚠️ [FIELD CATALOG] {reason or '-'}: unclassified task fields: {sorted(unknown)}")
     return unknown
 
+def _snapshot_field_names(item):
+    """Return field names from a JSON dict or task object without mutating it."""
+    if isinstance(item, dict):
+        return set(item.keys())
+    if hasattr(item, "__dict__"):
+        return set(item.__dict__.keys())
+    return set()
+
+
+def audit_task_snapshot_compatibility(items, reason="", max_fields=8):
+    """Summarize old-JSON/new-formula compatibility gaps without changing data.
+
+    This intentionally inspects only field names. It does not calculate formulas,
+    fill defaults, clear fields, publish Golden Store data, or touch task state.
+    Missing derived fields are expected when opening an older JSON after adding a
+    new formula/event/table column; recalculation can populate them later.
+    """
+    records = list(items or [])
+    summary = {
+        "reason": reason or "-",
+        "total_items": len(records),
+        "unknown_fields": [],
+        "missing_static_fields": {},
+        "missing_derived_fields": {},
+        "recalc_recommended": False,
+    }
+    if not records:
+        return summary
+
+    unknown = set()
+    missing_static = {}
+    missing_derived = {}
+    for item in records:
+        fields = _snapshot_field_names(item)
+        if not fields:
+            continue
+        unknown.update(fields - TASK_KNOWN_FIELDS)
+        for field in STATIC_TASK_FIELDS:
+            if field not in fields:
+                missing_static[field] = missing_static.get(field, 0) + 1
+        for field in DERIVED_TASK_FIELDS:
+            if field not in fields:
+                missing_derived[field] = missing_derived.get(field, 0) + 1
+
+    summary["unknown_fields"] = sorted(unknown)
+    summary["missing_static_fields"] = dict(sorted(missing_static.items()))
+    summary["missing_derived_fields"] = dict(sorted(missing_derived.items()))
+    summary["recalc_recommended"] = bool(missing_derived)
+
+    label = reason or "-"
+    if unknown:
+        shown = sorted(unknown)[:max_fields]
+        suffix = "..." if len(unknown) > max_fields else ""
+        print(f"⚠️ [SNAPSHOT AUDIT] {label}: unknown fields not in catalog: {shown}{suffix}")
+    if missing_static:
+        shown = list(summary["missing_static_fields"].items())[:max_fields]
+        suffix = "..." if len(missing_static) > max_fields else ""
+        print(f"⚠️ [SNAPSHOT AUDIT] {label}: missing static fields: {shown}{suffix}")
+    if missing_derived:
+        shown = list(summary["missing_derived_fields"].items())[:max_fields]
+        suffix = "..." if len(missing_derived) > max_fields else ""
+        print(f"ℹ️ [SNAPSHOT AUDIT] {label}: older snapshot may need recalculation for derived fields: {shown}{suffix}")
+    return summary
+
+
+def format_snapshot_audit_note(audit):
+    """Return a short UI-safe note for compatibility findings."""
+    if not audit:
+        return ""
+    parts = []
+    missing_derived = audit.get("missing_derived_fields") or {}
+    unknown = audit.get("unknown_fields") or []
+    if missing_derived:
+        parts.append(f"ℹ️ {len(missing_derived)} newer calculated field(s) missing; recalc can populate them.")
+    if unknown:
+        parts.append(f"⚠️ {len(unknown)} uncatalogued field(s) found; data was loaded unchanged.")
+    return " | ".join(parts)
+
+
 # 🔧 GOLDEN STORE: Pre-processed task data cache
 golden_task_store_data = None
 golden_store_version = 0
@@ -6587,6 +6666,8 @@ def load_tasks_from_json(n, filepath):
     except Exception as e:
         return f"❌ Load failed: {str(e)}", [], 0, 0, 0, dash.no_update  # 🔧 Added 6th value
         
+    snapshot_audit = audit_task_snapshot_compatibility(data, reason="json_load_raw")
+
     loaded_ids = []
     skipped = 0
     new_tasks = {}
@@ -6659,6 +6740,9 @@ def load_tasks_from_json(n, filepath):
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
     if skipped > 0:
         msg += f" | ⚠️ Skipped {skipped} corrupted tasks"
+    audit_note = format_snapshot_audit_note(snapshot_audit)
+    if audit_note:
+        msg += f" | {audit_note}"
     # golden-store-version is the table/stat refresh trigger. Avoid also bumping
     # analysis-complete-trigger here because that path performs heavier
     # recalculation-oriented work before the first page can paint on older Macs.
@@ -6704,6 +6788,7 @@ def recalc_table_flags(n):
     if not tasks:
         return "⚠️ No completed tasks with signal data to recalc.", dash.no_update  # 🔧 Return tuple
     report_unclassified_task_fields(tasks, reason="recalc_table_flags")
+    audit_task_snapshot_compatibility(tasks, reason="before_recalc")
 
     # 🔧 CRITICAL: Serialize tasks to dict format INSIDE the main thread (same logic as save_tasks_to_json)
     # This ensures all attributes are properly captured before passing to background thread
