@@ -524,9 +524,15 @@ def audit_task_snapshot_compatibility(items, reason="", max_fields=8):
         suffix = "..." if len(missing_static) > max_fields else ""
         print(f"⚠️ [SNAPSHOT AUDIT] {label}: missing static fields: {shown}{suffix}")
     if missing_derived:
-        shown = list(summary["missing_derived_fields"].items())[:max_fields]
-        suffix = "..." if len(missing_derived) > max_fields else ""
-        print(f"ℹ️ [SNAPSHOT AUDIT] {label}: older snapshot may need recalculation for derived fields: {shown}{suffix}")
+        shown_fields = list(summary["missing_derived_fields"].keys())[:max_fields]
+        affected_count = max(missing_derived.values()) if missing_derived else 0
+        suffix = ", ..." if len(missing_derived) > max_fields else ""
+        print(
+            f"ℹ️ [SNAPSHOT AUDIT] {label}: Loaded JSON is compatible. "
+            f"{affected_count} task(s) are missing newer calculated field(s): "
+            f"{', '.join(shown_fields)}{suffix}. "
+            "Run recalculation only if you need these fields, then save a new JSON."
+        )
     return summary
 
 
@@ -538,7 +544,13 @@ def format_snapshot_audit_note(audit):
     missing_derived = audit.get("missing_derived_fields") or {}
     unknown = audit.get("unknown_fields") or []
     if missing_derived:
-        parts.append(f"ℹ️ {len(missing_derived)} newer calculated field(s) missing; recalc can populate them.")
+        affected_count = max(missing_derived.values()) if missing_derived else 0
+        fields = ", ".join(list(missing_derived.keys())[:4])
+        suffix = ", ..." if len(missing_derived) > 4 else ""
+        parts.append(
+            f"ℹ️ Loaded JSON is compatible. {affected_count} task(s) are missing newer calculated field(s): "
+            f"{fields}{suffix}. Run recalculation only if you need these fields, then save a new JSON."
+        )
     if unknown:
         parts.append(f"⚠️ {len(unknown)} uncatalogued field(s) found; data was loaded unchanged.")
     return " | ".join(parts)
