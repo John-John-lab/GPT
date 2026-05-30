@@ -386,8 +386,14 @@ DERIVED_TASK_FIELDS = {
     "max_adverse_before_return_pct", "max_adverse_before_return_time",
     "returned_to_signal", "max_adverse_sgnl_pct", "max_adverse_sgnl_time",
     "max_adverse_before_return_sgnl_pct", "max_adverse_before_return_sgnl_time",
+    "drawdown_before_return_sgnl_pct", "drawdown_before_return_sgnl_time",
     "returned_to_sgnl", "max_expected_sgnl_pct", "max_expected_sgnl_time",
 }
+
+# Internal state currently preserved by the broad JSON snapshot for backward
+# compatibility. Do not move these into RUNTIME_TASK_FIELDS unless intentionally
+# changing JSON/recalc persistence behavior.
+INTERNAL_SNAPSHOT_TASK_FIELDS = {"_batches_since_flush"}
 
 STATE_TASK_FIELDS = {
     "status", "progress", "log", "total_candles", "downloaded_candles",
@@ -419,8 +425,31 @@ TASK_INIT_FIELDS = (
 )
 
 SERIALIZED_TASK_FIELDS = (
-    STATIC_TASK_FIELDS | DERIVED_TASK_FIELDS | STATE_TASK_FIELDS | UI_TASK_FIELDS
+    STATIC_TASK_FIELDS
+    | DERIVED_TASK_FIELDS
+    | STATE_TASK_FIELDS
+    | UI_TASK_FIELDS
+    | INTERNAL_SNAPSHOT_TASK_FIELDS
 )
+
+TASK_KNOWN_FIELDS = SERIALIZED_TASK_FIELDS | RUNTIME_TASK_FIELDS
+
+
+def get_unclassified_task_fields(tasks):
+    """Return task attributes not covered by the field catalog. No behavior changes."""
+    unknown = set()
+    for task in tasks or []:
+        if hasattr(task, "__dict__"):
+            unknown.update(set(task.__dict__) - TASK_KNOWN_FIELDS)
+    return unknown
+
+
+def report_unclassified_task_fields(tasks, reason=""):
+    """Log catalog gaps so future JSON/recalc changes can be made safely."""
+    unknown = get_unclassified_task_fields(tasks)
+    if unknown:
+        print(f"⚠️ [FIELD CATALOG] {reason or '-'}: unclassified task fields: {sorted(unknown)}")
+    return unknown
 
 # 🔧 GOLDEN STORE: Pre-processed task data cache
 golden_task_store_data = None
@@ -465,6 +494,7 @@ def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
     """
     global golden_task_store_data, golden_store_version
     golden_task_store_data = list(tasks)
+    report_unclassified_task_fields(golden_task_store_data, reason=f"publish:{reason or '-'}")
     if bump_version:
         golden_store_version += 1
     reset_display_caches(reason or "publish")
@@ -6849,6 +6879,7 @@ def save_tasks_to_json(n, filename):
     
     # Get live tasks from RAM (Source of Truth)
     tasks = tm.get_all_tasks()
+    report_unclassified_task_fields(tasks, reason="save_tasks_to_json")
     
     # Build reconstructed data list
     serializable_data = []
@@ -7027,6 +7058,7 @@ def recalc_table_flags(n):
     tasks = [t for t in tm.get_all_tasks() if t.signal_time is not None and t.status == "completed"]
     if not tasks:
         return "⚠️ No completed tasks with signal data to recalc.", dash.no_update  # 🔧 Return tuple
+    report_unclassified_task_fields(tasks, reason="recalc_table_flags")
 
     # 🔧 CRITICAL: Serialize tasks to dict format INSIDE the main thread (same logic as save_tasks_to_json)
     # This ensures all attributes are properly captured before passing to background thread
