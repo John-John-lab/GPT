@@ -329,8 +329,19 @@ recalculation_complete_timestamp = 0
 # PERFORMANCE TRACING UTILITIES
 # =============================================================================
 
+# Keep verbose per-render tracing disabled by default. Printing dozens of trace
+# lines on every page/table render can noticeably slow older machines and does
+# not affect business logic. Set True only when profiling locally.
+PERF_TRACE_ENABLED = False
+
+
+def perf_log(message):
+    if PERF_TRACE_ENABLED:
+        print(message)
+
+
 class PerfTimer:
-    """High-precision timer for performance tracing."""
+    """High-precision timer for optional performance tracing."""
     def __init__(self, label):
         self.label = label
         self.start_time = None
@@ -339,21 +350,21 @@ class PerfTimer:
     def start(self):
         self.start_time = time.perf_counter()
         self.last_time = self.start_time
-        print(f"[TRACE] ⏱️  START: {self.label}")
+        perf_log(f"[TRACE] ⏱️  START: {self.label}")
         return self
         
     def check(self, step_name):
         current = time.perf_counter()
         elapsed = current - self.last_time
         total = current - self.start_time
-        print(f"[TRACE]    └─ {step_name}: {elapsed:.4f}s (Total: {total:.4f}s)")
+        perf_log(f"[TRACE]    └─ {step_name}: {elapsed:.4f}s (Total: {total:.4f}s)")
         self.last_time = current
         return self
         
     def end(self):
         if self.start_time:
             total = time.perf_counter() - self.start_time
-            print(f"[TRACE] ✅ END: {self.label} ({total:.4f}s)")
+            perf_log(f"[TRACE] ✅ END: {self.label} ({total:.4f}s)")
         return self
 
 
@@ -4099,7 +4110,7 @@ def cache_task_page(cache_key, page):
     _page_html_cache.move_to_end(cache_key)
     while len(_page_html_cache) > _PAGE_HTML_CACHE_MAX_PAGES:
         evicted_key, _ = _page_html_cache.popitem(last=False)
-        print(f"[TRACE] 🧹 Evicted cached task page '{evicted_key}' to keep cache <= {_PAGE_HTML_CACHE_MAX_PAGES}")
+        perf_log(f"[TRACE] 🧹 Evicted cached task page '{evicted_key}' to keep cache <= {_PAGE_HTML_CACHE_MAX_PAGES}")
 
 @app.callback(
     Output("task-table-container", "children"),
@@ -4129,17 +4140,17 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
         return dash.no_update
         
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    print(f"[DEBUG] 🔍 TRIGGER: {triggered_id} | version={version} | page={current_page}")
+    perf_log(f"[DEBUG] 🔍 TRIGGER: {triggered_id} | version={version} | page={current_page}")
     timer.check(f"Trigger Detected: {triggered_id}")
     
     # If only lock changed, don't re-render table
     if triggered_id == "recalc-lock-store" and version == getattr(update_task_table_only, '_last_version', None):
-        print(f"[TRACE] Skipping render - lock change only")
+        perf_log(f"[TRACE] Skipping render - lock change only")
         timer.check("Lock Skip").end()
         return dash.no_update
     
     update_task_table_only._last_version = version
-    print(f"[DEBUG] 📊 STATE: golden_store_version={golden_store_version}, cache_size={len(_page_html_cache)}")
+    perf_log(f"[DEBUG] 📊 STATE: golden_store_version={golden_store_version}, cache_size={len(_page_html_cache)}")
     
     # Lock check
     if lock_state and lock_state.get("locked", False):
@@ -4150,21 +4161,21 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     t0 = time.time()
     tasks = get_display_tasks_snapshot()
     source = "golden store" if golden_task_store_data is not None and len(golden_task_store_data) > 0 else "task_manager"
-    print(f"[TRACE] ✓ Loaded {len(tasks)} tasks from {source}")
+    perf_log(f"[TRACE] ✓ Loaded {len(tasks)} tasks from {source}")
     timer.check(f"Step 1: Get Data ({len(tasks)} tasks)")
     
     if not tasks:
-        print("[TRACE] ✗ No tasks found")
+        perf_log("[TRACE] ✗ No tasks found")
         timer.end()
         return "No tasks."
     
     # CRITICAL CACHE CHECK
     current_golden_version = golden_store_version
-    print(f"[TRACE] Version check: cached={_cached_golden_version}, current={current_golden_version}")
+    perf_log(f"[TRACE] Version check: cached={_cached_golden_version}, current={current_golden_version}")
     
     # Invalidate cache if data changed
     if _cached_golden_version != current_golden_version:
-        print(f"[TRACE] 🔄 Cache invalidated: {_cached_golden_version} -> {current_golden_version}")
+        perf_log(f"[TRACE] 🔄 Cache invalidated: {_cached_golden_version} -> {current_golden_version}")
         _page_html_cache.clear()
         _cached_golden_version = current_golden_version
         timer.check("Cache Invalidated")
@@ -4176,7 +4187,7 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     start_idx = current_page * PAGE_SIZE
     end_idx = start_idx + PAGE_SIZE
     visible_tasks = tasks[start_idx:end_idx]
-    print(f"[TRACE] ✂️ Sliced tasks [{start_idx}:{end_idx}] → {len(visible_tasks)} visible")
+    perf_log(f"[TRACE] ✂️ Sliced tasks [{start_idx}:{end_idx}] → {len(visible_tasks)} visible")
     timer.check(f"Step 2: Pagination Slice")
 
     # UI-only table log toggle. Checked means keep table rows lightweight.
@@ -4190,11 +4201,11 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     # Return cached page if available (INSTANT - no HTML generation)
     cached_page = get_cached_task_page(cache_key)
     if cached_page is not None:
-        print(f"[TRACE] ⚡ CACHE HIT for key '{cache_key}'! Returning cached page {current_page}")
+        perf_log(f"[TRACE] ⚡ CACHE HIT for key '{cache_key}'! Returning cached page {current_page}")
         timer.check("Cache Hit").end()
         return cached_page
 
-    print(f"[TRACE] ❌ CACHE MISS for key '{cache_key}'. Will generate rows.")
+    perf_log(f"[TRACE] ❌ CACHE MISS for key '{cache_key}'. Will generate rows.")
     timer.check("Cache Miss Confirmed")
     
     # Detect if this is ONLY a page navigation (no data change)
@@ -4205,9 +4216,9 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     # This ensures full stats are calculated after recalculation completes
     if triggered_id == "analysis-complete-trigger":
         is_page_only_nav = False
-        print(f"[TRACE] 🔄 Analysis trigger detected - forcing full stats recalculation")
+        perf_log(f"[TRACE] 🔄 Analysis trigger detected - forcing full stats recalculation")
     
-    print(f"[TRACE] Navigation detection: triggered={triggered_id}, prev_ver={prev_golden_version}, curr_ver={current_golden_version} → is_page_only_nav={is_page_only_nav}")
+    perf_log(f"[TRACE] Navigation detection: triggered={triggered_id}, prev_ver={prev_golden_version}, curr_ver={current_golden_version} → is_page_only_nav={is_page_only_nav}")
     timer.check("Navigation Detection")
     
     # Store current state for next comparison
@@ -4273,12 +4284,12 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     
     # Generate the visible table page ONLY (300 max) as raw HTML strings.
     # Keep this presentation-only: it formats fields that are already present on tasks.
-    print(f"[TRACE] 🚀 Starting table HTML generation for {len(visible_tasks)} tasks using optimized HTML string renderer...")
+    perf_log(f"[TRACE] 🚀 Starting table HTML generation for {len(visible_tasks)} tasks using optimized HTML string renderer...")
     t_table_start = time.time()
     table_html, row_count = render_task_table_html(visible_tasks, show_table_logs=show_table_logs)
     table_elapsed = time.time() - t_table_start
     per_row_ms = (table_elapsed / row_count * 1000) if row_count else 0
-    print(f"[TRACE] ✓ Generated table HTML for {row_count} rows in {table_elapsed:.2f}s ({per_row_ms:.1f}ms per row) - USING RAW HTML STRINGS")
+    perf_log(f"[TRACE] ✓ Generated table HTML for {row_count} rows in {table_elapsed:.2f}s ({per_row_ms:.1f}ms per row) - USING RAW HTML STRINGS")
     timer.check(f"Step 4-5: Table HTML Generation ({row_count} rows)")
 
 
@@ -4335,8 +4346,8 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     
     # Print final timing
     timer.end()
-    print(f"[TRACE] <<< COMPLETE Page {current_page} rendered in {timer.last_time - timer.start_time:.4f}s | Cache Size: {len(_page_html_cache)}")
-    print(f"[TRACE] ✓✓✓ RETURNING RESULT TO DASH UI ✓✓✓")
+    perf_log(f"[TRACE] <<< COMPLETE Page {current_page} rendered in {timer.last_time - timer.start_time:.4f}s | Cache Size: {len(_page_html_cache)}")
+    perf_log(f"[TRACE] ✓✓✓ RETURNING RESULT TO DASH UI ✓✓✓")
     
 
     return result
@@ -4812,375 +4823,6 @@ def render_signal_stats_table(tasks):
     ]
     return html.Table([html.Tbody(signal_stats_rows)], style={"border": "1px solid #4a90e2", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f0f7ff"})
 
-
-# 🔧 REMOVED DUPLICATE: This was a duplicate function definition without @app.callback decorator
-# The actual callback is defined at line 3695 with the proper @app.callback decorator
-# def update_task_table_only(current_page, version, lock_state, analysis_trigger):
-#     \"\"\"Render task table ONLY. Uses aggressive caching to skip HTML generation on page changes.\"\"\"
-#     global golden_task_store_data, golden_store_version, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
-
-
-    
-    # Initialize timer for full trace
-    timer = PerfTimer(f"Page {current_page} Render (v{version})").start()
-    
-    # Validate global state
-    if not hasattr(app, 'layout') or app.layout is None:
-        timer.check("Validation Failed").end()
-        return html.Div("", style={"display": "none"})
-    
-    # Get triggered input
-    ctx = dash.callback_context
-    if not ctx.triggered:
-        timer.check("No Trigger").end()
-        return dash.no_update
-        
-    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    print(f"[DEBUG] 🔍 TRIGGER: {triggered_id} | version={version} | page={current_page}")
-    timer.check(f"Trigger Detected: {triggered_id}")
-    
-    # If only lock changed, don't re-render table
-    if triggered_id == "recalc-lock-store" and version == getattr(update_task_table_only, '_last_version', None):
-        print(f"[TRACE] Skipping render - lock change only")
-        timer.check("Lock Skip").end()
-        return dash.no_update
-    
-    update_task_table_only._last_version = version
-    print(f"[DEBUG] 📊 STATE: golden_store_version={golden_store_version}, cache_size={len(_page_html_cache)}")
-    
-    # Lock check
-    if lock_state and lock_state.get("locked", False):
-        timer.check("Lock Active").end()
-        return html.Div("⏳ Recalculating... Please wait", style={"textAlign": "center", "padding": "20px", "fontSize": "16px", "color": "#666"})
-    
-    # Get tasks from Golden Store
-    t0 = time.time()
-    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
-        tasks = golden_task_store_data
-        print(f"[TRACE] ✓ Loaded {len(tasks)} tasks from golden store")
-    else:
-        with tm.lock:
-            tasks = list(tm.tasks.values())
-        print(f"[TRACE] ✓ Loaded {len(tasks)} tasks from task_manager")
-    timer.check(f"Step 1: Get Data ({len(tasks)} tasks)")
-    
-    if not tasks:
-        print("[TRACE] ✗ No tasks found")
-        timer.end()
-        return "No tasks."
-    
-    # CRITICAL CACHE CHECK
-    current_golden_version = golden_store_version
-    print(f"[TRACE] Version check: cached={_cached_golden_version}, current={current_golden_version}")
-    
-    # Invalidate cache if data changed
-    if _cached_golden_version != current_golden_version:
-        print(f"[TRACE] 🔄 Cache invalidated: {_cached_golden_version} -> {current_golden_version}")
-        _page_html_cache.clear()
-        _cached_golden_version = current_golden_version
-        timer.check("Cache Invalidated")
-    
-    # ⚡ CRITICAL FIX: Cache MUST use version in key to avoid stale data
-    cache_key = f"page_{current_page}_v{current_golden_version}"
-    
-    # Return cached page if available (INSTANT - no HTML generation)
-    if cache_key in _page_html_cache:
-        print(f"[TRACE] ⚡ CACHE HIT for key '{cache_key}'! Returning cached page {current_page}")
-        timer.check("Cache Hit").end()
-        return _page_html_cache[cache_key]
-    
-    print(f"[TRACE] ❌ CACHE MISS for key '{cache_key}'. Will generate rows.")
-    timer.check("Cache Miss Confirmed")
-    
-    force_refresh = version is not None and version > 0
-    
-    # Pagination Slicing
-    PAGE_SIZE = 300
-    total_pages = max(1, (len(tasks) + PAGE_SIZE - 1) // PAGE_SIZE)
-    current_page = max(0, min(current_page or 0, total_pages - 1))
-    start_idx = current_page * PAGE_SIZE
-    end_idx = start_idx + PAGE_SIZE
-    visible_tasks = tasks[start_idx:end_idx]
-    print(f"[TRACE] ✂️ Sliced tasks [{start_idx}:{end_idx}] → {len(visible_tasks)} visible")
-    timer.check(f"Step 2: Pagination Slice")
-    
-    # Detect if this is ONLY a page navigation (no data change)
-    prev_golden_version = getattr(update_task_table_only, '_last_golden_version', None)
-    is_page_only_nav = (triggered_id == "task-page-store") and (prev_golden_version is not None) and (current_golden_version == prev_golden_version)
-    
-    # 🔧 CRITICAL FIX: Also treat analysis_trigger as a data change (not page nav)
-    # This ensures full stats are calculated after recalculation completes
-    if triggered_id == "analysis-complete-trigger":
-        is_page_only_nav = False
-        print(f"[TRACE] 🔄 Analysis trigger detected - forcing full stats recalculation")
-    
-    print(f"[TRACE] Navigation detection: triggered={triggered_id}, prev_ver={prev_golden_version}, curr_ver={current_golden_version} → is_page_only_nav={is_page_only_nav}")
-    timer.check("Navigation Detection")
-    
-    # Store current state for next comparison
-    update_task_table_only._last_golden_version = current_golden_version
-    update_task_table_only._last_page = current_page
-    
-    timer.check("Step 3: Helper Functions Setup")
-    
-    # Generate rows for visible tasks ONLY (300 max) using extracted UI function
-    print(f"[TRACE] 🚀 Starting row generation for {len(visible_tasks)} tasks...")
-    t_row_start = time.time()
-    rows = [render_task_table_row(t) for t in visible_tasks]
-    row_count = len(rows)
-    
-    row_elapsed = time.time() - t_row_start
-    print(f"[TRACE] ✓ Generated {row_count} rows in {row_elapsed:.2f}s ({row_elapsed/row_count*1000:.1f}ms per row)")
-    timer.check(f"Step 4: Row Generation ({row_count} rows)")
-    
-    # Build table HTML using extracted UI function
-    t_table_start = time.time()
-    table = html.Table([
-        render_task_table_header(),
-        html.Tbody(rows)
-    ], style={"width": "100%", "borderCollapse": "collapse"})
-    print(f"[TRACE] ✓ Built table HTML in {time.time() - t_table_start:.2f}s")
-    timer.check("Step 5: Build Table HTML")
-
-    # ⚡ PERFORMANCE: Skip heavy stats calculation on page-only navigation
-    # This is the CRITICAL FIX - stats are calculated ONLY when version changes (data reload/recalc)
-    if is_page_only_nav:
-        # Return minimal stats for page navigation (no heavy iteration over all tasks)
-        # But we still need to show basic stats from ALL tasks (consistent across pages)
-        total_tasks = len(tasks)
-        completed_count = sum(1 for t in tasks if t.status == "completed")
-        
-        # ALL-task averages (still fast - just iterating, not generating HTML)
-        avg_adv = np.mean([t.max_adverse_move_pct for t in tasks if t.max_adverse_move_pct is not None and not is_na(t.max_adverse_move_pct)] or [0])
-        avg_dd = np.mean([t.drawdown_before_level for t in tasks if t.drawdown_before_level is not None and not is_na(t.drawdown_before_level)] or [0])
-        
-        stats_rows = [
-            html.Tr([html.Td("✅ Task Completed (Total)"), html.Td(str(completed_count))]),
-            html.Tr([html.Td("📦 Total Tasks"), html.Td(str(total_tasks))]),
-            html.Tr([html.Td("📉 Avg Max Adverse (All)"), html.Td(fmt_dd_ui(avg_adv))]),
-            html.Tr([html.Td("📉 Avg Drawdown Lvl (All)"), html.Td(fmt_dd_ui(avg_dd))])
-        ]
-        stats_table = html.Table([html.Tbody(stats_rows)], style={"border": "1px solid #ccc", "padding": "5px", "fontSize": "13px", "backgroundColor": "#f9f9f9"})
-        
-        # 🔧 FIX: Use cached signal stats from ALL tasks (calculated once per version)
-        print(f"[DEBUG] ⏭️ USING CACHED SIGNAL STATS")
-        stats_elapsed = 0.0
-        # Access global cache (already declared at function level)
-        signal_stats_table = cached_signal_stats_html if cached_signal_stats_html else html.Div("ℹ️ Stats loading...", style={"textAlign": "center", "padding": "10px", "color": "#555", "fontStyle": "italic"})
-    else:
-        # 🔧 CRITICAL: Calculate signal stats on ALL tasks when data loads/recalculates
-        print(f"[DEBUG] 🚀 CALCULATING SIGNAL STATS for {len(tasks)} tasks...")
-        
-        t_stats_start = time.time()
-
-        # ✅ BASIC STATS: Calculate only when data changes (not on page nav) - NOW USES ALL TASKS
-        total_tasks = len(tasks)
-        completed_count = sum(1 for t in tasks if t.status == "completed")
-
-        # ALL-task averages (consistent across all pages)
-        avg_adv = np.mean([t.max_adverse_move_pct for t in tasks if t.max_adverse_move_pct is not None and not is_na(t.max_adverse_move_pct)] or [0])
-        avg_dd = np.mean([t.drawdown_before_level for t in tasks if t.drawdown_before_level is not None and not is_na(t.drawdown_before_level)] or [0])
-
-        stats_rows = [
-            html.Tr([html.Td("✅ Task Completed (Total)"), html.Td(str(completed_count))]),
-            html.Tr([html.Td("📦 Total Tasks"), html.Td(str(total_tasks))]),
-            html.Tr([html.Td("📉 Avg Max Adverse (All)"), html.Td(fmt_dd_ui(avg_adv))]),
-            html.Tr([html.Td("📉 Avg Drawdown Lvl (All)"), html.Td(fmt_dd_ui(avg_dd))])
-        ]
-        stats_table = html.Table([html.Tbody(stats_rows)], style={"border": "1px solid #ccc", "padding": "5px", "fontSize": "13px", "backgroundColor": "#f9f9f9"})
-
-        # ✅ SIGNAL STATS: Calculated on ALL in-memory tasks (consistent denominator)
-        reached_level_cnt = sum(1 for t in tasks if t.reached_level)
-        reversed_dir_cnt = sum(1 for t in tasks if t.reversed_direction)
-        hit_1_cnt = sum(1 for t in tasks if t.reached_level and t.hit_1)
-        hit_1_5_cnt = sum(1 for t in tasks if t.reached_level and t.hit_1_5)
-        hit_2_cnt = sum(1 for t in tasks if t.reached_level and t.hit_2)
-        
-        def fmt_stat(stat_count, total):
-            if total == 0: return "0 / 0 (0.0%)"
-            return f"{stat_count} / {total} ({(stat_count/total)*100:.1f}%)"
-
-        # ----- Max Adverse Distribution Stats (compact format) -----
-        def get_adverse_range_ui(pct):
-            if pct is None or (isinstance(pct, float) and is_na(pct)):
-                return None
-            if 0 <= pct < 0.5: return "0-0.5%"
-            elif 0.5 <= pct < 1: return "0.5-1%"
-            elif 1 <= pct < 2: return "1-2%"
-            elif 2 <= pct < 3: return "2-3%"
-            elif 3 <= pct < 4: return "3-4%"
-            elif 4 <= pct < 5: return "4-5%"
-            elif 5 <= pct < 10: return "5-10%"
-            elif 10 <= pct < 20: return "10-20%"
-            elif 20 <= pct < 30: return "20-30%"
-            elif pct >= 30: return ">30%"
-            return None
-
-        # Count tasks in each adverse range (only for reached_level tasks)
-        adverse_counts = {}
-        for t in tasks:
-            adv = t.max_adverse_move_pct
-            if t.reached_level and adv is not None and not (isinstance(adv, float) and is_na(adv)):
-                range_key = get_adverse_range_ui(adv)
-                if range_key:
-                    adverse_counts[range_key] = adverse_counts.get(range_key, 0) + 1
-
-        # Format as two compact rows (5 ranges each) to save vertical space
-        ranges = ["0-0.5%", "0.5-1%", "1-2%", "2-3%", "3-4%", "4-5%", "5-10%", "10-20%", "20-30%", ">30%"]
-        row1_adv = " | ".join([f"{r}:{adverse_counts.get(r,0)}" for r in ranges[:5]])
-        row2_adv = " | ".join([f"{r}:{adverse_counts.get(r,0)}" for r in ranges[5:]])
-
-        # 🔧 Calculate cumulative totals for Max Adverse
-        adv_05_plus_total = 0
-        adv_4_plus_total = 0
-        for t in tasks:
-            adv = t.max_adverse_move_pct
-            if t.reached_level and adv is not None and not (isinstance(adv, float) and is_na(adv)):
-                if adv >= 0.5:
-                    adv_05_plus_total += 1
-                if adv >= 4.0:
-                    adv_4_plus_total += 1
-
-        # 🔧 NEW: Calculate distribution & cumulative totals for Max Expected
-        exp_counts = {}
-        exp_05_plus_total = 0
-        exp_4_plus_total = 0
-        for t in tasks:
-            exp = t.max_expected_move_pct
-            if t.reached_level and exp is not None and not (isinstance(exp, float) and is_na(exp)):
-                range_key = get_adverse_range_ui(exp)
-                if range_key:
-                    exp_counts[range_key] = exp_counts.get(range_key, 0) + 1
-                if exp >= 0.5:
-                    exp_05_plus_total += 1
-                if exp >= 4.0:
-                    exp_4_plus_total += 1
-                
-        row1_exp = " | ".join([f"{r}:{exp_counts.get(r,0)}" for r in ranges[:5]])
-        row2_exp = " | ".join([f"{r}:{exp_counts.get(r,0)}" for r in ranges[5:]])
-
-        # Define uniform style for all cells in the summary table
-        td_style = {"fontSize": "13px", "fontWeight": "normal", "padding": "2px 5px"}
-        
-        # Calculate (sgnl) statistics for Adverse & Expected - OPTIMIZED with direct attribute access
-        adv_sgnl_counts = {}; exp_sgnl_counts = {}
-        adv_sgnl_05 = 0; adv_sgnl_4 = 0; exp_sgnl_05 = 0; exp_sgnl_4 = 0
-        for t in tasks:
-            adv_s = t.max_adverse_sgnl_pct
-            if adv_s is not None and not (isinstance(adv_s, float) and is_na(adv_s)):
-                r = get_adverse_range_ui(adv_s)
-                if r: adv_sgnl_counts[r] = adv_sgnl_counts.get(r, 0) + 1
-                if adv_s >= 0.5: adv_sgnl_05 += 1
-                if adv_s >= 4.0: adv_sgnl_4 += 1
-            exp_s = t.max_expected_sgnl_pct
-            if exp_s is not None and not (isinstance(exp_s, float) and is_na(exp_s)):
-                r = get_adverse_range_ui(exp_s)
-                if r: exp_sgnl_counts[r] = exp_sgnl_counts.get(r, 0) + 1
-                if exp_s >= 0.5: exp_sgnl_05 += 1
-                if exp_s >= 4.0: exp_sgnl_4 += 1
-                
-        row1_adv_s = " | ".join([f"{r}:{adv_sgnl_counts.get(r,0)}" for r in ranges[:5]])
-        row2_adv_s = " | ".join([f"{r}:{adv_sgnl_counts.get(r,0)}" for r in ranges[5:]])
-        row1_exp_s = " | ".join([f"{r}:{exp_sgnl_counts.get(r,0)}" for r in ranges[:5]])
-        row2_exp_s = " | ".join([f"{r}:{exp_sgnl_counts.get(r,0)}" for r in ranges[5:]])
-        
-        # Delta Price (sgnl to lvl) Distribution
-        delta_counts = {k: 0 for k in ranges}
-        delta_05_plus_total = 0
-        delta_4_plus_total = 0
-        for t in tasks:
-            dp = t.price_change_pct
-            if dp is not None and not (isinstance(dp, float) and is_na(dp)):
-                val = abs(dp)
-                r = get_adverse_range_ui(val)
-                if r:
-                    delta_counts[r] += 1
-                if val >= 0.5: delta_05_plus_total += 1
-                if val >= 4.0: delta_4_plus_total += 1
-
-        row1_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[:5]])
-        row2_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[5:]])
-
-        signal_stats_rows = [
-            html.Tr([html.Td("Reached Level", style=td_style), html.Td(fmt_stat(reached_level_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Reversed Direction", style=td_style), html.Td(fmt_stat(reversed_dir_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
-            html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
-            # Max Adverse (lvl) Rows
-            html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
-            html.Tr([html.Td("Max Adv 0.5%+ Total (lvl)", style=td_style), html.Td(str(adv_05_plus_total), style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ Total (lvl)", style=td_style), html.Td(str(adv_4_plus_total), style=td_style)]),
-            # Max Expected (lvl) Rows
-            html.Tr([html.Td("Max Exp 0-4% (lvl)", style=td_style), html.Td(row1_exp, style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ (lvl)", style=td_style), html.Td(row2_exp, style=td_style)]),
-            html.Tr([html.Td("Max Exp 0.5%+ Total (lvl)", style=td_style), html.Td(str(exp_05_plus_total), style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ Total (lvl)", style=td_style), html.Td(str(exp_4_plus_total), style=td_style)]),
-            # Max Adverse (sgnl) Rows
-            html.Tr([html.Td("Max Adv 0-4% (sgnl)", style=td_style), html.Td(row1_adv_s, style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ (sgnl)", style=td_style), html.Td(row2_adv_s, style=td_style)]),
-            html.Tr([html.Td("Max Adv 0.5%+ Total (sgnl)", style=td_style), html.Td(str(adv_sgnl_05), style=td_style)]),
-            html.Tr([html.Td("Max Adv 4%+ Total (sgnl)", style=td_style), html.Td(str(adv_sgnl_4), style=td_style)]),
-            # Max Expected (sgnl) Rows
-            html.Tr([html.Td("Max Exp 0-4% (sgnl)", style=td_style), html.Td(row1_exp_s, style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ (sgnl)", style=td_style), html.Td(row2_exp_s, style=td_style)]),
-            html.Tr([html.Td("Max Exp 0.5%+ Total (sgnl)", style=td_style), html.Td(str(exp_sgnl_05), style=td_style)]),
-            html.Tr([html.Td("Max Exp 4%+ Total (sgnl)", style=td_style), html.Td(str(exp_sgnl_4), style=td_style)]),
-            # Delta Price Rows
-            html.Tr([html.Td("Delta Price 0-4%", style=td_style), html.Td(row1_delta, style=td_style)]),
-            html.Tr([html.Td("Delta Price 4%+", style=td_style), html.Td(row2_delta, style=td_style)]),
-            html.Tr([html.Td("Delta Price 0.5%+ Total", style=td_style), html.Td(str(delta_05_plus_total), style=td_style)]),
-            html.Tr([html.Td("Delta Price 4%+ Total", style=td_style), html.Td(str(delta_4_plus_total), style=td_style)]),
-        ]
-        signal_stats_table = html.Table([html.Tbody(signal_stats_rows)], style={"border": "1px solid #4a90e2", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f0f7ff"})
-        
-        # Cache the stats for ALL tasks (calculated once per version)
-        cached_signal_stats_html = signal_stats_table
-        cached_small_stats_data = {"completed": completed_count, "total": total_tasks, "avg_adv": avg_adv, "avg_dd": avg_dd}
-        stats_cache_version = golden_store_version
-        
-        stats_elapsed = time.time() - t_stats_start
-        print(f"[DEBUG] ✅ SIGNAL STATS COMPLETE in {stats_elapsed:.2f}s (cached for version {stats_cache_version})")
-    
-    # 🔧 PAGINATION NAVIGATION
-    nav_buttons = []
-    nav_buttons.append(html.Button("<< Prev", id={"type":"page-nav","index":"prev"}, disabled=(current_page==0), style={"margin":"2px"}))
-    for p in range(total_pages):
-        btn_style = {"margin":"2px", "padding":"2px 6px", "fontWeight":"bold" if p==current_page else "normal"}
-        nav_buttons.append(html.Button(str(p+1), id={"type":"page-nav","index":p}, style=btn_style))
-    nav_buttons.append(html.Button("Next >>", id={"type":"page-nav","index":"next"}, disabled=(current_page==total_pages-1), style={"margin":"2px"}))
-    nav_container = html.Div(nav_buttons, style={"display":"flex", "alignItems":"center", "marginBottom":"8px", "justifyContent":"center"})
-    timer.check("Step 7: Build Pagination Nav")
-
-    result = html.Div([
-        html.H4("Task Summary"),
-        nav_container,
-        dcc.Markdown(table_html, dangerously_allow_html=True, style={"overflow-x": "auto", "overflow-y": "auto", "max-height": "75vh", "width": "100%"}),
-        html.P(f"📄 Page {current_page+1} of {total_pages} | Showing tasks {start_idx+1}-{min(end_idx, len(tasks))} of {len(tasks)}", style={"textAlign":"center", "fontSize":"12px", "color":"#555"}),
-        stats_table,
-        html.H5("Signal Performance Summary", style={"marginTop": "15px", "marginBottom": "5px"}),
-        signal_stats_table,
-        html.P(
-            "ℹ️ Hit % metrics measure price movement ≥1%/1.5%/2% **in the EXPECTED direction** from the signal level base. "
-            "Resistance: Price moves UP ≥X% from level. Support: Price moves DOWN ≥X% from level. "
-            "Hits are only counted if the price actually touched the level first.",
-            style={"fontSize": "11px", "color": "#777", "marginTop": "6px", "marginBottom": "0", "fontStyle": "italic"}
-        )
-    ])
-    timer.check("Step 8: Build Final Result Div")
-    
-    # ⚡ CACHE THE RESULT with version key for instant page switching (ALWAYS cache, regardless of stats)
-    # The table HTML is the same whether we calculated full stats or page-only stats
-    _page_html_cache[cache_key] = result
-    timer.check("Step 9: Cache Result")
-    
-    # Print final timing
-    timer.end()
-    print(f"[TRACE] <<< COMPLETE Page {current_page} rendered in {timer.last_time - timer.start_time:.4f}s | Cache Size: {len(_page_html_cache)}")
-    print(f"[TRACE] ✓✓✓ RETURNING RESULT TO DASH UI ✓✓✓")
-    
-    return result
 
 @app.callback(
     Output("task-page-store", "data"),
