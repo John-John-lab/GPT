@@ -105,6 +105,42 @@ UI reads Golden Store
 User can save new JSON snapshot
 ```
 
+### 1.6 Formula and JSON Evolution Requirement
+
+The application must remain flexible because its purpose is to test new trading approaches. New events, new task-table columns, and changed formulas are expected to appear over time. Therefore, refactoring must support schema evolution instead of assuming that one JSON format or one formula set is final.
+
+Required behavior for future formula/event changes:
+
+1. Old saved JSON files must still open in the app.
+2. Missing fields from older JSON files should be treated as normal, not as load errors.
+3. Existing static task fields should remain the stable identity of each task.
+4. New derived fields should be filled by recalculation when they cannot be read from the old JSON.
+5. Formula changes should overwrite or recompute only the affected derived fields while preserving static fields.
+6. After recalculation, the updated task snapshot should be publishable to Golden Store and saveable as a new JSON file.
+7. The field catalog should be updated whenever a new formula, event, or table column introduces a new task attribute.
+
+This means the field catalog is not meant to freeze the model. It is a safety map. It should make future additions explicit: decide whether each new field is static, derived, UI/state, internal snapshot, or runtime-only.
+
+Recommended safe workflow for adding a new formula or event:
+
+```text
+Add or change formula/event logic
+    ↓
+Add the new task attribute to the field catalog
+    ↓
+Open an older JSON file
+    ↓
+Recalculate completed tasks
+    ↓
+Verify old static fields are preserved
+    ↓
+Verify the new derived field is populated
+    ↓
+Publish to Golden Store
+    ↓
+Save a new JSON snapshot
+```
+
 ---
 
 ## 2. How the Current Code Matches the Concept

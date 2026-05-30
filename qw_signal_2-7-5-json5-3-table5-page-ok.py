@@ -360,7 +360,10 @@ class PerfTimer:
 # ---------- Task field catalog (documentation-first; preserves current behavior) ----------
 # These groups make JSON/recalc changes safer by naming the field types in one
 # place. They do not change formulas, event detection, downloading, validation,
-# or the current broad JSON snapshot behavior.
+# or the current broad JSON snapshot behavior. The catalog is intentionally
+# evolvable: when new formulas/events/table columns add task attributes, classify
+# them here so old JSON snapshots can still load and then be recalculated into a
+# new JSON snapshot with the new derived data.
 STATIC_TASK_FIELDS = {
     "task_id", "symbols", "timeframe", "mode", "start_date", "end_date",
     "overwrite", "price_continuity_check", "signal_time", "signal_price",
