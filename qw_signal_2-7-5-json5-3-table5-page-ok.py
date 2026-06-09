@@ -4233,6 +4233,36 @@ def make_task_page_cache_key(current_page, version, show_table_logs):
     return f"page_{current_page}_v{version}_{log_cache_mode}"
 
 
+def build_cached_summary_panels(current_golden_version, tasks):
+    """Return cached summary/stat UI for the table page without recalculating stats.
+
+    The dedicated summary callback owns the heavy all-task aggregation. The
+    task-table callback should only reuse cached panels or show lightweight
+    placeholders while those caches are being refreshed.
+    """
+    if cached_small_stats_data and stats_cache_version == current_golden_version:
+        stats_table = render_basic_stats_table(
+            cached_small_stats_data.get("completed", 0),
+            cached_small_stats_data.get("total", len(tasks)),
+            cached_small_stats_data.get("avg_adv", 0),
+            cached_small_stats_data.get("avg_dd", 0),
+        )
+    else:
+        stats_table = html.Div(
+            "ℹ️ Summary stats are updating...",
+            style={"textAlign": "center", "padding": "8px", "color": "#555", "fontStyle": "italic"}
+        )
+
+    if cached_signal_stats_html and stats_cache_version == current_golden_version:
+        signal_stats_table = cached_signal_stats_html
+    else:
+        signal_stats_table = html.Div(
+            "ℹ️ Signal Performance Summary is updating...",
+            style={"textAlign": "center", "padding": "10px", "color": "#555", "fontStyle": "italic"}
+        )
+    return stats_table, signal_stats_table
+
+
 def get_cached_task_page(cache_key):
     """Return a cached rendered task page and mark it recent, if present."""
     if cache_key not in _page_html_cache:
@@ -4430,29 +4460,9 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
 
 
     # ⚡ PERFORMANCE: the dedicated summary callback owns the full all-task
-    # Signal Performance Summary. The task-table callback should only render the
-    # current 300-row page, otherwise first page paint can block for a long time
-    # on old hardware and page/chart clicks can show a transient "Stats loading".
-    if cached_small_stats_data and stats_cache_version == current_golden_version:
-        stats_table = render_basic_stats_table(
-            cached_small_stats_data.get("completed", 0),
-            cached_small_stats_data.get("total", len(tasks)),
-            cached_small_stats_data.get("avg_adv", 0),
-            cached_small_stats_data.get("avg_dd", 0),
-        )
-    else:
-        stats_table = html.Div(
-            "ℹ️ Summary stats are updating...",
-            style={"textAlign": "center", "padding": "8px", "color": "#555", "fontStyle": "italic"}
-        )
-
-    if cached_signal_stats_html and stats_cache_version == current_golden_version:
-        signal_stats_table = cached_signal_stats_html
-    else:
-        signal_stats_table = html.Div(
-            "ℹ️ Signal Performance Summary is updating...",
-            style={"textAlign": "center", "padding": "10px", "color": "#555", "fontStyle": "italic"}
-        )
+    # Signal Performance Summary. The task-table callback reuses cached panels
+    # and never recalculates all-task stats on page navigation.
+    stats_table, signal_stats_table = build_cached_summary_panels(current_golden_version, tasks)
     # 🔧 PAGINATION NAVIGATION
     nav_container = render_pagination_nav(current_page, total_pages)
     timer.check("Step 7: Build Pagination Nav")
