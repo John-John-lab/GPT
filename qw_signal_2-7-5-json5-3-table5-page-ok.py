@@ -113,6 +113,32 @@ def get_adverse_range_ui(pct):
     elif pct >= 30: return ">30%"
     return None
 
+STRATEGY_TP_LEVELS = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+STRATEGY_STOP_LOSS_PCT = 0.12
+
+def fmt_strategy_tp_ui(val):
+    """Format the max reached take-profit tier for the entry-from-next-candle strategy."""
+    if val is None:
+        return "-"
+    try:
+        val = float(val)
+    except Exception:
+        return "-"
+    if val <= 0:
+        return "0%"
+    if val >= 4.0:
+        return "4%+"
+    return f"{val:g}%"
+
+def strategy_hit_count(tasks, pct):
+    """Count tasks whose strategy reached at least pct before the 0.12% stop loss."""
+    return sum(
+        1 for t in tasks
+        if getattr(t, 'strategy_entry_valid', False)
+        and not getattr(t, 'strategy_stop_loss_hit', False)
+        and (getattr(t, 'strategy_max_tp_pct', 0) or 0) >= pct
+    )
+
 # 🔧 CRITICAL: Global aliases for thread-safe numpy/bisect access in background threads
 np_local_global = None
 bisect_local_global = None
@@ -686,6 +712,19 @@ class DownloadTask:
         self.returned_to_sgnl = False
         self.max_expected_sgnl_pct = None
         self.max_expected_sgnl_time = None
+        # Entry-from-next-candle strategy check:
+        # buy toward resistance / sell toward support, 0.12% SL from entry,
+        # record the maximum TP tier reached before the stop loss.
+        self.strategy_entry_valid = False
+        self.strategy_order_side = None
+        self.strategy_entry_price = None
+        self.strategy_entry_time = None
+        self.strategy_stop_loss_price = None
+        self.strategy_stop_loss_hit = False
+        self.strategy_stop_loss_time = None
+        self.strategy_max_tp_pct = 0.0
+        self.strategy_max_tp_time = None
+        self.strategy_level_reached_after_entry = False
         self.status = "queued"
         self.progress = 0.0
         self.log = []
@@ -1770,6 +1809,75 @@ class DownloadTask:
 
         if self.log_events:
             self.add_log(f"Fast Hit targets (from signal time): 1%={self.hit_1}, 1.5%={self.hit_1_5}, 2%={self.hit_2}")
+
+        # ----- Entry-from-next-candle strategy check -----
+        # Logic: enter at the OPEN of the candle immediately after the signal.
+        # resistance => BUY toward the level; support => SELL toward the level.
+        # A 0.12% stop loss is checked conservatively before TP checks inside each candle.
+        self.strategy_entry_valid = False
+        self.strategy_order_side = None
+        self.strategy_entry_price = None
+        self.strategy_entry_time = None
+        self.strategy_stop_loss_price = None
+        self.strategy_stop_loss_hit = False
+        self.strategy_stop_loss_time = None
+        self.strategy_max_tp_pct = 0.0
+        self.strategy_max_tp_time = None
+        self.strategy_level_reached_after_entry = False
+
+        entry_idx_next = signal_idx + 1
+        if entry_idx_next < len(df) and self.signal_direction in ('resistance', 'support'):
+            entry_row = df.iloc[entry_idx_next]
+            entry_price_next = float(entry_row['open'])
+            if entry_price_next > 0:
+                is_buy_strategy = self.signal_direction == 'resistance'
+                level_is_ahead = self.signal_price > entry_price_next if is_buy_strategy else self.signal_price < entry_price_next
+                self.strategy_entry_valid = bool(level_is_ahead)
+                self.strategy_order_side = 'buy' if is_buy_strategy else 'sell'
+                self.strategy_entry_price = entry_price_next
+                self.strategy_entry_time = int(entry_row['timestamp'])
+                self.strategy_stop_loss_price = (
+                    entry_price_next * (1 - STRATEGY_STOP_LOSS_PCT / 100)
+                    if is_buy_strategy else
+                    entry_price_next * (1 + STRATEGY_STOP_LOSS_PCT / 100)
+                )
+
+                if self.strategy_entry_valid:
+                    for _, row in df.iloc[entry_idx_next:].iterrows():
+                        ts = int(row['timestamp'])
+                        high = float(row['high'])
+                        low = float(row['low'])
+
+                        stop_hit = low <= self.strategy_stop_loss_price if is_buy_strategy else high >= self.strategy_stop_loss_price
+                        # Conservative same-candle assumption: if SL and TP are both inside the
+                        # candle range, count the stop first because intrabar order is unknown.
+                        if stop_hit:
+                            self.strategy_stop_loss_hit = True
+                            self.strategy_stop_loss_time = ts
+                            break
+
+                        favorable_pct = (
+                            (high - entry_price_next) / entry_price_next * 100
+                            if is_buy_strategy else
+                            (entry_price_next - low) / entry_price_next * 100
+                        )
+                        for tp_pct in STRATEGY_TP_LEVELS:
+                            if favorable_pct >= tp_pct and tp_pct > self.strategy_max_tp_pct:
+                                self.strategy_max_tp_pct = tp_pct
+                                self.strategy_max_tp_time = ts
+
+                        level_hit = high >= self.signal_price if is_buy_strategy else low <= self.signal_price
+                        if level_hit:
+                            self.strategy_level_reached_after_entry = True
+                            break
+
+                if self.log_events:
+                    self.add_log(
+                        f"Next-candle strategy: side={self.strategy_order_side}, "
+                        f"entry={self.strategy_entry_price:.8f}, SL={self.strategy_stop_loss_price:.8f}, "
+                        f"maxTP={fmt_strategy_tp_ui(self.strategy_max_tp_pct)}, "
+                        f"SL hit={self.strategy_stop_loss_hit}"
+                    )
 
         # =====================================================================
         # 🔧 VECTORISED HIT TIMING (Replaces iterrows loop at line 1705)
@@ -3776,6 +3884,14 @@ def update_summary_stats_only(version, lock_state):
         html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
         html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
         html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy valid entries", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False)), total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy stop losses (0.12%)", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False) and getattr(t, 'strategy_stop_loss_hit', False)), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 0.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 0.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 2% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 2.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 3% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 3.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 4%+ before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 4.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
         html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
         html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
         html.Tr([html.Td("Max Adv 0.5%+ Total (lvl)", style=td_style), html.Td(str(adv_05_plus_total), style=td_style)]),
@@ -3806,7 +3922,9 @@ def update_summary_stats_only(version, lock_state):
         html.P(
             "ℹ️ Hit % metrics measure price movement ≥1%/1.5%/2% **in the EXPECTED direction** from the signal level base. "
             "Resistance: Price moves UP ≥X% from level. Support: Price moves DOWN ≥X% from level. "
-            "Hits are only counted if the price actually touched the level first.",
+            "Hits are only counted if the price actually touched the level first. "
+            "New strategy rows enter at the next candle open, use a conservative stop-first same-candle rule, "
+            "and count only the maximum TP tier reached before any 0.12% stop loss.",
             style={"fontSize": "11px", "color": "#777", "marginTop": "6px", "marginBottom": "0", "fontStyle": "italic"}
         )
     ])
@@ -4241,6 +4359,14 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
             html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
             html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
             html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy valid entries", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False)), total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy stop losses (0.12%)", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False) and getattr(t, 'strategy_stop_loss_hit', False)), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 0.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 0.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 2% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 2.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 3% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 3.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 4%+ before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 4.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
             # Max Adverse (lvl) Rows
             html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
             html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
@@ -4298,7 +4424,9 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger):
         html.P(
             "ℹ️ Hit % metrics measure price movement ≥1%/1.5%/2% **in the EXPECTED direction** from the signal level base. "
             "Resistance: Price moves UP ≥X% from level. Support: Price moves DOWN ≥X% from level. "
-            "Hits are only counted if the price actually touched the level first.",
+            "Hits are only counted if the price actually touched the level first. "
+            "New strategy rows enter at the next candle open, use a conservative stop-first same-candle rule, "
+            "and count only the maximum TP tier reached before any 0.12% stop loss.",
             style={"fontSize": "11px", "color": "#777", "marginTop": "6px", "marginBottom": "0", "fontStyle": "italic"}
         )
     ])
@@ -4332,6 +4460,11 @@ def render_task_table_row(t):
     hit_1_display = "Yes" if t.hit_1 else "No"
     hit_1_5_display = "Yes" if t.hit_1_5 else "No"
     hit_2_display = "Yes" if t.hit_2 else "No"
+    strat_entry_display = "Yes" if getattr(t, 'strategy_entry_valid', False) else "No"
+    strat_side_display = getattr(t, 'strategy_order_side', None) or "-"
+    strat_entry_price_display = f"{float(getattr(t, 'strategy_entry_price')):.8f}" if getattr(t, 'strategy_entry_price', None) is not None else "-"
+    strat_sl_hit_display = "Yes" if getattr(t, 'strategy_stop_loss_hit', False) else "No"
+    strat_max_tp_display = fmt_strategy_tp_ui(getattr(t, 'strategy_max_tp_pct', None))
     
     strategy_display = t.strategy_log_summary if t.strategy_log_summary else '-'
     strategy_conf = t.strategy_confidence if t.strategy_confidence else 0
@@ -4405,6 +4538,13 @@ def render_task_table_row(t):
         <td style="min-width:50px">{hit_1_display}</td>
         <td style="min-width:60px">{hit_1_5_display}</td>
         <td style="min-width:50px">{hit_2_display}</td>
+        <td style="min-width:80px">{strat_entry_display}</td>
+        <td style="min-width:70px">{strat_side_display}</td>
+        <td style="min-width:110px">{strat_entry_price_display}</td>
+        <td style="min-width:80px">{strat_sl_hit_display}</td>
+        <td style="min-width:140px">{fmt_time_ui(getattr(t, 'strategy_stop_loss_time', None))}</td>
+        <td style="min-width:90px">{strat_max_tp_display}</td>
+        <td style="min-width:140px">{fmt_time_ui(getattr(t, 'strategy_max_tp_time', None))}</td>
         <td style="min-width:50px">{"Yes" if t.first_hit_1_expected else "No"}</td>
         <td style="min-width:140px">{fmt_time_ui(t.first_hit_1_expected_time)}</td>
         <td style="min-width:60px">{"Yes" if t.first_hit_1_5_expected else "No"}</td>
@@ -4466,6 +4606,13 @@ def render_task_table_header():
         html.Th("Hit 1% (lvl-fwd.dir)", style={"minWidth": "50px"}),
         html.Th("Hit 1.5% (lvl-fwd.dir)", style={"minWidth": "60px"}),
         html.Th("Hit 2% (lvl-fwd.dir)", style={"minWidth": "50px"}),
+        html.Th("Strat Valid", style={"minWidth": "80px"}),
+        html.Th("Strat Side", style={"minWidth": "70px"}),
+        html.Th("Strat Entry", style={"minWidth": "110px"}),
+        html.Th("Strat SL?", style={"minWidth": "80px"}),
+        html.Th("Strat SL Time", style={"minWidth": "140px"}),
+        html.Th("Strat Max TP", style={"minWidth": "90px"}),
+        html.Th("Strat Max TP Time", style={"minWidth": "140px"}),
         html.Th("1st 1% Exp", style={"minWidth": "50px"}),
         html.Th("Time 1% Exp", style={"minWidth": "140px"}),
         html.Th("1st 1.5% Exp", style={"minWidth": "60px"}),
@@ -4551,6 +4698,8 @@ def render_signal_stats_table(tasks):
     hit_1_cnt = sum(1 for t in tasks if t.reached_level and t.hit_1)
     hit_1_5_cnt = sum(1 for t in tasks if t.reached_level and t.hit_1_5)
     hit_2_cnt = sum(1 for t in tasks if t.reached_level and t.hit_2)
+    strategy_valid_cnt = sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))
+    strategy_sl_cnt = sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False) and getattr(t, 'strategy_stop_loss_hit', False))
     
     def fmt_stat(stat_count, total):
         if total == 0: return "0 / 0 (0.0%)"
@@ -4663,6 +4812,22 @@ def render_signal_stats_table(tasks):
         html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
         html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
         html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy valid entries", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False)), total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy stop losses (0.12%)", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False) and getattr(t, 'strategy_stop_loss_hit', False)), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 0.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 0.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 2% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 2.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 3% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 3.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 4%+ before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 4.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+        html.Tr([html.Td("Strategy valid entries", style=td_style), html.Td(fmt_stat(strategy_valid_cnt, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Strategy stop losses (0.12%)", style=td_style), html.Td(fmt_stat(strategy_sl_cnt, strategy_valid_cnt), style=td_style)]),
+        html.Tr([html.Td("Strategy reached 0.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 0.5), strategy_valid_cnt), style=td_style)]),
+        html.Tr([html.Td("Strategy reached 1% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.0), strategy_valid_cnt), style=td_style)]),
+        html.Tr([html.Td("Strategy reached 1.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.5), strategy_valid_cnt), style=td_style)]),
+        html.Tr([html.Td("Strategy reached 2% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 2.0), strategy_valid_cnt), style=td_style)]),
+        html.Tr([html.Td("Strategy reached 3% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 3.0), strategy_valid_cnt), style=td_style)]),
+        html.Tr([html.Td("Strategy reached 4%+ before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 4.0), strategy_valid_cnt), style=td_style)]),
         # Max Adverse (lvl) Rows
         html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
         html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
@@ -4986,6 +5151,14 @@ def render_signal_stats_table(tasks):
             html.Tr([html.Td("Hit 1% (from level)", style=td_style), html.Td(fmt_stat(hit_1_cnt, total_tasks), style=td_style)]),
             html.Tr([html.Td("Hit 1.5% (from level)", style=td_style), html.Td(fmt_stat(hit_1_5_cnt, total_tasks), style=td_style)]),
             html.Tr([html.Td("Hit 2% (from level)", style=td_style), html.Td(fmt_stat(hit_2_cnt, total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy valid entries", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False)), total_tasks), style=td_style)]),
+            html.Tr([html.Td("Strategy stop losses (0.12%)", style=td_style), html.Td(fmt_stat(sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False) and getattr(t, 'strategy_stop_loss_hit', False)), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 0.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 0.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 1.5% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 1.5), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 2% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 2.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 3% before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 3.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
+            html.Tr([html.Td("Strategy reached 4%+ before SL", style=td_style), html.Td(fmt_stat(strategy_hit_count(tasks, 4.0), sum(1 for t in tasks if getattr(t, 'strategy_entry_valid', False))), style=td_style)]),
             # Max Adverse (lvl) Rows
             html.Tr([html.Td("Max Adv 0-4% (lvl)", style=td_style), html.Td(row1_adv, style=td_style)]),
             html.Tr([html.Td("Max Adv 4%+ (lvl)", style=td_style), html.Td(row2_adv, style=td_style)]),
@@ -5043,7 +5216,9 @@ def render_signal_stats_table(tasks):
         html.P(
             "ℹ️ Hit % metrics measure price movement ≥1%/1.5%/2% **in the EXPECTED direction** from the signal level base. "
             "Resistance: Price moves UP ≥X% from level. Support: Price moves DOWN ≥X% from level. "
-            "Hits are only counted if the price actually touched the level first.",
+            "Hits are only counted if the price actually touched the level first. "
+            "New strategy rows enter at the next candle open, use a conservative stop-first same-candle rule, "
+            "and count only the maximum TP tier reached before any 0.12% stop loss.",
             style={"fontSize": "11px", "color": "#777", "marginTop": "6px", "marginBottom": "0", "fontStyle": "italic"}
         )
     ])
