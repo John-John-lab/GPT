@@ -4285,6 +4285,108 @@ def update_progress(_, stores):
 # ============================================================================
 # 🔧 SPLIT CALLBACK #1: Summary Statistics Only (HEAVY - runs ONCE per data load)
 # ============================================================================
+def get_toward_entry_level_distance_pct(task):
+    """Return absolute distance from toward entry to parsed level as percent."""
+    entry_price = getattr(task, 'toward_entry_price', None)
+    level_price = getattr(task, 'signal_price', None)
+    try:
+        if entry_price is None or level_price is None:
+            return None
+        entry_price = float(entry_price)
+        level_price = float(level_price)
+        if entry_price <= 0:
+            return None
+        return abs(level_price - entry_price) / entry_price * 100
+    except Exception:
+        return None
+
+
+def get_toward_distance_bucket(distance_pct):
+    """Bucket entry-to-level distance for toward-strategy diagnostics."""
+    if distance_pct is None or (isinstance(distance_pct, float) and is_na(distance_pct)):
+        return None
+    if 0 <= distance_pct < 0.12:
+        return "0-0.12%"
+    if 0.12 <= distance_pct < 0.5:
+        return "0.12-0.5%"
+    if 0.5 <= distance_pct < 1:
+        return "0.5-1%"
+    if 1 <= distance_pct < 2:
+        return "1-2%"
+    if 2 <= distance_pct < 4:
+        return "2-4%"
+    if distance_pct >= 4:
+        return "4%+"
+    return None
+
+
+def build_toward_strategy_summary_rows(tasks, td_style, fmt_stat):
+    """Build transparent toward-strategy funnel/diagnostic rows without changing math."""
+    toward_cases = [t for t in tasks if getattr(t, 'toward_entry_price', None) is not None]
+    toward_total = len(toward_cases)
+    toward_stop_losses = sum(1 for t in toward_cases if getattr(t, 'toward_stop_loss_hit', False))
+    toward_no_sl_return = sum(1 for t in toward_cases if getattr(t, 'toward_no_stop_returned_entry', False))
+    toward_level_reached = sum(1 for t in toward_cases if getattr(t, 'toward_level_reached', False))
+    stopped_before_level = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_stop_loss_hit', False) and not getattr(t, 'toward_level_reached', False)
+    )
+    reached_before_stop = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False) and not getattr(t, 'toward_stop_loss_hit', False)
+    )
+    both_stop_and_level = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False) and getattr(t, 'toward_stop_loss_hit', False)
+    )
+    neither_stop_nor_level = max(0, toward_total - stopped_before_level - reached_before_stop - both_stop_and_level)
+
+    distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
+    distance_counts = {r: 0 for r in distance_ranges}
+    for task in toward_cases:
+        bucket = get_toward_distance_bucket(get_toward_entry_level_distance_pct(task))
+        if bucket:
+            distance_counts[bucket] += 1
+    distance_row_1 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[:3])
+    distance_row_2 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[3:])
+
+    toward_strategy_rows = [
+        html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward stop losses 0.12%", style=td_style), html.Td(fmt_stat(toward_stop_losses, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward stopped before level", style=td_style), html.Td(fmt_stat(stopped_before_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward reached level", style=td_style), html.Td(fmt_stat(toward_level_reached, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward reached before stop", style=td_style), html.Td(fmt_stat(reached_before_stop, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward both SL and level flags", style=td_style), html.Td(fmt_stat(both_stop_and_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward no SL + returned entry", style=td_style), html.Td(fmt_stat(toward_no_sl_return, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward neither SL nor level", style=td_style), html.Td(fmt_stat(neither_stop_nor_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 0-1%", style=td_style), html.Td(distance_row_1, style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 1%+", style=td_style), html.Td(distance_row_2, style=td_style)]),
+    ]
+
+    for pct in TOWARD_LEVEL_TARGET_PCTS:
+        label = "4%+" if pct >= 4 else f"{pct:g}%"
+        found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct)
+        found_reached = sum(
+            1 for t in toward_cases
+            if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct
+            and getattr(t, 'toward_level_reached', False)
+            and not getattr(t, 'toward_stop_loss_hit', False)
+        )
+        found_stopped = sum(
+            1 for t in toward_cases
+            if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct
+            and getattr(t, 'toward_stop_loss_hit', False)
+            and not getattr(t, 'toward_level_reached', False)
+        )
+        toward_strategy_rows.extend([
+            html.Tr([html.Td(f"Toward TP {label} found", style=td_style), html.Td(fmt_stat(found, toward_total), style=td_style)]),
+            html.Tr([html.Td(f"Toward TP {label} + reached level", style=td_style), html.Td(fmt_stat(found_reached, reached_before_stop), style=td_style)]),
+            html.Tr([html.Td(f"Toward TP {label} + stopped before level", style=td_style), html.Td(fmt_stat(found_stopped, stopped_before_level), style=td_style)]),
+        ])
+
+    return toward_strategy_rows
+
+
 @app.callback(
     Output("summary-stats-container", "children"),
     Input("golden-store-version", "data"),  # ✅ FIXED: Only trigger when data version changes (not on page clicks)
@@ -4454,25 +4556,7 @@ def update_summary_stats_only(version, lock_state):
     row1_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[:5]])
     row2_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[5:]])
 
-    toward_cases = [t for t in tasks if getattr(t, 'toward_entry_price', None) is not None]
-    toward_total = len(toward_cases)
-    toward_stop_losses = sum(1 for t in toward_cases if getattr(t, 'toward_stop_loss_hit', False))
-    toward_no_sl_return = sum(1 for t in toward_cases if getattr(t, 'toward_no_stop_returned_entry', False))
-    toward_level_reached = sum(1 for t in toward_cases if getattr(t, 'toward_level_reached', False))
-    toward_target_rows = []
-    for pct in TOWARD_LEVEL_TARGET_PCTS:
-        found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct)
-        label = "4%+" if pct >= 4 else f"{pct:g}%"
-        toward_target_rows.append(html.Tr([
-            html.Td(f"Toward TP {label} found", style=td_style),
-            html.Td(fmt_stat(found, toward_total), style=td_style),
-        ]))
-    toward_strategy_rows = [
-        html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward stop losses 0.12%", style=td_style), html.Td(fmt_stat(toward_stop_losses, toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward reached level", style=td_style), html.Td(fmt_stat(toward_level_reached, toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward no SL + returned entry", style=td_style), html.Td(fmt_stat(toward_no_sl_return, toward_total), style=td_style)]),
-    ] + toward_target_rows
+    toward_strategy_rows = build_toward_strategy_summary_rows(tasks, td_style, fmt_stat)
     toward_strategy_table = html.Table([html.Tbody(toward_strategy_rows)], style={"border": "1px solid #2e7d32", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f1fff1"})
 
     signal_stats_rows = [
