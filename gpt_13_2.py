@@ -3615,6 +3615,8 @@ def toggle_period_input(period_type):
 @app.callback(
     Output("task-ids-store", "data", allow_duplicate=True),
     Output("task-count-store", "data", allow_duplicate=True),
+    Output("task-page-store", "data", allow_duplicate=True),
+    Output("golden-store-version", "data", allow_duplicate=True),
     Input("create-signal-tasks-btn", "n_clicks"),
     State("signal-data-store", "data"),
     State("period-type", "value"),
@@ -3637,7 +3639,7 @@ def toggle_period_input(period_type):
 def create_signal_tasks(n_clicks, signals, period_type, start_date, end_date, hours, tf, ow, beyond_val, stored_ids, strat_val, imp_val, pre_buffer, event_log_val, hide_logs_val, autoclear_val, count):
     """Parses signals and creates tasks with background processing for large batches."""
     if not signals:
-        return stored_ids, count
+        return stored_ids, count, dash.no_update, dash.no_update
     
     ow_flag = "overwrite" in ow if ow else False
     analyze_beyond = "beyond" in beyond_val if beyond_val else False
@@ -3687,8 +3689,11 @@ def create_signal_tasks(n_clicks, signals, period_type, start_date, end_date, ho
         import threading
         threading.Thread(target=_run_parse_background, args=(parse_data,), daemon=True).start()
         
-        # 🔧 Return updated IDs immediately so UI can track new tasks
-        return new_ids, new_count
+        # 🔧 Return updated IDs immediately and reset the table to the first page.
+        # The background thread publishes the final Golden Store snapshot; the
+        # interval-based version sync below propagates that server-side version
+        # bump back into the client store so the table refreshes when parsing is done.
+        return new_ids, new_count, 0, get_golden_store_version()
     
     # 🔧 SMALL BATCH: Process synchronously (original logic with improved progress)
     return _process_signals_sync(signals, period_type, start_date, end_date, hours, tf, 
@@ -3794,9 +3799,11 @@ def _process_signals_sync(signals, period_type, start_date, end_date, hours, tf,
     # This syncs tm.tasks (working storage) → golden_task_store_data (UI display source)
     with tm.lock:
         task_snapshot = list(tm.tasks.values())
-    publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
+    published_version = publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
     
-    return new_ids, new_count
+    # Reset to page 1 and bump the client-side Golden Store version so the
+    # summary and task-table callbacks render the tasks created by this click.
+    return new_ids, new_count, 0, published_version
 
 
 def _run_parse_background(parse_data):
@@ -6886,6 +6893,26 @@ def save_tasks_to_json(n, filename):
             os.remove(temp_path)  # Delete broken temp file
         return f"❌ Save failed: {str(e)}", filename
 
+
+
+@app.callback(
+    Output("golden-store-version", "data", allow_duplicate=True),
+    Input("progress-interval", "n_intervals"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True
+)
+def sync_golden_store_version_from_server(_n_intervals, client_version):
+    """Propagate server-side Golden Store publishes into the Dash store.
+
+    Background workers can update the module-level Golden Store, but they cannot
+    directly update dcc.Store values in the browser. Polling this lightweight
+    version counter lets callbacks that depend on ``golden-store-version``
+    refresh after background task creation or other server-side publishes.
+    """
+    server_version = get_golden_store_version()
+    if server_version != client_version:
+        return server_version
+    return dash.no_update
 
 # 3. Load tasks from selected JSON file (Optimized & Thread-Safe)
 @app.callback(
