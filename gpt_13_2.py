@@ -4865,6 +4865,12 @@ TASK_TABLE_HEADERS = [
     ("Price Δ% (sgnl-lvl)", "80px"),
     ("Reached", "70px"),
     ("Reversed", "70px"),
+    ("Toward Dir", "80px"),
+    ("Toward Entry", "110px"),
+    ("Toward SL Hit 0.12%", "120px"),
+    ("Toward Max TP (0.5–4%+)", "160px"),
+    ("Toward Level Hit", "120px"),
+    ("No-SL Ret Entry", "130px"),
     ("Hit 1% (lvl-fwd.dir)", "50px"),
     ("Hit 1.5% (lvl-fwd.dir)", "60px"),
     ("Hit 2% (lvl-fwd.dir)", "50px"),
@@ -4884,14 +4890,14 @@ TASK_TABLE_HEADERS = [
     ("Max Adv T(lvl)", "140px"),
     ("Max Exp %(lvl)", "100px"),
     ("Max Exp T(lvl)", "140px"),
-    ("Max Adv %(sgnl)", "100px"),
-    ("Max Adv T(sgnl)", "140px"),
-    ("Max Exp %(sgnl)", "100px"),
-    ("Max Exp T(sgnl)", "140px"),
     ("Max Adv %(bef ret lvl)", "140px"),
     ("Time (bef ret lvl)", "140px"),
+    ("Max Adv %(sgnl)", "100px"),
+    ("Max Adv T(sgnl)", "140px"),
     ("Max Adv %(bef ret sgnl)", "140px"),
     ("Time (bef ret sgnl)", "140px"),
+    ("Max Exp %(sgnl)", "100px"),
+    ("Max Exp T(sgnl)", "140px"),
     ("DD% (Lvl)", "80px"),
     ("DD Time (Lvl)", "140px"),
     ("DD% (1%)", "80px"),
@@ -4904,14 +4910,14 @@ TASK_TABLE_HEADERS = [
     ("Confidence", "80px"),
     ("Impulse #", "80px"),
     ("Log", "200px"),
-    ("Actions", "180px"),
+    ("Actions", "420px"),
 ]
 
 
 TASK_TABLE_HEADER_HTML = (
     '<thead style="position:sticky;top:0;background-color:#f0f0f0;z-index:10"><tr>'
     + "".join(
-        f'<th style="min-width:{width}">{label}</th>'
+        f'<th style="min-width:{width};white-space:nowrap;padding:4px 6px;border:1px solid #ddd">{label}</th>'
         for label, width in TASK_TABLE_HEADERS
     )
     + "</tr></thead>"
@@ -4943,7 +4949,11 @@ def render_task_table_html(visible_tasks, show_table_logs=False):
         render_task_table_row(t, show_table_logs=show_table_logs) for t in visible_tasks
     ) + "</tbody>"
     table_html = (
-        '<table style="width:100%;border-collapse:collapse">'
+        '<style>'
+        '#task-summary-table th,#task-summary-table td{white-space:nowrap;padding:4px 6px;border:1px solid #ddd;vertical-align:top;}'
+        '#task-summary-table td:nth-last-child(2){white-space:normal;}'
+        '</style>'
+        '<table id="task-summary-table" style="width:max-content;min-width:100%;border-collapse:collapse;table-layout:auto">'
         + render_task_table_header_html()
         + body_html
         + "</table>"
@@ -5091,7 +5101,7 @@ def render_task_table_row(t, show_table_logs=False):
         <td style="min-width:80px">{confidence_display}</td>
         <td style="min-width:80px">{impulse_display}</td>
         <td style="min-width:200px">{log_html}</td>
-        <td style="min-width:180px">{button_html}</td>
+        <td style="min-width:420px">{button_html}</td>
     </tr>"""
 
 
@@ -5115,10 +5125,10 @@ def render_task_table_header():
         html.Th("Reversed", style={"minWidth": "70px"}),
         html.Th("Toward Dir", style={"minWidth": "80px"}),
         html.Th("Toward Entry", style={"minWidth": "100px"}),
-        html.Th("Toward SL 0.12%", style={"minWidth": "80px"}),
-        html.Th("Toward Max TP", style={"minWidth": "90px"}),
-        html.Th("Toward Level", style={"minWidth": "80px"}),
-        html.Th("No SL Ret Entry", style={"minWidth": "100px"}),
+        html.Th("Toward SL Hit 0.12%", style={"minWidth": "120px"}),
+        html.Th("Toward Max TP (0.5–4%+)", style={"minWidth": "160px"}),
+        html.Th("Toward Level Hit", style={"minWidth": "120px"}),
+        html.Th("No-SL Ret Entry", style={"minWidth": "130px"}),
         html.Th("Hit 1% (lvl-fwd.dir)", style={"minWidth": "50px"}),
         html.Th("Hit 1.5% (lvl-fwd.dir)", style={"minWidth": "60px"}),
         html.Th("Hit 2% (lvl-fwd.dir)", style={"minWidth": "50px"}),
@@ -5138,14 +5148,14 @@ def render_task_table_header():
         html.Th("Max Adv T(lvl)", style={"minWidth": "140px"}),
         html.Th("Max Exp %(lvl)", style={"minWidth": "100px"}),
         html.Th("Max Exp T(lvl)", style={"minWidth": "140px"}),
-        html.Th("Max Adv %(sgnl)", style={"minWidth": "100px"}),
-        html.Th("Max Adv T(sgnl)", style={"minWidth": "140px"}),
-        html.Th("Max Exp %(sgnl)", style={"minWidth": "100px"}),
-        html.Th("Max Exp T(sgnl)", style={"minWidth": "140px"}),           
         html.Th("Max Adv %(bef ret lvl)", style={"minWidth": "140px"}),
         html.Th("Time (bef ret lvl)", style={"minWidth": "140px"}),
+        html.Th("Max Adv %(sgnl)", style={"minWidth": "100px"}),
+        html.Th("Max Adv T(sgnl)", style={"minWidth": "140px"}),
         html.Th("Max Adv %(bef ret sgnl)", style={"minWidth": "140px"}),
         html.Th("Time (bef ret sgnl)", style={"minWidth": "140px"}),
+        html.Th("Max Exp %(sgnl)", style={"minWidth": "100px"}),
+        html.Th("Max Exp T(sgnl)", style={"minWidth": "140px"}),
         html.Th("DD% (Lvl)", style={"minWidth": "80px"}),
         html.Th("DD Time (Lvl)", style={"minWidth": "140px"}),
         html.Th("DD% (1%)", style={"minWidth": "80px"}),
@@ -5158,7 +5168,7 @@ def render_task_table_header():
         html.Th("Confidence", style={"minWidth": "80px"}),
         html.Th("Impulse #", style={"minWidth": "80px"}),
         html.Th("Log", style={"minWidth": "200px"}),
-        html.Th("Actions", style={"minWidth": "180px"})
+        html.Th("Actions", style={"minWidth": "420px"})
     ]), style={'position': 'sticky', 'top': 0, 'backgroundColor': '#f0f0f0', 'zIndex': 10})
 
 
