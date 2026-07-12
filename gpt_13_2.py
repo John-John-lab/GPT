@@ -9,6 +9,13 @@ Bybit Downloader – Two Tabs + Summary + Optimized Buffering (10k candles)
 with Database Verification Tool and Real‑time Integrity Checks.
 Now with signal‑based downloading, candle analysis, and per‑task interactive charts.
 """
+
+# =============================================================================
+# 1. IMPORTS AND EXTERNAL INTEGRATIONS
+# =============================================================================
+# Keep imports centralized. Repository-local strategy/impulse/database imports are
+# intentionally explicit so the main app can be reorganized without changing math.
+
 import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functools, sys, bisect, math
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -36,8 +43,11 @@ from database import (
 )
 
 # =============================================================================
-# UI HELPER FUNCTIONS - Pure presentation logic (no calculations)
-# These functions format data for display only
+# 2. UI FORMATTING HELPERS
+# =============================================================================
+# Presentation-only helpers. These functions may format or categorize values for
+# display, but must not mutate tasks, publish Golden Store snapshots, or perform
+# calculations that change saved analysis results.
 # =============================================================================
 
 def fmt_time_ui(ts):
@@ -120,6 +130,14 @@ def get_adverse_range_ui(pct):
     elif pct >= 30: return ">30%"
     return None
 
+
+# =============================================================================
+# 3. MATH CONSTANTS AND TOWARD-LEVEL STRATEGY HELPERS
+# =============================================================================
+# Keep formulas and event/strategy math isolated from Dash callbacks. The helper
+# below still mutates the task exactly as before; this section only makes the
+# boundary explicit for future behavior-preserving extraction.
+# =============================================================================
 
 TOWARD_LEVEL_TARGET_PCTS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
 TOWARD_LEVEL_STOP_LOSS_PCT = 0.12
@@ -231,6 +249,14 @@ def calculate_toward_level_strategy(task, df):
     task.toward_max_reached_pct = max(reached_targets) if reached_targets else None
     task.toward_no_stop_returned_entry = bool(returned_entry_after_favorable and not task.toward_stop_loss_hit)
 
+# =============================================================================
+# 4. ANALYSIS THREAD-SAFETY ALIASES AND SHADOW VERIFICATION
+# =============================================================================
+# These aliases and comparison helpers support the existing vectorized analysis
+# path. Preserve their behavior while gradually moving calculation details into
+# smaller helpers inside this file.
+# =============================================================================
+
 # 🔧 CRITICAL: Global aliases for thread-safe numpy/bisect access in background threads
 np_local_global = None
 bisect_local_global = None
@@ -281,8 +307,11 @@ def compare_results(original, vectorized, field_name, tolerance=1e-9):
         return True, None
 
 # =============================================================================
-# JSON PERSISTENCE & DATA INTEGRITY LAYER
-# Implements "Serialization Bridge" pattern for safe RAM ↔ Disk conversion
+# 5. JSON PERSISTENCE AND SNAPSHOT COMPATIBILITY
+# =============================================================================
+# Serialization Bridge for safe RAM ↔ disk conversion. This section owns JSON
+# safety, timestamp parsing, task-field catalogs, and old snapshot compatibility.
+# Be very careful when changing field names or runtime-field exclusions.
 # =============================================================================
 
 def sanitize_for_json(obj):
@@ -414,6 +443,49 @@ def _parse_timestamp(val):
         return None
 
 
+def task_to_serializable_dict(task):
+    """Convert one task object to the current JSON-safe snapshot dictionary.
+
+    This preserves the existing save behavior: iterate over live task attributes,
+    skip runtime-only fields, sanitize every stored value, and keep the warning for
+    missing critical derived fields.
+    """
+    d = {}
+    # Iterate through all attributes, excluding non-serializable threading objects
+    for k, v in task.__dict__.items():
+        # Skip threading/synchronization objects and internal caches
+        if k in RUNTIME_TASK_FIELDS:
+            continue
+
+        # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
+        d[k] = sanitize_for_json(v)
+
+    # Debug: Verify critical fields are present
+    if 'hit_1' not in d:
+        print(f"WARNING: Task {task.task_id[:8]} missing 'hit_1' in save! Current value: {getattr(task, 'hit_1', 'MISSING')}")
+
+    return d
+
+
+def tasks_to_serializable_snapshot(tasks):
+    """Convert live task objects into the list persisted by save_tasks_to_json()."""
+    return [task_to_serializable_dict(t) for t in (tasks or [])]
+
+
+def write_json_atomic(filepath, data):
+    """Write JSON through a temp file and atomic replace, preserving crash safety."""
+    temp_path = filepath + ".tmp"
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            # All data is pre-sanitized, no need for default=str
+            json.dump(data, f, indent=2)
+        os.replace(temp_path, filepath)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)  # Delete broken temp file
+        raise
+
+
 # =============================================================================
 # END JSON PERSISTENCE LAYER
 # =============================================================================
@@ -421,7 +493,12 @@ def _parse_timestamp(val):
 # DuckDB availability is now imported from database module
 # See: from database import DUCKDB_AVAILABLE
 
-# ---------- Configuration ----------
+# =============================================================================
+# 6. APPLICATION CONFIGURATION AND RUNTIME CONSTANTS
+# =============================================================================
+# Configuration remains in this file for now. Future refactors should move code
+# toward smaller sections first, not new files, to preserve callback wiring.
+# =============================================================================
 LOGS_DIR = "./task_logs"
 os.makedirs(LOGS_DIR, exist_ok=True)
 BYBIT_BASE_URL = "https://api.bybit.com"
@@ -484,6 +561,13 @@ class PerfTimer:
             perf_log(f"[TRACE] ✅ END: {self.label} ({total:.4f}s)")
         return self
 
+
+# =============================================================================
+# 7. TASK FIELD CATALOG FOR JSON / RECALC DURABILITY
+# =============================================================================
+# Documentation-first catalog preserving current broad JSON snapshot behavior.
+# Classify new task attributes here before changing save/load or recalculation.
+# =============================================================================
 
 # ---------- Task field catalog (documentation-first; preserves current behavior) ----------
 # These groups make JSON/recalc changes safer by naming the field types in one
@@ -676,6 +760,15 @@ def format_snapshot_audit_note(audit):
     return " | ".join(parts)
 
 
+# =============================================================================
+# 8. GOLDEN STORE, RECALC STATE, AND DISPLAY CACHE STATE
+# =============================================================================
+# Golden Store is the authoritative display snapshot for task table/stat callbacks.
+# Prefer publishing through publish_golden_task_snapshot() so version bumps and
+# cache resets stay synchronized. Recalc/display globals are documented here
+# before deeper state-container refactors.
+# =============================================================================
+
 # 🔧 GOLDEN STORE: Pre-processed task data cache
 golden_task_store_data = None
 golden_store_version = 0
@@ -713,6 +806,26 @@ def reset_display_caches(reason=""):
         print(f"🔄 [GOLDEN] Display caches reset: {reason}")
 
 
+def get_golden_store_version():
+    """Return the current Golden Store version used by UI cache keys."""
+    return golden_store_version
+
+
+def has_golden_task_snapshot():
+    """Return True when Golden Store currently has a non-empty task snapshot."""
+    return golden_task_store_data is not None and len(golden_task_store_data) > 0
+
+
+def get_golden_task_snapshot():
+    """Return the current Golden Store snapshot without falling back to TaskManager."""
+    return golden_task_store_data if golden_task_store_data is not None else []
+
+
+def get_golden_task_count():
+    """Return the number of tasks currently held by the Golden Store snapshot."""
+    return len(golden_task_store_data) if golden_task_store_data is not None else 0
+
+
 def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
     """Publish the final task snapshot used by UI callbacks and reset display caches.
 
@@ -731,10 +844,17 @@ def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
 
 def get_display_tasks_snapshot():
     """Return the Golden Store task snapshot, falling back to TaskManager if empty."""
-    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
-        return golden_task_store_data
+    if has_golden_task_snapshot():
+        return get_golden_task_snapshot()
     with tm.lock:
         return list(tm.tasks.values())
+
+# =============================================================================
+# 9. DATA ACCESS, PARQUET CACHE, AND MARKET API HELPERS
+# =============================================================================
+# Data I/O helpers stay separate from UI callbacks and math. They may load, write,
+# merge, or fetch candles but should not render Dash components.
+# =============================================================================
 
 # ---------- Low-RAM Parquet Cache ----------
 @functools.lru_cache(maxsize=4)  # Holds max 4 DFs to protect old Mac RAM
@@ -916,6 +1036,13 @@ def find_earliest_candle(symbol, interval):
         return df.iloc[0]['timestamp']
     return int((datetime.now() - timedelta(days=730)).timestamp() * 1000)
 
+# =============================================================================
+# 10. SIGNAL PARSING
+# =============================================================================
+# Parsing converts user/file text into normalized signal dictionaries only. It
+# should not create tasks, mutate Golden Store, or render UI.
+# =============================================================================
+
 # ---------- Signal Parser ----------
 def parse_signal_text(text):
     """
@@ -969,7 +1096,15 @@ def parse_signal_text(text):
         })
     return signals
 
-# ---------- Task Manager ----------
+# =============================================================================
+# 11. TASK MODEL AND TASK EXECUTION LOGIC
+# =============================================================================
+# DownloadTask currently owns task state, download execution, analysis, and logs.
+# Keep original behavior intact; future internal refactors should split large
+# methods into helpers before moving code to separate files.
+# =============================================================================
+
+# ---------- Task Model ----------
 class DownloadTask:
     """Represents a single download job (multiple symbols possible)."""
     def __init__(self, task_id, symbols, timeframe, mode, start_date=None, end_date=None, overwrite=False, price_continuity_check=False,
@@ -2546,6 +2681,13 @@ class DownloadTask:
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# =============================================================================
+# 12. TASK AND OPTIMIZER MANAGERS
+# =============================================================================
+# Runtime managers own queues/background jobs. Keep singleton creation explicit
+# so callbacks continue to share the same task and optimizer state.
+# =============================================================================
+
 class TaskManager:
     def __init__(self, max_workers=4):
         self.tasks = {}
@@ -2652,6 +2794,14 @@ class OptimizerManager:
             return self.jobs.get(job_id, {'status': 'idle', 'progress': 0.0, 'result': None, 'error': None})
 
 optimizer_mgr = OptimizerManager()
+
+# =============================================================================
+# 13. DASH APP, FLASK ROUTES, AND ROOT LAYOUT
+# =============================================================================
+# The app object and decorated callbacks/routes must stay after app creation.
+# Component IDs in layout are part of the callback contract; do not rename them
+# during organization-only refactors.
+# =============================================================================
 
 # ---------- Dash App ----------
 app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_callbacks='initial_duplicate')
@@ -3562,6 +3712,14 @@ def render_tab(tab):
         # Data Analysis tab - now imported from database module
         return create_data_analysis_tab()
 
+# =============================================================================
+# 14. CALLBACKS: SIGNAL INPUT AND TASK CREATION
+# =============================================================================
+# These callbacks parse uploaded/pasted signals and create DownloadTask objects.
+# They coordinate UI stores and Golden Store publication but should delegate math
+# to task/analysis helpers.
+# =============================================================================
+
 # ----- Callbacks for signal file handling -----
 @app.callback(
     Output("upload-status", "children"),
@@ -3612,9 +3770,58 @@ def toggle_period_input(period_type):
     else:
         return {'display': 'none'}, {'display': 'block'}
 
+
+def build_task_creation_options(ow, beyond_val, strat_val, imp_val, event_log_val, hide_logs_val, pre_buffer):
+    """Normalize Create Tasks UI values into the flags used by existing logic."""
+    return {
+        'ow_flag': "overwrite" in ow if ow else False,
+        'analyze_beyond': "beyond" in beyond_val if beyond_val else False,
+        'strat_disabled': "disable" in strat_val if strat_val else False,
+        'imp_disabled': "disable" in imp_val if imp_val else False,
+        'log_events': "disable" not in event_log_val if event_log_val else True,
+        'hide_logs_val': hide_logs_val,
+        'pre_buffer': pre_buffer,
+    }
+
+
+def initialize_task_creation_state(stored_ids, count, autoclear_val):
+    """Return the starting task id/count state for Create Tasks.
+
+    This preserves the existing auto-clear behavior exactly, including clearing
+    the task manager's in-memory task map before new task creation begins.
+    """
+    if autoclear_val and "autoclear" in autoclear_val:
+        tm.tasks.clear()
+        return [], 0
+    return stored_ids.copy() if stored_ids else [], count
+
+
+def build_background_parse_data(signals, period_type, start_date, end_date, hours, tf, task_options, new_ids, new_count):
+    """Build the payload consumed by _run_parse_background using existing keys."""
+    return {
+        'signals': signals,
+        'period_type': period_type,
+        'start_date': start_date,
+        'end_date': end_date,
+        'hours': hours,
+        'tf': tf,
+        'ow_flag': task_options['ow_flag'],
+        'analyze_beyond': task_options['analyze_beyond'],
+        'strat_disabled': task_options['strat_disabled'],
+        'imp_disabled': task_options['imp_disabled'],
+        'log_events': task_options['log_events'],
+        'hide_logs_val': task_options['hide_logs_val'],
+        'pre_buffer': task_options['pre_buffer'],
+        'existing_ids': list(new_ids),
+        'existing_count': new_count
+    }
+
+
 @app.callback(
     Output("task-ids-store", "data", allow_duplicate=True),
     Output("task-count-store", "data", allow_duplicate=True),
+    Output("task-page-store", "data", allow_duplicate=True),
+    Output("golden-store-version", "data", allow_duplicate=True),
     Input("create-signal-tasks-btn", "n_clicks"),
     State("signal-data-store", "data"),
     State("period-type", "value"),
@@ -3637,22 +3844,12 @@ def toggle_period_input(period_type):
 def create_signal_tasks(n_clicks, signals, period_type, start_date, end_date, hours, tf, ow, beyond_val, stored_ids, strat_val, imp_val, pre_buffer, event_log_val, hide_logs_val, autoclear_val, count):
     """Parses signals and creates tasks with background processing for large batches."""
     if not signals:
-        return stored_ids, count
+        return stored_ids, count, dash.no_update, dash.no_update
     
-    ow_flag = "overwrite" in ow if ow else False
-    analyze_beyond = "beyond" in beyond_val if beyond_val else False
-    strat_disabled = "disable" in strat_val if strat_val else False
-    imp_disabled = "disable" in imp_val if imp_val else False
-    log_events = "disable" not in event_log_val if event_log_val else True
-    
-    # AUTO-CLEAR LOGIC: Wipe memory if checkbox is checked
-    if autoclear_val and "autoclear" in autoclear_val:
-        tm.tasks.clear()
-        new_ids = []
-        new_count = 0
-    else:
-        new_ids = stored_ids.copy() if stored_ids else []
-        new_count = count
+    task_options = build_task_creation_options(
+        ow, beyond_val, strat_val, imp_val, event_log_val, hide_logs_val, pre_buffer
+    )
+    new_ids, new_count = initialize_task_creation_state(stored_ids, count, autoclear_val)
         
     buffer_ms = SIGNAL_BUFFER_MINUTES * 60 * 1000
     
@@ -3664,36 +3861,27 @@ def create_signal_tasks(n_clicks, signals, period_type, start_date, end_date, ho
         print(f"🚀 Large batch detected ({total_signals} signals) - using background processing...")
         
         # 🔧 Prepare serialized data for background thread
-        import copy
-        parse_data = {
-            'signals': signals,
-            'period_type': period_type,
-            'start_date': start_date,
-            'end_date': end_date,
-            'hours': hours,
-            'tf': tf,
-            'ow_flag': ow_flag,
-            'analyze_beyond': analyze_beyond,
-            'strat_disabled': strat_disabled,
-            'imp_disabled': imp_disabled,
-            'log_events': log_events,
-            'hide_logs_val': hide_logs_val,
-            'pre_buffer': pre_buffer,
-            'existing_ids': list(new_ids),
-            'existing_count': new_count
-        }
+        parse_data = build_background_parse_data(
+            signals, period_type, start_date, end_date, hours, tf,
+            task_options, new_ids, new_count
+        )
         
         # 🔧 Start background thread
         import threading
         threading.Thread(target=_run_parse_background, args=(parse_data,), daemon=True).start()
         
-        # 🔧 Return updated IDs immediately so UI can track new tasks
-        return new_ids, new_count
+        # 🔧 Return updated IDs immediately and reset the table to the first page.
+        # The background thread publishes the final Golden Store snapshot; the
+        # interval-based version sync below propagates that server-side version
+        # bump back into the client store so the table refreshes when parsing is done.
+        return new_ids, new_count, 0, get_golden_store_version()
     
     # 🔧 SMALL BATCH: Process synchronously (original logic with improved progress)
-    return _process_signals_sync(signals, period_type, start_date, end_date, hours, tf, 
-                                  ow_flag, analyze_beyond, strat_disabled, imp_disabled, 
-                                  log_events, hide_logs_val, pre_buffer, new_ids, new_count)
+    return _process_signals_sync(signals, period_type, start_date, end_date, hours, tf,
+                                  task_options['ow_flag'], task_options['analyze_beyond'],
+                                  task_options['strat_disabled'], task_options['imp_disabled'],
+                                  task_options['log_events'], task_options['hide_logs_val'],
+                                  task_options['pre_buffer'], new_ids, new_count)
 
 
 def _process_signals_sync(signals, period_type, start_date, end_date, hours, tf, 
@@ -3794,9 +3982,11 @@ def _process_signals_sync(signals, period_type, start_date, end_date, hours, tf,
     # This syncs tm.tasks (working storage) → golden_task_store_data (UI display source)
     with tm.lock:
         task_snapshot = list(tm.tasks.values())
-    publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
+    published_version = publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
     
-    return new_ids, new_count
+    # Reset to page 1 and bump the client-side Golden Store version so the
+    # summary and task-table callbacks render the tasks created by this click.
+    return new_ids, new_count, 0, published_version
 
 
 def _run_parse_background(parse_data):
@@ -4085,9 +4275,118 @@ def update_progress(_, stores):
             texts.append("0.0% 0/0/0")
     return logs, progs, texts
 
+# =============================================================================
+# 15. CALLBACKS: SUMMARY STATISTICS AND TASK TABLE REFRESH
+# =============================================================================
+# Heavy summary rendering and lightweight table rendering are intentionally split
+# for performance. Golden Store version changes are the primary refresh signal.
+# =============================================================================
+
 # ============================================================================
 # 🔧 SPLIT CALLBACK #1: Summary Statistics Only (HEAVY - runs ONCE per data load)
 # ============================================================================
+def get_toward_entry_level_distance_pct(task):
+    """Return absolute distance from toward entry to parsed level as percent."""
+    entry_price = getattr(task, 'toward_entry_price', None)
+    level_price = getattr(task, 'signal_price', None)
+    try:
+        if entry_price is None or level_price is None:
+            return None
+        entry_price = float(entry_price)
+        level_price = float(level_price)
+        if entry_price <= 0:
+            return None
+        return abs(level_price - entry_price) / entry_price * 100
+    except Exception:
+        return None
+
+
+def get_toward_distance_bucket(distance_pct):
+    """Bucket entry-to-level distance for toward-strategy diagnostics."""
+    if distance_pct is None or (isinstance(distance_pct, float) and is_na(distance_pct)):
+        return None
+    if 0 <= distance_pct < 0.12:
+        return "0-0.12%"
+    if 0.12 <= distance_pct < 0.5:
+        return "0.12-0.5%"
+    if 0.5 <= distance_pct < 1:
+        return "0.5-1%"
+    if 1 <= distance_pct < 2:
+        return "1-2%"
+    if 2 <= distance_pct < 4:
+        return "2-4%"
+    if distance_pct >= 4:
+        return "4%+"
+    return None
+
+
+def build_toward_strategy_summary_rows(tasks, td_style, fmt_stat):
+    """Build transparent toward-strategy funnel/diagnostic rows without changing math."""
+    toward_cases = [t for t in tasks if getattr(t, 'toward_entry_price', None) is not None]
+    toward_total = len(toward_cases)
+    toward_stop_losses = sum(1 for t in toward_cases if getattr(t, 'toward_stop_loss_hit', False))
+    toward_no_sl_return = sum(1 for t in toward_cases if getattr(t, 'toward_no_stop_returned_entry', False))
+    toward_level_reached = sum(1 for t in toward_cases if getattr(t, 'toward_level_reached', False))
+    stopped_before_level = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_stop_loss_hit', False) and not getattr(t, 'toward_level_reached', False)
+    )
+    reached_before_stop = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False) and not getattr(t, 'toward_stop_loss_hit', False)
+    )
+    both_stop_and_level = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False) and getattr(t, 'toward_stop_loss_hit', False)
+    )
+    neither_stop_nor_level = max(0, toward_total - stopped_before_level - reached_before_stop - both_stop_and_level)
+
+    distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
+    distance_counts = {r: 0 for r in distance_ranges}
+    for task in toward_cases:
+        bucket = get_toward_distance_bucket(get_toward_entry_level_distance_pct(task))
+        if bucket:
+            distance_counts[bucket] += 1
+    distance_row_1 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[:3])
+    distance_row_2 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[3:])
+
+    toward_strategy_rows = [
+        html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward stop losses 0.12%", style=td_style), html.Td(fmt_stat(toward_stop_losses, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward stopped before level", style=td_style), html.Td(fmt_stat(stopped_before_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward reached level", style=td_style), html.Td(fmt_stat(toward_level_reached, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward reached before stop", style=td_style), html.Td(fmt_stat(reached_before_stop, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward both SL and level flags", style=td_style), html.Td(fmt_stat(both_stop_and_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward no SL + returned entry", style=td_style), html.Td(fmt_stat(toward_no_sl_return, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward neither SL nor level", style=td_style), html.Td(fmt_stat(neither_stop_nor_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 0-1%", style=td_style), html.Td(distance_row_1, style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 1%+", style=td_style), html.Td(distance_row_2, style=td_style)]),
+    ]
+
+    for pct in TOWARD_LEVEL_TARGET_PCTS:
+        label = "4%+" if pct >= 4 else f"{pct:g}%"
+        found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct)
+        found_reached = sum(
+            1 for t in toward_cases
+            if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct
+            and getattr(t, 'toward_level_reached', False)
+            and not getattr(t, 'toward_stop_loss_hit', False)
+        )
+        found_stopped = sum(
+            1 for t in toward_cases
+            if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct
+            and getattr(t, 'toward_stop_loss_hit', False)
+            and not getattr(t, 'toward_level_reached', False)
+        )
+        toward_strategy_rows.extend([
+            html.Tr([html.Td(f"Toward TP {label} found", style=td_style), html.Td(fmt_stat(found, toward_total), style=td_style)]),
+            html.Tr([html.Td(f"Toward TP {label} + reached level", style=td_style), html.Td(fmt_stat(found_reached, reached_before_stop), style=td_style)]),
+            html.Tr([html.Td(f"Toward TP {label} + stopped before level", style=td_style), html.Td(fmt_stat(found_stopped, stopped_before_level), style=td_style)]),
+        ])
+
+    return toward_strategy_rows
+
+
 @app.callback(
     Output("summary-stats-container", "children"),
     Input("golden-store-version", "data"),  # ✅ FIXED: Only trigger when data version changes (not on page clicks)
@@ -4257,25 +4556,7 @@ def update_summary_stats_only(version, lock_state):
     row1_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[:5]])
     row2_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[5:]])
 
-    toward_cases = [t for t in tasks if getattr(t, 'toward_entry_price', None) is not None]
-    toward_total = len(toward_cases)
-    toward_stop_losses = sum(1 for t in toward_cases if getattr(t, 'toward_stop_loss_hit', False))
-    toward_no_sl_return = sum(1 for t in toward_cases if getattr(t, 'toward_no_stop_returned_entry', False))
-    toward_level_reached = sum(1 for t in toward_cases if getattr(t, 'toward_level_reached', False))
-    toward_target_rows = []
-    for pct in TOWARD_LEVEL_TARGET_PCTS:
-        found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct)
-        label = "4%+" if pct >= 4 else f"{pct:g}%"
-        toward_target_rows.append(html.Tr([
-            html.Td(f"Toward TP {label} found", style=td_style),
-            html.Td(fmt_stat(found, toward_total), style=td_style),
-        ]))
-    toward_strategy_rows = [
-        html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward stop losses 0.12%", style=td_style), html.Td(fmt_stat(toward_stop_losses, toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward reached level", style=td_style), html.Td(fmt_stat(toward_level_reached, toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward no SL + returned entry", style=td_style), html.Td(fmt_stat(toward_no_sl_return, toward_total), style=td_style)]),
-    ] + toward_target_rows
+    toward_strategy_rows = build_toward_strategy_summary_rows(tasks, td_style, fmt_stat)
     toward_strategy_table = html.Table([html.Tbody(toward_strategy_rows)], style={"border": "1px solid #2e7d32", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f1fff1"})
 
     signal_stats_rows = [
@@ -4336,11 +4617,6 @@ def update_summary_stats_only(version, lock_state):
 _PAGE_HTML_CACHE_MAX_PAGES = 8
 _page_html_cache = OrderedDict()
 _cached_golden_version = None
-
-
-def get_golden_store_version():
-    """Return the current Golden Store version used by UI cache keys."""
-    return golden_store_version
 
 
 def normalize_task_page(current_page, total_pages):
@@ -4673,6 +4949,12 @@ TASK_TABLE_HEADERS = [
     ("Price Δ% (sgnl-lvl)", "80px"),
     ("Reached", "70px"),
     ("Reversed", "70px"),
+    ("Toward Dir", "80px"),
+    ("Toward Entry", "110px"),
+    ("Toward SL Hit 0.12%", "120px"),
+    ("Toward Max TP (0.5–4%+)", "160px"),
+    ("Toward Level Hit", "120px"),
+    ("No-SL Ret Entry", "130px"),
     ("Hit 1% (lvl-fwd.dir)", "50px"),
     ("Hit 1.5% (lvl-fwd.dir)", "60px"),
     ("Hit 2% (lvl-fwd.dir)", "50px"),
@@ -4692,14 +4974,14 @@ TASK_TABLE_HEADERS = [
     ("Max Adv T(lvl)", "140px"),
     ("Max Exp %(lvl)", "100px"),
     ("Max Exp T(lvl)", "140px"),
-    ("Max Adv %(sgnl)", "100px"),
-    ("Max Adv T(sgnl)", "140px"),
-    ("Max Exp %(sgnl)", "100px"),
-    ("Max Exp T(sgnl)", "140px"),
     ("Max Adv %(bef ret lvl)", "140px"),
     ("Time (bef ret lvl)", "140px"),
+    ("Max Adv %(sgnl)", "100px"),
+    ("Max Adv T(sgnl)", "140px"),
     ("Max Adv %(bef ret sgnl)", "140px"),
     ("Time (bef ret sgnl)", "140px"),
+    ("Max Exp %(sgnl)", "100px"),
+    ("Max Exp T(sgnl)", "140px"),
     ("DD% (Lvl)", "80px"),
     ("DD Time (Lvl)", "140px"),
     ("DD% (1%)", "80px"),
@@ -4712,19 +4994,26 @@ TASK_TABLE_HEADERS = [
     ("Confidence", "80px"),
     ("Impulse #", "80px"),
     ("Log", "200px"),
-    ("Actions", "180px"),
+    ("Actions", "420px"),
 ]
 
 
 TASK_TABLE_HEADER_HTML = (
     '<thead style="position:sticky;top:0;background-color:#f0f0f0;z-index:10"><tr>'
     + "".join(
-        f'<th style="min-width:{width}">{label}</th>'
+        f'<th style="min-width:{width};white-space:nowrap;padding:4px 6px;border:1px solid #ddd">{label}</th>'
         for label, width in TASK_TABLE_HEADERS
     )
     + "</tr></thead>"
 )
 
+
+# =============================================================================
+# 16. UI RENDERERS: TASK TABLE, PAGINATION, AND SUMMARY TABLES
+# =============================================================================
+# Renderer helpers convert already-calculated task fields into Dash/raw HTML. They
+# should not change task state, Golden Store, JSON, or analysis results.
+# =============================================================================
 
 def render_task_table_header_html():
     """Return the prebuilt raw sticky table header HTML used by the fast task table."""
@@ -4744,7 +5033,11 @@ def render_task_table_html(visible_tasks, show_table_logs=False):
         render_task_table_row(t, show_table_logs=show_table_logs) for t in visible_tasks
     ) + "</tbody>"
     table_html = (
-        '<table style="width:100%;border-collapse:collapse">'
+        '<style>'
+        '#task-summary-table th,#task-summary-table td{white-space:nowrap;padding:4px 6px;border:1px solid #ddd;vertical-align:top;}'
+        '#task-summary-table td:nth-last-child(2){white-space:normal;}'
+        '</style>'
+        '<table id="task-summary-table" style="width:max-content;min-width:100%;border-collapse:collapse;table-layout:auto">'
         + render_task_table_header_html()
         + body_html
         + "</table>"
@@ -4892,7 +5185,7 @@ def render_task_table_row(t, show_table_logs=False):
         <td style="min-width:80px">{confidence_display}</td>
         <td style="min-width:80px">{impulse_display}</td>
         <td style="min-width:200px">{log_html}</td>
-        <td style="min-width:180px">{button_html}</td>
+        <td style="min-width:420px">{button_html}</td>
     </tr>"""
 
 
@@ -4916,10 +5209,10 @@ def render_task_table_header():
         html.Th("Reversed", style={"minWidth": "70px"}),
         html.Th("Toward Dir", style={"minWidth": "80px"}),
         html.Th("Toward Entry", style={"minWidth": "100px"}),
-        html.Th("Toward SL 0.12%", style={"minWidth": "80px"}),
-        html.Th("Toward Max TP", style={"minWidth": "90px"}),
-        html.Th("Toward Level", style={"minWidth": "80px"}),
-        html.Th("No SL Ret Entry", style={"minWidth": "100px"}),
+        html.Th("Toward SL Hit 0.12%", style={"minWidth": "120px"}),
+        html.Th("Toward Max TP (0.5–4%+)", style={"minWidth": "160px"}),
+        html.Th("Toward Level Hit", style={"minWidth": "120px"}),
+        html.Th("No-SL Ret Entry", style={"minWidth": "130px"}),
         html.Th("Hit 1% (lvl-fwd.dir)", style={"minWidth": "50px"}),
         html.Th("Hit 1.5% (lvl-fwd.dir)", style={"minWidth": "60px"}),
         html.Th("Hit 2% (lvl-fwd.dir)", style={"minWidth": "50px"}),
@@ -4939,14 +5232,14 @@ def render_task_table_header():
         html.Th("Max Adv T(lvl)", style={"minWidth": "140px"}),
         html.Th("Max Exp %(lvl)", style={"minWidth": "100px"}),
         html.Th("Max Exp T(lvl)", style={"minWidth": "140px"}),
-        html.Th("Max Adv %(sgnl)", style={"minWidth": "100px"}),
-        html.Th("Max Adv T(sgnl)", style={"minWidth": "140px"}),
-        html.Th("Max Exp %(sgnl)", style={"minWidth": "100px"}),
-        html.Th("Max Exp T(sgnl)", style={"minWidth": "140px"}),           
         html.Th("Max Adv %(bef ret lvl)", style={"minWidth": "140px"}),
         html.Th("Time (bef ret lvl)", style={"minWidth": "140px"}),
+        html.Th("Max Adv %(sgnl)", style={"minWidth": "100px"}),
+        html.Th("Max Adv T(sgnl)", style={"minWidth": "140px"}),
         html.Th("Max Adv %(bef ret sgnl)", style={"minWidth": "140px"}),
         html.Th("Time (bef ret sgnl)", style={"minWidth": "140px"}),
+        html.Th("Max Exp %(sgnl)", style={"minWidth": "100px"}),
+        html.Th("Max Exp T(sgnl)", style={"minWidth": "140px"}),
         html.Th("DD% (Lvl)", style={"minWidth": "80px"}),
         html.Th("DD Time (Lvl)", style={"minWidth": "140px"}),
         html.Th("DD% (1%)", style={"minWidth": "80px"}),
@@ -4959,7 +5252,7 @@ def render_task_table_header():
         html.Th("Confidence", style={"minWidth": "80px"}),
         html.Th("Impulse #", style={"minWidth": "80px"}),
         html.Th("Log", style={"minWidth": "200px"}),
-        html.Th("Actions", style={"minWidth": "180px"})
+        html.Th("Actions", style={"minWidth": "420px"})
     ]), style={'position': 'sticky', 'top': 0, 'backgroundColor': '#f0f0f0', 'zIndex': 10})
 
 
@@ -5187,6 +5480,13 @@ def page_for_task(task_id, tasks):
         if str(getattr(task, 'task_id', '')) == str(task_id):
             return idx // PAGE_SIZE
     return no_update
+
+# =============================================================================
+# 17. CALLBACKS: CHART MODAL, CHART NAVIGATION, AND VISIBILITY TOGGLES
+# =============================================================================
+# Chart callbacks/renderers should consume task data and display state only. Keep
+# measurement, visibility, and modal state separate from analysis calculations.
+# =============================================================================
 
 @app.callback(
     Output("prev-chart-btn", "disabled"),
@@ -5957,6 +6257,13 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
 # =============================================================================
 
 # ----- Impulse callbacks -----
+# =============================================================================
+# 18. CALLBACKS: IMPULSE / STRATEGY DETAILS AND OPTIMIZATION UI
+# =============================================================================
+# UI around strategy/impulse parameters, details, grid search, and walk-forward.
+# Core detection remains in strategies.py / impulse.py or task analysis helpers.
+# =============================================================================
+
 @app.callback(
     Output("impulse-task-selector", "options"),
     Input("progress-interval", "n_intervals")
@@ -6640,6 +6947,14 @@ def rerun_impulse_on_all(n_clicks, range_mult, vol_mult, body_ratio, wick_ratio,
 # redownload functions, and database backup functionality.
 # =============================================================================
 
+# =============================================================================
+# 19. CALLBACKS: ACTIVE DOWNLOAD MONITOR AND DATA MAINTENANCE
+# =============================================================================
+# Monitor callbacks expose current task progress and control pause/stop actions.
+# Maintenance shortcuts queue work but should leave persistence and recalculation
+# rules to their dedicated sections below.
+# =============================================================================
+
 # ----- Active Download Monitor Callbacks -----
 @app.callback(
     Output("monitor-task-info", "children"),
@@ -6798,6 +7113,14 @@ def bulk_rerun_all(ev_n, str_n, imp_n):
     label = "Events" if triggered == "bulk-rerun-events" else "Strategy" if triggered == "bulk-rerun-strategy" else "Impulse"
     return f"✅ {label} re-run completed on {count} tasks. Table will refresh shortly."
 
+# =============================================================================
+# 20. CALLBACKS: PERSISTENCE, SAVE/LOAD JSON, AND FILE DROPDOWNS
+# =============================================================================
+# JSON persistence callbacks must preserve the compatibility rules and field
+# catalog above. Avoid introducing UI refresh side effects outside Golden Store
+# publication helpers.
+# =============================================================================
+
 # 1. Auto-refresh dropdown with existing JSON files
 @app.callback(
     Output("json-file-select", "options"),
@@ -6852,40 +7175,35 @@ def save_tasks_to_json(n, filename):
     report_unclassified_task_fields(tasks, reason="save_tasks_to_json")
     
     # Build reconstructed data list
-    serializable_data = []
-    
-    # Process all valid tasks from RAM
-    if tasks:
-        for t in tasks:
-            d = {}
-            # Iterate through all attributes, excluding non-serializable threading objects
-            for k, v in t.__dict__.items():
-                # Skip threading/synchronization objects and internal caches
-                if k in RUNTIME_TASK_FIELDS:
-                    continue
-                
-                # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
-                d[k] = sanitize_for_json(v)
-            
-            # Debug: Verify critical fields are present
-            if 'hit_1' not in d:
-                print(f"WARNING: Task {t.task_id[:8]} missing 'hit_1' in save! Current value: {getattr(t, 'hit_1', 'MISSING')}")
-            
-            serializable_data.append(d)
-    
+    serializable_data = tasks_to_serializable_snapshot(tasks)
+
     # 🔧 ATOMIC SAVE with sanitization (removed default=str fallback)
-    temp_path = filepath + ".tmp"
     try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            # All data is pre-sanitized, no need for default=str
-            json.dump(serializable_data, f, indent=2)
-        os.replace(temp_path, filepath)
+        write_json_atomic(filepath, serializable_data)
         return f"✅ Saved {len(tasks)} tasks to {filename}", filename
     except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)  # Delete broken temp file
         return f"❌ Save failed: {str(e)}", filename
 
+
+
+@app.callback(
+    Output("golden-store-version", "data", allow_duplicate=True),
+    Input("progress-interval", "n_intervals"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True
+)
+def sync_golden_store_version_from_server(_n_intervals, client_version):
+    """Propagate server-side Golden Store publishes into the Dash store.
+
+    Background workers can update the module-level Golden Store, but they cannot
+    directly update dcc.Store values in the browser. Polling this lightweight
+    version counter lets callbacks that depend on ``golden-store-version``
+    refresh after background task creation or other server-side publishes.
+    """
+    server_version = get_golden_store_version()
+    if server_version != client_version:
+        return server_version
+    return dash.no_update
 
 # 3. Load tasks from selected JSON file (Optimized & Thread-Safe)
 @app.callback(
@@ -7011,6 +7329,14 @@ def manual_clear_all(n):
         tm.tasks.clear()
     publish_golden_task_snapshot([], reason="manual_clear", bump_version=False)
     return "🗑️ All tasks cleared.", [], 0, 0
+
+# =============================================================================
+# 21. CALLBACKS: BULK ACTIONS, RECALCULATION, AND BACKGROUND WORKERS
+# =============================================================================
+# Long-running operations coordinate recalc state, task state, and Golden Store
+# publication. Keep stop/progress flags explicit and avoid changing calculation
+# logic during organization-only refactors.
+# =============================================================================
 
 @app.callback(
     Output("bulk-rerun-status", "children", allow_duplicate=True),
@@ -7337,6 +7663,13 @@ def trigger_ui_on_recalc_complete(n_intervals, is_disabled):
         return False, dash.no_update
     # Keep current state
     return dash.no_update, dash.no_update
+
+# =============================================================================
+# 22. DATABASE CALLBACK REGISTRATION AND APPLICATION ENTRYPOINT
+# =============================================================================
+# Database-specific UI/callbacks are delegated to database.py. Keep this final so
+# the main app is fully constructed before registration.
+# =============================================================================
 
 # Register database callbacks
 register_database_callbacks(app)
