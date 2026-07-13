@@ -3655,6 +3655,47 @@ def render_tab(tab):
                     ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px"})
                 ], style={"marginBottom": "20px"})
             ]),
+            # ----- Dynamic Toward-Level Strategy Checkup (on-demand diagnostics) -----
+            html.Details([
+                html.Summary("🧪 Dynamic Toward-Level Checkup – variable SL / TP / trailing stop", style={"fontWeight": "bold", "cursor": "pointer"}),
+                html.Div([
+                    html.P(
+                        "Runs an on-demand diagnostic over raw candle data without changing saved task fields. "
+                        "Entry uses the first candle after signal time, buy toward resistance and sell toward support.",
+                        style={"marginTop": "10px", "color": "#555"}
+                    ),
+                    html.Div([
+                        html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
+                        dcc.Input(id="dynamic-check-sl-input", type="number", value=0.12, min=0, step=0.01, style={"width": "90px"}),
+                        html.Label("Max drawdown from entry %:", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="dynamic-check-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Take profit levels %:", style={"width": "180px", "display": "inline-block"}),
+                        dcc.Input(id="dynamic-check-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
+                        html.Span("Example: 0.5, 1, 2, 4", style={"marginLeft": "10px", "color": "#777"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Dynamic stop rules:", style={"width": "180px", "display": "inline-block"}),
+                        dcc.Input(id="dynamic-check-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                        html.Span("trigger%:move-stop-to-profit% pairs", style={"marginLeft": "10px", "color": "#777"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Button("Run Dynamic Checkup", id="dynamic-check-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                    html.Div(id="dynamic-check-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                    html.Div(
+                        id="dynamic-check-results",
+                        style={
+                            "marginTop": "10px",
+                            "maxHeight": "420px",
+                            "overflowY": "auto",
+                            "border": "1px solid #ddd",
+                            "borderRadius": "4px",
+                            "padding": "8px",
+                            "backgroundColor": "#fff",
+                        }
+                    ),
+                ], style={"padding": "10px", "backgroundColor": "#f7fbff", "borderRadius": "5px", "border": "1px solid #cfe8ff"})
+            ], open=False, style={"marginBottom": "20px"}),
             # ----- Strategy Info Panel (collapsible) – Professional version -----
             html.Details([
                 html.Summary("📊 Professional Strategy Framework – Multi‑Month Levels", style={"fontWeight": "bold", "cursor": "pointer"}),
@@ -5086,7 +5127,7 @@ def render_task_table_row(t, show_table_logs=False):
     else:
         import html as html_lib
         log_text = "\n".join(t.log) if t.log else "No logs yet..."
-        log_escaped = html_lib.escape(log_text)
+        log_escaped = html_lib.escape(log_text).replace("\n", "<br>")
         log_html = f'<div style="width:100%;max-height:100px;min-height:50px;font-family:monospace;font-size:11px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word;padding:4px;border:1px solid #ddd;border-radius:3px;background-color:#fafafa">{log_escaped}</div>'
     
     # Build action buttons as HTML strings
@@ -5127,7 +5168,7 @@ def render_task_table_row(t, show_table_logs=False):
     button_html = f'<div>{stop_btn}{pause_btn}{chart_btn}{details_btn}{impulse_btn}{rerun_strat_btn}{rerun_impulse_btn}{tv_btn}</div>'
 
     # Build and return RAW HTML STRING for the entire row
-    return f"""<tr data-task-row="{task_id_str}">
+    row_html = f"""<tr data-task-row="{task_id_str}">
         <td style="min-width:80px">{task_id_str[:8]}</td>
         <td style="min-width:80px">{t.status}</td>
         <td style="min-width:70px">{t.progress:.1f}%</td>
@@ -5187,6 +5228,10 @@ def render_task_table_row(t, show_table_logs=False):
         <td style="min-width:200px">{log_html}</td>
         <td style="min-width:420px">{button_html}</td>
     </tr>"""
+    # dcc.Markdown treats indented HTML lines as code blocks, which caused raw
+    # <td> tags to display in the page. Compact the row so Markdown receives a
+    # continuous raw-HTML block while preserving log line breaks as <br> tags.
+    return "".join(line.strip() for line in row_html.splitlines())
 
 
 def render_task_table_header():
@@ -6263,6 +6308,243 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
 # UI around strategy/impulse parameters, details, grid search, and walk-forward.
 # Core detection remains in strategies.py / impulse.py or task analysis helpers.
 # =============================================================================
+
+def parse_dynamic_percent_levels(text, default_levels=(0.5, 1.0, 2.0, 4.0)):
+    """Parse comma/space separated positive percent levels for dynamic diagnostics."""
+    if text is None or str(text).strip() == "":
+        return list(default_levels)
+    levels = []
+    for raw_part in re.split(r"[,;\s]+", str(text)):
+        part = raw_part.strip().replace("%", "").replace("+", "")
+        if not part:
+            continue
+        value = float(part)
+        if value <= 0:
+            raise ValueError("Percent levels must be greater than 0.")
+        levels.append(value)
+    if not levels:
+        return list(default_levels)
+    return sorted(set(levels))
+
+
+def parse_dynamic_stop_rules(text):
+    """Parse trigger%:stop-profit% pairs for dynamic stop movement diagnostics."""
+    if text is None or str(text).strip() == "":
+        return []
+    rules = []
+    for raw_rule in re.split(r"[,;]+", str(text)):
+        rule = raw_rule.strip()
+        if not rule:
+            continue
+        if ":" not in rule:
+            raise ValueError("Dynamic stop rules must use trigger:stop format, e.g. 1:0.5.")
+        trigger_text, stop_text = rule.split(":", 1)
+        trigger_pct = float(trigger_text.strip().replace("%", "").replace("+", ""))
+        stop_profit_pct = float(stop_text.strip().replace("%", "").replace("+", ""))
+        if trigger_pct <= 0:
+            raise ValueError("Dynamic stop trigger levels must be greater than 0.")
+        rules.append((trigger_pct, stop_profit_pct))
+    return sorted(set(rules), key=lambda item: item[0])
+
+
+def fmt_dynamic_level_label(level):
+    """Format dynamic diagnostic percent labels."""
+    try:
+        level = float(level)
+    except Exception:
+        return str(level)
+    if level >= 4:
+        return f"{level:g}%+"
+    return f"{level:g}%"
+
+
+def simulate_dynamic_checkup_for_task(task, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
+    """Run a read-only raw-candle diagnostic for one task without mutating task fields."""
+    result = {
+        "valid": False,
+        "level_reached": False,
+        "stop_hit": False,
+        "max_dd_hit": False,
+        "stopped_before_level": False,
+        "stop_after_tp": False,
+        "tp_hits": set(),
+        "stop_moves": set(),
+        "entry_level_distance_pct": None,
+        "max_move_pct": 0.0,
+    }
+    if task is None or getattr(task, "signal_time", None) is None or getattr(task, "signal_price", None) is None:
+        return result
+    if getattr(task, "signal_direction", None) not in ("resistance", "support"):
+        return result
+
+    df = load_task_data_cached(task)
+    if df is None or df.empty:
+        return result
+    df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+    entry_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
+    if entry_idx >= len(df_sorted):
+        return result
+
+    entry_row = df_sorted.iloc[entry_idx]
+    entry_price = entry_row.get("open", entry_row.get("close"))
+    if entry_price is None or (isinstance(entry_price, (float, np.floating)) and is_na(entry_price)):
+        return result
+    entry_price = float(entry_price)
+    signal_price = float(task.signal_price)
+    if entry_price <= 0 or signal_price <= 0:
+        return result
+
+    direction = "buy" if task.signal_direction == "resistance" else "sell"
+    result["valid"] = True
+    result["entry_level_distance_pct"] = abs(signal_price - entry_price) / entry_price * 100
+
+    stop_loss_pct = max(0.0, float(stop_loss_pct or 0.0))
+    stop_price = entry_price * (1 - stop_loss_pct / 100) if direction == "buy" else entry_price * (1 + stop_loss_pct / 100)
+    max_dd_pct = float(max_dd_pct or 0.0)
+    max_dd_price = None
+    if max_dd_pct > 0:
+        max_dd_price = entry_price * (1 - max_dd_pct / 100) if direction == "buy" else entry_price * (1 + max_dd_pct / 100)
+
+    for _, row in df_sorted.iloc[entry_idx:].iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+
+        if direction == "buy":
+            if low <= stop_price:
+                result["stop_hit"] = True
+                break
+            if max_dd_price is not None and low <= max_dd_price:
+                result["max_dd_hit"] = True
+                break
+            move_pct = (high - entry_price) / entry_price * 100
+            if high >= signal_price:
+                result["level_reached"] = True
+        else:
+            if high >= stop_price:
+                result["stop_hit"] = True
+                break
+            if max_dd_price is not None and high >= max_dd_price:
+                result["max_dd_hit"] = True
+                break
+            move_pct = (entry_price - low) / entry_price * 100
+            if low <= signal_price:
+                result["level_reached"] = True
+
+        result["max_move_pct"] = max(result["max_move_pct"], move_pct)
+        for level in tp_levels:
+            if move_pct >= level:
+                result["tp_hits"].add(level)
+
+        for trigger_pct, stop_profit_pct in stop_rules:
+            if move_pct < trigger_pct:
+                continue
+            if direction == "buy":
+                candidate_stop = entry_price * (1 + stop_profit_pct / 100)
+                if candidate_stop > stop_price:
+                    stop_price = candidate_stop
+                    result["stop_moves"].add(trigger_pct)
+            else:
+                candidate_stop = entry_price * (1 - stop_profit_pct / 100)
+                if candidate_stop < stop_price:
+                    stop_price = candidate_stop
+                    result["stop_moves"].add(trigger_pct)
+
+    result["stopped_before_level"] = bool((result["stop_hit"] or result["max_dd_hit"]) and not result["level_reached"])
+    result["stop_after_tp"] = bool((result["stop_hit"] or result["max_dd_hit"]) and len(result["tp_hits"]) > 0)
+    return result
+
+
+def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
+    """Build an on-demand summary table from raw dynamic-check diagnostic results."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
+    total_tasks = len(tasks)
+    results = [simulate_dynamic_checkup_for_task(t, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for t in tasks]
+    valid_results = [r for r in results if r["valid"]]
+    valid_total = len(valid_results)
+
+    def fmt_stat(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
+
+    stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
+    level_reached = sum(1 for r in valid_results if r["level_reached"])
+    stopped_before_level = sum(1 for r in valid_results if r["stopped_before_level"])
+    stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
+    stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+
+    distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
+    distance_counts = {r: 0 for r in distance_ranges}
+    for result in valid_results:
+        bucket = get_toward_distance_bucket(result["entry_level_distance_pct"])
+        if bucket:
+            distance_counts[bucket] += 1
+
+    rows = [
+        html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
+        html.Tr([html.Td("Valid dynamic cases", style=td_style), html.Td(fmt_stat(valid_total, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max drawdown cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Reached signal level", style=td_style), html.Td(fmt_stat(level_reached, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stopped before level", style=td_style), html.Td(fmt_stat(stopped_before_level, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 0-1%", style=td_style), html.Td(" | ".join(f"{r}:{distance_counts[r]}" for r in distance_ranges[:3]), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 1%+", style=td_style), html.Td(" | ".join(f"{r}:{distance_counts[r]}" for r in distance_ranges[3:]), style=td_style)]),
+    ]
+
+    reached_results = [r for r in valid_results if r["level_reached"]]
+    stopped_results = [r for r in valid_results if r["stopped_before_level"]]
+    for level in tp_levels:
+        label = fmt_dynamic_level_label(level)
+        tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
+        tp_reached = sum(1 for r in reached_results if level in r["tp_hits"])
+        tp_stopped = sum(1 for r in stopped_results if level in r["tp_hits"])
+        rows.extend([
+            html.Tr([html.Td(f"TP {label} found", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]),
+            html.Tr([html.Td(f"TP {label} conditional over reached level", style=td_style), html.Td(fmt_stat(tp_reached, len(reached_results)), style=td_style)]),
+            html.Tr([html.Td(f"TP {label} while stopped before level", style=td_style), html.Td(fmt_stat(tp_stopped, len(stopped_results)), style=td_style)]),
+        ])
+
+    for trigger_pct, stop_profit_pct in stop_rules:
+        moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
+        rows.append(html.Tr([
+            html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style),
+            html.Td(fmt_stat(moved, valid_total), style=td_style),
+        ]))
+
+    return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+
+
+@app.callback(
+    Output("dynamic-check-status", "children"),
+    Output("dynamic-check-results", "children"),
+    Input("dynamic-check-run-btn", "n_clicks"),
+    State("dynamic-check-sl-input", "value"),
+    State("dynamic-check-max-dd-input", "value"),
+    State("dynamic-check-tp-levels-input", "value"),
+    State("dynamic-check-trail-rules-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_dynamic_strategy_checkup(n_clicks, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, _version):
+    """On-demand callback for raw-data dynamic strategy diagnostics."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        tp_levels = parse_dynamic_percent_levels(tp_text)
+        stop_rules = parse_dynamic_stop_rules(stop_rules_text)
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_levels, stop_rules)
+        elapsed = time.time() - started
+        status = (
+            f"✅ Dynamic checkup complete in {elapsed:.2f}s. "
+            f"SL={float(stop_loss_pct or 0):g}%, max DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
+            f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}."
+        )
+        return status, table
+    except Exception as exc:
+        return f"❌ Dynamic checkup failed: {exc}", no_update
 
 @app.callback(
     Output("impulse-task-selector", "options"),
