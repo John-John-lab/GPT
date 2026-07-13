@@ -3210,6 +3210,7 @@ def build_root_layout():
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
+    dcc.Store(id="measure-anchor-store", data=True),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
@@ -3324,6 +3325,16 @@ def build_root_layout():
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
+                                "padding": "8px 16px",
+                                "cursor": "pointer",
+                                "fontSize": "14px",
+                                "minWidth": "100px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Snap: On", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
+                                "background": "#e8f5e9",
+                                "color": "black",
+                                "border": "1px solid #2e7d32",
                                 "padding": "8px 16px",
                                 "cursor": "pointer",
                                 "fontSize": "14px",
@@ -6130,6 +6141,15 @@ def toggle_measure(n_clicks, current):
     return not current
 
 @app.callback(
+    Output("measure-anchor-store", "data"),
+    Input("toggle-measure-anchor-btn", "n_clicks"),
+    State("measure-anchor-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_measure_anchor(n_clicks, current):
+    return not current
+
+@app.callback(
     Output("measure-mode-store", "data", allow_duplicate=True),
     Output("measure-points-store", "data", allow_duplicate=True),
     Output("measure-result-store", "data", allow_duplicate=True),
@@ -6174,7 +6194,27 @@ def update_measure_button(active):
     }
     return ("📏 Measuring" if active else "Measure"), base_style
 
-def _extract_measure_point(click_data):
+@app.callback(
+    Output("toggle-measure-anchor-btn", "children"),
+    Output("toggle-measure-anchor-btn", "style"),
+    Input("measure-anchor-store", "data"),
+    prevent_initial_call=False
+)
+def update_measure_anchor_button(anchor_enabled):
+    base_style = {
+        "background": "#e8f5e9" if anchor_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #2e7d32" if anchor_enabled else "1px solid #999",
+        "padding": "8px 16px",
+        "cursor": "pointer",
+        "fontSize": "14px",
+        "minWidth": "100px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if anchor_enabled else "normal"
+    }
+    return ("Snap: On" if anchor_enabled else "Snap: Off"), base_style
+
+def _extract_measure_point(click_data, anchor_enabled=True):
     """Return {'x': ..., 'y': ...} from Plotly clickData.
 
     Plotly candlestick clicks do not consistently expose a `y` key.  The chart
@@ -6186,6 +6226,9 @@ def _extract_measure_point(click_data):
     point = click_data['points'][0]
     x_val = point.get('x')
     y_val = point.get('y')
+
+    if not anchor_enabled and point.get('curveNumber') is not None and point.get('y') is None:
+        return None
 
     if y_val is None:
         if point.get('close') is not None:
@@ -6236,18 +6279,19 @@ def _format_measure_time_delta(first_x, second_x, timeframe=None):
     Output("measure-result-store", "data"),
     Input("task-chart", "clickData"),
     State("measure-mode-store", "data"),
+    State("measure-anchor-store", "data"),
     State("measure-points-store", "data"),
     State("chart-task-id", "data"),
     prevent_initial_call=True
 )
-def capture_click(clickData, measure_mode, points, task_id):
+def capture_click(clickData, measure_mode, measure_anchor, points, task_id):
     if not measure_mode or not clickData:
         return dash.no_update, dash.no_update
 
-    clicked = _extract_measure_point(clickData)
+    clicked = _extract_measure_point(clickData, anchor_enabled=bool(measure_anchor))
     if clicked is None:
         return dash.no_update, {
-            "text": "📏 Could not read that candle price. Try clicking near the candle body/close marker.",
+            "text": "📏 Could not read that candle price. Try clicking near a candle body/close marker, or turn Snap back On.",
             "first": None,
             "second": None
         }
@@ -6323,11 +6367,13 @@ def show_measure_result(result):
 @app.callback(
     Output("measure-hint", "children"),
     Input("measure-mode-store", "data"),
+    Input("measure-anchor-store", "data"),
     prevent_initial_call=False
 )
-def measure_hint(active):
+def measure_hint(active, anchor_enabled):
     if active:
-        return "📏 Measure mode active: click one candle, then another. The chart measures close-price %, elapsed time, and candle count."
+        snap_text = "Snap On: clicks anchor to close-price helper points." if anchor_enabled else "Snap Off: close-price helper anchors are hidden; click directly on candle/trace points."
+        return f"📏 Measure mode active: click one candle, then another. {snap_text}"
     return "Click Measure to enable the TradingView-style ruler."
 
 # ----- Strategy details modal callbacks (using data-action pattern) -----
@@ -6439,11 +6485,12 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
     Input("measure-mode-store", "data"),
+    Input("measure-anchor-store", "data"),
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_anchor, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -6500,13 +6547,15 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
         ), row=1, col=1)
-        # Invisible close-price points make the Measure tool reliable because
-        # candlestick clickData can omit a usable y/price value.
-        target_fig.add_trace(go.Scatter(
-            x=df['x'], y=df['close'], mode='markers',
-            name='_measure_click_points', showlegend=False, hoverinfo='skip',
-            marker=dict(size=18, color='rgba(0,0,0,0)')
-        ), row=1, col=1)
+        if measure_anchor:
+            # Invisible close-price points make the Measure tool reliable because
+            # candlestick clickData can omit a usable y/price value.  The Snap
+            # toggle hides these helper points when users do not want anchoring.
+            target_fig.add_trace(go.Scatter(
+                x=df['x'], y=df['close'], mode='markers',
+                name='_measure_click_points', showlegend=False, hoverinfo='skip',
+                marker=dict(size=18, color='rgba(0,0,0,0)')
+            ), row=1, col=1)
 
     def add_volume_trace(target_fig, row, title="Volume"):
         colors = np.where(df['close'] >= df['open'], '#26a69a', '#ef5350')
