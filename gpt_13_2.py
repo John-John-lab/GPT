@@ -3205,6 +3205,7 @@ def build_root_layout():
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
+    dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
     dcc.Store(id="volume-visible-store", data=False),  # default: Volume hidden
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
@@ -3287,6 +3288,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "14px",
                                 "minWidth": "100px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Toggle Stoch", id="toggle-stochastic-btn", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "8px 16px",
+                                "cursor": "pointer",
+                                "fontSize": "14px",
+                                "minWidth": "110px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Volume", id="toggle-volume-btn", style={
@@ -3746,18 +3757,23 @@ def render_tab(tab):
                         html.Span("Grid rows reuse raw candle paths built once per task for faster comparison.", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
                     html.Button("Run Dynamic Checkup", id="dynamic-check-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
-                    html.Div(id="dynamic-check-status", style={"marginTop": "10px", "fontWeight": "bold"}),
-                    html.Div(
-                        id="dynamic-check-results",
-                        style={
-                            "marginTop": "10px",
-                            "maxHeight": "420px",
-                            "overflowY": "auto",
-                            "border": "1px solid #ddd",
-                            "borderRadius": "4px",
-                            "padding": "8px",
-                            "backgroundColor": "#fff",
-                        }
+                    dcc.Loading(
+                        type="circle",
+                        children=[
+                            html.Div(id="dynamic-check-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                            html.Div(
+                                id="dynamic-check-results",
+                                style={
+                                    "marginTop": "10px",
+                                    "maxHeight": "420px",
+                                    "overflowY": "auto",
+                                    "border": "1px solid #ddd",
+                                    "borderRadius": "4px",
+                                    "padding": "8px",
+                                    "backgroundColor": "#fff",
+                                }
+                            ),
+                        ],
                     ),
                 ], style={"padding": "10px", "backgroundColor": "#f7fbff", "borderRadius": "5px", "border": "1px solid #cfe8ff"})
             ], open=False, style={"marginBottom": "20px"}),
@@ -3818,18 +3834,23 @@ def render_tab(tab):
                         dcc.Input(id="level-reversal-offset-grid-input", type="text", value="0, 0.1, 0.25, 0.5", style={"width": "220px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Button("Run Level-Reversal Checkup", id="level-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
-                    html.Div(id="level-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}),
-                    html.Div(
-                        id="level-reversal-results",
-                        style={
-                            "marginTop": "10px",
-                            "maxHeight": "420px",
-                            "overflowY": "auto",
-                            "border": "1px solid #ddd",
-                            "borderRadius": "4px",
-                            "padding": "8px",
-                            "backgroundColor": "#fff",
-                        }
+                    dcc.Loading(
+                        type="circle",
+                        children=[
+                            html.Div(id="level-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                            html.Div(
+                                id="level-reversal-results",
+                                style={
+                                    "marginTop": "10px",
+                                    "maxHeight": "420px",
+                                    "overflowY": "auto",
+                                    "border": "1px solid #ddd",
+                                    "borderRadius": "4px",
+                                    "padding": "8px",
+                                    "backgroundColor": "#fff",
+                                }
+                            ),
+                        ],
                     ),
                 ], style={"padding": "10px", "backgroundColor": "#fffaf2", "borderRadius": "5px", "border": "1px solid #f4d19b"})
             ], open=False, style={"marginBottom": "20px"}),
@@ -6072,6 +6093,15 @@ def toggle_rsi(n_clicks, current):
     return not current
 
 @app.callback(
+    Output("stochastic-visible-store", "data"),
+    Input("toggle-stochastic-btn", "n_clicks"),
+    State("stochastic-visible-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_stochastic(n_clicks, current):
+    return not current
+
+@app.callback(
     Output("volume-visible-store", "data"),
     Input("toggle-volume-btn", "n_clicks"),
     State("volume-visible-store", "data"),
@@ -6403,6 +6433,7 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Output("task-chart", "figure"),
     Input("chart-task-id", "data"),
     Input("rsi-visible-store", "data"),
+    Input("stochastic-visible-store", "data"),
     Input("volume-visible-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
@@ -6412,7 +6443,7 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -6449,6 +6480,15 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
+    def compute_stochastic(high, low, close, k_length=14, d_length=1, smooth=3):
+        lowest_low = low.rolling(window=k_length, min_periods=k_length).min()
+        highest_high = high.rolling(window=k_length, min_periods=k_length).max()
+        price_range = (highest_high - lowest_low).replace(0, np.nan)
+        raw_k = (close - lowest_low) / price_range * 100
+        k_line = raw_k.rolling(window=smooth, min_periods=smooth).mean()
+        d_line = k_line.rolling(window=d_length, min_periods=d_length).mean()
+        return k_line, d_line
+
     has_volume = 'volume' in df.columns
     if volume_visible and has_volume:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
@@ -6477,63 +6517,81 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         ), row=row, col=1)
         target_fig.update_yaxes(title_text=title, row=row, col=1)
 
-    # Low-spec chart cache: compute RSI once per period view
+    def add_rsi_trace(target_fig, row):
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
+            line=dict(color='purple', width=1.5), connectgaps=True
+        ), row=row, col=1)
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=[50] * len(df), mode='lines',
+            name=f'_spike_helper_rsi_{row}', showlegend=False, hoverinfo='skip',
+            line=dict(width=1, color='rgba(0,0,0,0.01)')
+        ), row=row, col=1)
+        target_fig.add_hline(y=70, line_dash="dash", line_color="red", row=row, col=1)
+        target_fig.add_hline(y=30, line_dash="dash", line_color="green", row=row, col=1)
+        target_fig.update_yaxes(title_text="RSI", row=row, col=1, range=[0, 100])
+
+    def add_stochastic_trace(target_fig, row, k_col, d_col, title, color):
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df[k_col], mode='lines', name=f'{title} %K',
+            line=dict(color=color, width=1.4), connectgaps=True
+        ), row=row, col=1)
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
+            line=dict(color='#555', width=0.9, dash='dot'), connectgaps=True,
+            showlegend=False
+        ), row=row, col=1)
+        target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
+        target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
+        target_fig.update_yaxes(title_text=title, row=row, col=1, range=[0, 100])
+
+    # Low-spec chart cache: compute indicators once per period view
     cache_key = (start_ms, end_ms)
     if cache_key not in task._chart_cache:
         df['rsi'] = compute_rsi(df['close'])
+        df['stoch_k_14_1_3'], df['stoch_d_14_1_3'] = compute_stochastic(df['high'], df['low'], df['close'], 14, 1, 3)
+        df['stoch_k_40_1_4'], df['stoch_d_40_1_4'] = compute_stochastic(df['high'], df['low'], df['close'], 40, 1, 4)
+        df['stoch_k_60_1_10'], df['stoch_d_60_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 60, 1, 10)
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     else:
         df = task._chart_cache[cache_key]
     # Create figure
     volume_enabled = bool(volume_visible and has_volume)
-    if rsi_visible and volume_enabled:
-        fig = make_subplots(
-            rows=3, cols=1, shared_xaxes=True,
-            vertical_spacing=0.04, row_heights=[0.62, 0.20, 0.18]
-        )
-        add_main_candles(fig)
-        # RSI line
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
-            line=dict(color='purple', width=1.5), connectgaps=True
-        ), row=2, col=1)
-        # Helper trace on RSI (ensures hover line works – kept for consistency)
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=[50]*len(df), mode='lines',
-            name='_spike_helper_rsi', showlegend=False, hoverinfo='skip',
-            line=dict(width=1, color='rgba(0,0,0,0.01)')
-        ), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
-        add_volume_trace(fig, row=3)
-    elif rsi_visible:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.7, 0.3])
-        add_main_candles(fig)
-        # RSI line
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
-            line=dict(color='purple', width=1.5), connectgaps=True
-        ), row=2, col=1)
-        # Helper trace on RSI (ensures hover line works – kept for consistency)
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=[50]*len(df), mode='lines',
-            name='_spike_helper_rsi', showlegend=False, hoverinfo='skip',
-            line=dict(width=1, color='rgba(0,0,0,0.01)')
-        ), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
-    elif volume_enabled:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.72, 0.28])
-        add_main_candles(fig)
-        add_volume_trace(fig, row=2)
-    else:
+    indicator_specs = []
+    if rsi_visible:
+        indicator_specs.append(("rsi", None))
+    if stochastic_visible:
+        indicator_specs.extend([
+            ("stoch", ("stoch_k_14_1_3", "stoch_d_14_1_3", "Stoch 14/1/3", "#1565c0")),
+            ("stoch", ("stoch_k_40_1_4", "stoch_d_40_1_4", "Stoch 40/1/4", "#ef6c00")),
+            ("stoch", ("stoch_k_60_1_10", "stoch_d_60_1_10", "Stoch 60/1/10", "#2e7d32")),
+        ])
+    if volume_enabled:
+        indicator_specs.append(("volume", None))
+
+    total_rows = 1 + len(indicator_specs)
+    if total_rows == 1:
         fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
-        add_main_candles(fig)
+    else:
+        indicator_height = 0.12 if stochastic_visible else 0.18
+        row_heights = [max(0.42, 1.0 - indicator_height * len(indicator_specs))]
+        row_heights.extend([indicator_height] * len(indicator_specs))
+        fig = make_subplots(
+            rows=total_rows, cols=1, shared_xaxes=True,
+            vertical_spacing=0.035, row_heights=row_heights
+        )
+    add_main_candles(fig)
+
+    current_row = 2
+    for indicator_type, indicator_data in indicator_specs:
+        if indicator_type == "rsi":
+            add_rsi_trace(fig, current_row)
+        elif indicator_type == "stoch":
+            add_stochastic_trace(fig, current_row, *indicator_data)
+        elif indicator_type == "volume":
+            add_volume_trace(fig, row=current_row)
+        current_row += 1
 
     if volume_visible and not has_volume:
         fig.add_annotation(
@@ -6667,7 +6725,7 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         hovermode="x unified",
         clickmode="event+select",
         dragmode="pan",
-        height=780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500),
+        height=980 if stochastic_visible else (780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500)),
         margin=dict(l=50, r=50, t=50, b=50)
     )
     # X-axis tick format and native Plotly spike lines.
@@ -7204,11 +7262,17 @@ def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, m
     max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
     stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
     stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    resistance_total = sum(1 for t in eligible_tasks if getattr(t, "signal_direction", None) == "resistance")
+    support_total = sum(1 for t in eligible_tasks if getattr(t, "signal_direction", None) == "support")
+    resistance_results = [r for p, r in zip(valid_paths, valid_results) if p["direction"] == "sell"]
+    support_results = [r for p, r in zip(valid_paths, valid_results) if p["direction"] == "buy"]
     rows = [
         html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
         html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
         html.Tr([html.Td("Level/offset entries triggered", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Not triggered / did not reach entry", style=td_style), html.Td(fmt_stat(len(eligible_tasks) - valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Resistance→SELL entries triggered", style=td_style), html.Td(fmt_stat(len(resistance_results), resistance_total), style=td_style)]),
+        html.Tr([html.Td("Support→BUY entries triggered", style=td_style), html.Td(fmt_stat(len(support_results), support_total), style=td_style)]),
         html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
@@ -7219,6 +7283,10 @@ def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, m
         label = fmt_dynamic_level_label(level)
         tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
         rows.append(html.Tr([html.Td(f"TP {label} found after reversal entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
+        resistance_tp = sum(1 for r in resistance_results if level in r["tp_hits"])
+        support_tp = sum(1 for r in support_results if level in r["tp_hits"])
+        rows.append(html.Tr([html.Td(f"TP {label} Resistance→SELL", style=td_style), html.Td(fmt_stat(resistance_tp, len(resistance_results)), style=td_style)]))
+        rows.append(html.Tr([html.Td(f"TP {label} Support→BUY", style=td_style), html.Td(fmt_stat(support_tp, len(support_results)), style=td_style)]))
 
     for trigger_pct, stop_profit_pct in stop_rules:
         moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
@@ -7275,7 +7343,7 @@ def run_dynamic_strategy_checkup(n_clicks, stop_loss_pct, max_dd_pct, tp_text, s
         table = build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=sl_grid, be_grid=be_grid, dd_grid=dd_grid)
         elapsed = time.time() - started
         status = (
-            f"✅ Dynamic checkup complete in {elapsed:.2f}s. "
+            f"✅ Dynamic checkup run #{n_clicks} complete in {elapsed:.2f}s. "
             f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}."
         )
@@ -7324,7 +7392,7 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
         )
         elapsed = time.time() - started
         status = (
-            f"✅ Level-reversal checkup complete in {elapsed:.2f}s. "
+            f"✅ Level-reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
             f"entry offset={entry_offset_pct:g}%, SL={float(stop_loss_pct or 0):g}%, "
             f"max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}."
