@@ -3687,28 +3687,35 @@ def render_tab(tab):
                     ),
                     html.Div([
                         html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Loss distance from the simulated entry. Example: 0.12 means close if price moves 0.12% against the entry before a tighter dynamic stop is active.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-sl-input", type="number", value=0.12, min=0, step=0.01, style={"width": "90px"}),
                         html.Label("Max adverse DD from entry % (positive):", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Optional adverse-move cap measured from entry, always entered as a positive percent. It is an exit reason only if this cap is hit before the normal stop/trailing stop.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
                         html.Label("Take profit levels %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Favorable move checkpoints from entry. Example: 0.5, 1, 2, 4 counts candles that move at least those percentages in the trade direction.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
                         html.Span("Example: 0.5, 1, 2, 4", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
                         html.Label("Dynamic stop rules:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Comma-separated trigger:stop-profit pairs. Example 0.5:0 means: after price moves +0.5% in your favor, move the stop to breakeven. 1:0.3 means after +1%, lock +0.3% profit.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
                         html.Span("trigger%:move-stop-to-profit% pairs", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
                         html.Label("SL grid %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Extra stop-loss values to test side-by-side in the summary. They reuse the same raw candle paths for faster comparison.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-sl-grid-input", type="text", value="0.12, 0.15, 0.25, 0.35, 0.5", style={"width": "260px"}),
                         html.Label("BE arm grid %:", style={"width": "130px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Breakeven-arm tests add a rule that moves stop to entry after this favorable move. Example 0.5 tests BE after +0.5%.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-be-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
                         html.Label("Max adverse DD grid %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Extra adverse drawdown caps from entry to test side-by-side. A cap only counts when it becomes the actual exit before another stop.", style={"cursor": "help", "color": "#0b63b6"}),
                         dcc.Input(id="dynamic-check-dd-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
                         html.Span("Grid rows reuse raw candle paths built once per task for faster comparison.", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
@@ -3727,6 +3734,53 @@ def render_tab(tab):
                         }
                     ),
                 ], style={"padding": "10px", "backgroundColor": "#f7fbff", "borderRadius": "5px", "border": "1px solid #cfe8ff"})
+            ], open=False, style={"marginBottom": "20px"}),
+            # ----- Level-Reversal Strategy Checkup (on-demand diagnostics) -----
+            html.Details([
+                html.Summary("🧪 Level-Reversal Checkup – enter after signal level touch/overshoot", style={"fontWeight": "bold", "cursor": "pointer"}),
+                html.Div([
+                    html.P(
+                        "Tests the opposite idea: wait until price reaches the signal level (or overshoots it by a chosen percent), "
+                        "then enter the reversal direction. Resistance becomes SELL; support becomes BUY. This is read-only and does not change saved task fields.",
+                        style={"marginTop": "10px", "color": "#555"}
+                    ),
+                    html.Div([
+                        html.Label("Entry offset beyond level %:", style={"width": "210px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="0 means enter at the signal level. 0.2 means wait for 0.2% beyond resistance/support before entering the reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-offset-input", type="number", value=0, min=0, step=0.05, style={"width": "90px"}),
+                        html.Label("Initial stop loss %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Loss distance from reversal entry. Resistance reversal is SELL, support reversal is BUY.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
+                        html.Label("Max adverse DD %:", style={"width": "140px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="level-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Take profit levels %:", style={"width": "210px", "display": "inline-block"}),
+                        dcc.Input(id="level-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
+                        html.Label("Dynamic stop rules:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="level-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("SL grid %:", style={"width": "210px", "display": "inline-block"}),
+                        dcc.Input(id="level-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
+                        html.Label("Entry offset grid %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="level-reversal-offset-grid-input", type="text", value="0, 0.1, 0.25, 0.5", style={"width": "220px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Button("Run Level-Reversal Checkup", id="level-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                    html.Div(id="level-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                    html.Div(
+                        id="level-reversal-results",
+                        style={
+                            "marginTop": "10px",
+                            "maxHeight": "420px",
+                            "overflowY": "auto",
+                            "border": "1px solid #ddd",
+                            "borderRadius": "4px",
+                            "padding": "8px",
+                            "backgroundColor": "#fff",
+                        }
+                    ),
+                ], style={"padding": "10px", "backgroundColor": "#fffaf2", "borderRadius": "5px", "border": "1px solid #f4d19b"})
             ], open=False, style={"marginBottom": "20px"}),
             # ----- Strategy Info Panel (collapsible) – Professional version -----
             html.Details([
@@ -6613,6 +6667,24 @@ def parse_dynamic_percent_levels(text, default_levels=(0.5, 1.0, 2.0, 4.0)):
     return sorted(set(levels))
 
 
+def parse_dynamic_nonnegative_percent_levels(text, default_levels=(0.0,)):
+    """Parse comma/space separated non-negative percent levels for offset grids."""
+    if text is None or str(text).strip() == "":
+        return list(default_levels)
+    levels = []
+    for raw_part in re.split(r"[,;\s]+", str(text)):
+        part = raw_part.strip().replace("%", "").replace("+", "")
+        if not part:
+            continue
+        value = float(part)
+        if value < 0:
+            raise ValueError("Percent levels must be 0 or greater.")
+        levels.append(value)
+    if not levels:
+        return list(default_levels)
+    return sorted(set(levels))
+
+
 def parse_dynamic_stop_rules(text):
     """Parse trigger%:stop-profit% pairs for dynamic stop movement diagnostics."""
     if text is None or str(text).strip() == "":
@@ -6986,6 +7058,143 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
 
+def build_level_reversal_path(task, entry_offset_pct=0.0):
+    """Build a raw path for the opposite trade after level touch/overshoot.
+
+    Resistance signals become SELL after price reaches resistance plus the
+    optional offset. Support signals become BUY after price reaches support
+    minus the optional offset.
+    """
+    if not is_task_eligible_for_dynamic_checkup(task):
+        return None
+    if task is None or getattr(task, "signal_time", None) is None or getattr(task, "signal_price", None) is None:
+        return None
+    if getattr(task, "signal_direction", None) not in ("resistance", "support"):
+        return None
+
+    df = load_task_data_cached(task)
+    if df is None or df.empty:
+        return None
+
+    entry_offset_pct = max(0.0, float(entry_offset_pct or 0.0))
+    signal_price = float(task.signal_price)
+    if signal_price <= 0:
+        return None
+
+    df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+    search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
+    if search_idx >= len(df_sorted):
+        return None
+
+    if task.signal_direction == "resistance":
+        direction = "sell"
+        entry_price = signal_price * (1 + entry_offset_pct / 100)
+        trigger_mask = df_sorted.iloc[search_idx:]["high"].astype(float) >= entry_price
+    else:
+        direction = "buy"
+        entry_price = signal_price * (1 - entry_offset_pct / 100)
+        trigger_mask = df_sorted.iloc[search_idx:]["low"].astype(float) <= entry_price
+
+    trigger_positions = np.flatnonzero(trigger_mask.to_numpy(copy=False))
+    if len(trigger_positions) == 0:
+        return None
+
+    trigger_idx = search_idx + int(trigger_positions[0])
+    path_df = df_sorted.iloc[trigger_idx:][["high", "low"]].astype(float)
+    if path_df.empty or entry_price <= 0:
+        return None
+
+    return {
+        "direction": direction,
+        "entry_price": entry_price,
+        "signal_price": signal_price,
+        "highs": path_df["high"].to_numpy(copy=False),
+        "lows": path_df["low"].to_numpy(copy=False),
+        "entry_offset_pct": entry_offset_pct,
+        "entry_level_distance_pct": entry_offset_pct,
+    }
+
+
+def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, offset_grid=None):
+    """Build a read-only diagnostic table for entering reversal at/after level."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
+    total_tasks = len(tasks)
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    paths = [build_level_reversal_path(t, entry_offset_pct) for t in eligible_tasks]
+    valid_paths = [p for p in paths if p]
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+    valid_results = [r for r in results if r["valid"]]
+    valid_total = len(valid_results)
+
+    def fmt_stat(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
+
+    def scenario_summary(label, scenario_paths, scenario_results):
+        scenario_total = len(scenario_results)
+        stop_events = sum(1 for r in scenario_results if r["stop_hit"])
+        max_dd_events = sum(1 for r in scenario_results if r["max_dd_hit"])
+        tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
+        tp1 = sum(1 for r in scenario_results if any(level >= 1.0 for level in r["tp_hits"]))
+        stop_moved = sum(1 for r in scenario_results if r["stop_moves"])
+        return html.Tr([
+            html.Td(label, style=td_style),
+            html.Td(
+                f"entries {fmt_stat(len(scenario_paths), len(eligible_tasks))} | "
+                f"TP0.5 {fmt_stat(tp05, scenario_total)} | "
+                f"TP1 {fmt_stat(tp1, scenario_total)} | "
+                f"SL {fmt_stat(stop_events, scenario_total)} | "
+                f"adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
+                f"stop moved {fmt_stat(stop_moved, scenario_total)}",
+                style=td_style,
+            ),
+        ])
+
+    stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
+    stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
+    stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    rows = [
+        html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
+        html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
+        html.Tr([html.Td("Level/offset entries triggered", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Not triggered / did not reach entry", style=td_style), html.Td(fmt_stat(len(eligible_tasks) - valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+    ]
+
+    for level in tp_levels:
+        label = fmt_dynamic_level_label(level)
+        tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
+        rows.append(html.Tr([html.Td(f"TP {label} found after reversal entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
+
+    for trigger_pct, stop_profit_pct in stop_rules:
+        moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
+        rows.append(html.Tr([
+            html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style),
+            html.Td(fmt_stat(moved, valid_total), style=td_style),
+        ]))
+
+    sl_grid = sl_grid or []
+    if sl_grid:
+        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same entry offset, TP levels, max adverse DD, and dynamic stop rules", style=td_style)]))
+        for sl_pct in sl_grid:
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+            rows.append(scenario_summary(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", valid_paths, scenario_results))
+
+    offset_grid = offset_grid or []
+    if offset_grid:
+        rows.append(html.Tr([html.Td("— Entry offset grid —", style=td_style), html.Td("0% means level touch; higher values require overshoot beyond level before reversal entry", style=td_style)]))
+        for offset_pct in offset_grid:
+            scenario_paths = [build_level_reversal_path(t, offset_pct) for t in eligible_tasks]
+            scenario_paths = [p for p in scenario_paths if p]
+            scenario_results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in scenario_paths]
+            rows.append(scenario_summary(f"Entry offset {fmt_dynamic_level_label(offset_pct)}", scenario_paths, scenario_results))
+
+    return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+
+
 @app.callback(
     Output("dynamic-check-status", "children"),
     Output("dynamic-check-results", "children"),
@@ -7022,6 +7231,56 @@ def run_dynamic_strategy_checkup(n_clicks, stop_loss_pct, max_dd_pct, tp_text, s
         return status, table
     except Exception as exc:
         return f"❌ Dynamic checkup failed: {exc}", no_update
+
+
+@app.callback(
+    Output("level-reversal-status", "children"),
+    Output("level-reversal-results", "children"),
+    Input("level-reversal-run-btn", "n_clicks"),
+    State("level-reversal-offset-input", "value"),
+    State("level-reversal-sl-input", "value"),
+    State("level-reversal-max-dd-input", "value"),
+    State("level-reversal-tp-levels-input", "value"),
+    State("level-reversal-trail-rules-input", "value"),
+    State("level-reversal-sl-grid-input", "value"),
+    State("level-reversal-offset-grid-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, offset_grid_text, _version):
+    """On-demand callback for level-touch/overshoot reversal diagnostics."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        entry_offset_pct = float(entry_offset_pct or 0.0)
+        tp_levels = parse_dynamic_percent_levels(tp_text)
+        stop_rules = parse_dynamic_stop_rules(stop_rules_text)
+        sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
+        offset_grid = parse_dynamic_nonnegative_percent_levels(offset_grid_text, default_levels=(0.0,))
+        if 0.0 not in offset_grid:
+            offset_grid = sorted(set([0.0] + offset_grid))
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_level_reversal_summary_table(
+            tasks,
+            entry_offset_pct,
+            stop_loss_pct,
+            max_dd_pct,
+            tp_levels,
+            stop_rules,
+            sl_grid=sl_grid,
+            offset_grid=offset_grid,
+        )
+        elapsed = time.time() - started
+        status = (
+            f"✅ Level-reversal checkup complete in {elapsed:.2f}s. "
+            f"entry offset={entry_offset_pct:g}%, SL={float(stop_loss_pct or 0):g}%, "
+            f"max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
+            f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}."
+        )
+        return status, table
+    except Exception as exc:
+        return f"❌ Level-reversal checkup failed: {exc}", no_update
 
 @app.callback(
     Output("impulse-task-selector", "options"),
