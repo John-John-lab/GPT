@@ -6785,6 +6785,72 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
     return result
 
 
+def analyze_dynamic_path_milestones(path):
+    """Read-only path milestones independent of the active SL/DD scenario."""
+    result = {
+        "valid": False,
+        "tp05": False,
+        "tp1": False,
+        "dd05": False,
+        "dd05_before_tp1": False,
+        "tp1_before_dd05": False,
+        "entry_return_after_tp05": False,
+        "entry_return_after_tp1": False,
+        "dd05_after_tp05": False,
+        "dd05_after_tp1": False,
+        "tp1_before_entry_return_after_tp05": False,
+    }
+    if not path:
+        return result
+
+    direction = path["direction"]
+    entry_price = path["entry_price"]
+    result["valid"] = True
+    tp05_seen = False
+    tp1_seen = False
+    entry_return_after_tp05_seen = False
+
+    for high, low in zip(path["highs"], path["lows"]):
+        if direction == "buy":
+            favorable_pct = (high - entry_price) / entry_price * 100
+            adverse_pct = (entry_price - low) / entry_price * 100
+            returned_entry = low <= entry_price
+        else:
+            favorable_pct = (entry_price - low) / entry_price * 100
+            adverse_pct = (high - entry_price) / entry_price * 100
+            returned_entry = high >= entry_price
+
+        if adverse_pct >= 0.5:
+            result["dd05"] = True
+            if not tp1_seen:
+                result["dd05_before_tp1"] = True
+            if tp05_seen:
+                result["dd05_after_tp05"] = True
+            if tp1_seen:
+                result["dd05_after_tp1"] = True
+
+        if favorable_pct >= 0.5:
+            result["tp05"] = True
+            tp05_seen = True
+
+        if tp05_seen and returned_entry:
+            result["entry_return_after_tp05"] = True
+            entry_return_after_tp05_seen = True
+
+        if favorable_pct >= 1.0:
+            result["tp1"] = True
+            if not result["dd05"]:
+                result["tp1_before_dd05"] = True
+            if not entry_return_after_tp05_seen:
+                result["tp1_before_entry_return_after_tp05"] = True
+            tp1_seen = True
+
+        if tp1_seen and returned_entry:
+            result["entry_return_after_tp1"] = True
+
+    return result
+
+
 def simulate_dynamic_checkup_for_task(task, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
     """Run a read-only raw-candle diagnostic for one task without mutating task fields."""
     path = build_dynamic_checkup_path(task)
@@ -6799,7 +6865,9 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
     paths = [build_dynamic_checkup_path(t) for t in eligible_tasks]
     valid_paths = [p for p in paths if p]
     results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+    milestones = [analyze_dynamic_path_milestones(p) for p in valid_paths]
     valid_results = [r for r in results if r["valid"]]
+    valid_milestones = [m for m in milestones if m["valid"]]
     valid_total = len(valid_results)
 
     def fmt_stat(count, total):
@@ -6830,6 +6898,16 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
     stopped_before_level = sum(1 for r in valid_results if r["stopped_before_level"])
     stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
     stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    raw_tp05 = sum(1 for m in valid_milestones if m["tp05"])
+    raw_tp1 = sum(1 for m in valid_milestones if m["tp1"])
+    raw_dd05 = sum(1 for m in valid_milestones if m["dd05"])
+    raw_dd05_before_tp1 = sum(1 for m in valid_milestones if m["dd05_before_tp1"])
+    raw_tp1_before_dd05 = sum(1 for m in valid_milestones if m["tp1_before_dd05"])
+    raw_entry_return_after_tp05 = sum(1 for m in valid_milestones if m["entry_return_after_tp05"])
+    raw_entry_return_after_tp1 = sum(1 for m in valid_milestones if m["entry_return_after_tp1"])
+    raw_dd05_after_tp05 = sum(1 for m in valid_milestones if m["dd05_after_tp05"])
+    raw_dd05_after_tp1 = sum(1 for m in valid_milestones if m["dd05_after_tp1"])
+    raw_tp1_before_entry_return_after_tp05 = sum(1 for m in valid_milestones if m["tp1_before_entry_return_after_tp05"])
 
     distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
     distance_counts = {r: 0 for r in distance_ranges}
@@ -6864,6 +6942,17 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
             html.Tr([html.Td(f"TP {label} conditional over reached level", style=td_style), html.Td(fmt_stat(tp_reached, len(reached_results)), style=td_style)]),
             html.Tr([html.Td(f"TP {label} while stopped before level", style=td_style), html.Td(fmt_stat(tp_stopped, len(stopped_results)), style=td_style)]),
         ])
+
+    rows.extend([
+        html.Tr([html.Td("Raw path touched adverse DD 0.5% from entry", style=td_style), html.Td(fmt_stat(raw_dd05, valid_total), style=td_style)]),
+        html.Tr([html.Td("Raw path adverse DD 0.5% before TP1", style=td_style), html.Td(fmt_stat(raw_dd05_before_tp1, valid_total), style=td_style)]),
+        html.Tr([html.Td("Raw path TP1 before adverse DD 0.5%", style=td_style), html.Td(fmt_stat(raw_tp1_before_dd05, valid_total), style=td_style)]),
+        html.Tr([html.Td("After TP0.5 returned to entry", style=td_style), html.Td(fmt_stat(raw_entry_return_after_tp05, raw_tp05), style=td_style)]),
+        html.Tr([html.Td("After TP1 returned to entry", style=td_style), html.Td(fmt_stat(raw_entry_return_after_tp1, raw_tp1), style=td_style)]),
+        html.Tr([html.Td("After TP0.5 touched adverse DD 0.5%", style=td_style), html.Td(fmt_stat(raw_dd05_after_tp05, raw_tp05), style=td_style)]),
+        html.Tr([html.Td("After TP1 touched adverse DD 0.5%", style=td_style), html.Td(fmt_stat(raw_dd05_after_tp1, raw_tp1), style=td_style)]),
+        html.Tr([html.Td("TP1 before entry return after TP0.5", style=td_style), html.Td(fmt_stat(raw_tp1_before_entry_return_after_tp05, raw_tp05), style=td_style)]),
+    ])
 
     for trigger_pct, stop_profit_pct in stop_rules:
         moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
