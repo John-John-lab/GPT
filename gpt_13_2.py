@@ -885,7 +885,16 @@ def load_task_data_cached(task) -> pd.DataFrame:
         return pd.DataFrame()
     
     mtime = os.path.getmtime(fp)
-    df = _load_parquet_cached(fp, mtime).copy()
+    try:
+        df = _load_parquet_cached(fp, mtime).copy()
+    except Exception as exc:
+        # A partially written/corrupted parquet file (for example ZSTD
+        # decompression failure) should not crash diagnostics or UI callbacks.
+        # Clear the small LRU cache in case the failing reader state was cached,
+        # report the affected file, and let callers treat this task as no-data.
+        clear_parquet_cache()
+        print(f"⚠️ [CACHE] Failed to read parquet for {sym} {task.timeframe}: {fp} ({exc})")
+        return pd.DataFrame()
     
     # Guarantee timestamp is int64 milliseconds for safe searchsorted & math
     if 'timestamp' in df.columns:
