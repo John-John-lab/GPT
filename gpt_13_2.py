@@ -3947,18 +3947,20 @@ def render_tab(tab):
                 html.Summary("🧪 Oscillator Level-Reversal Checkup – level cross + Stoch/RSI trigger", style={"fontWeight": "bold", "cursor": "pointer"}),
                 html.Div([
                     html.P(
-                        "Waits for price to cross the signal level in the toward direction, then waits for all enabled Stoch/RSI conditions. "
-                        "When they match, it enters the reverse side and runs the same SL/TP/DD/trailing-stop simulation.",
+                        "Waits for price to cross the signal level in the toward direction, then selects the UP-toward or DOWN-toward oscillator group. "
+                        "When all enabled Stoch/RSI conditions in that group match, it enters the reverse side and runs the same SL/TP/DD/trailing-stop simulation.",
                         style={"marginTop": "10px", "color": "#555"}
                     ),
                     html.Details([
                         html.Summary("ⓘ Logic and examples", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
                         html.Div([
                             html.Ul([
-                                html.Li("Resistance: price first reaches/crosses resistance, oscillator conditions trigger, then test SELL reversal."),
-                                html.Li("Support: price first reaches/crosses support, oscillator conditions trigger, then test BUY reversal."),
+                                html.Li("Resistance means the toward move is UP to resistance; the UP-toward group is used and the test enters SELL after confirmation."),
+                                html.Li("Support means the toward move is DOWN to support; the DOWN-toward group is used and the test enters BUY after confirmation."),
+                                html.Li("Use the UP-toward group for upper-limit logic, e.g. Stoch crossing down from 87 after price reaches resistance."),
+                                html.Li("Use the DOWN-toward group for lower-limit logic, e.g. Stoch crossing up from 13 after price reaches support."),
                                 html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10."),
-                                html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Above/Below only check the current candle."),
+                                html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
                                 html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
                                 html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
                                 html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
@@ -3966,6 +3968,7 @@ def render_tab(tab):
                         ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
                     ], open=False),
                     html.Div([
+                        html.H5("UP-toward oscillator group (resistance → reverse SELL)", style={"margin": "8px 0", "color": "#6a1b9a"}),
                         html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
@@ -3980,6 +3983,23 @@ def render_tab(tab):
                         html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
                         dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "12px"}),
+                    html.Div([
+                        html.H5("DOWN-toward oscillator group (support → reverse BUY)", style={"margin": "8px 0", "color": "#1565c0"}),
+                        html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                        dcc.Input(id="osc-down-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-down-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                        dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
                         html.Label("Initial SL %:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
@@ -7724,17 +7744,38 @@ def oscillator_condition_met(values, idx, level, condition):
     return False
 
 
-def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition):
+def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
     """Build normalized oscillator condition specs from UI values."""
     return [
-        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else 87.0), "condition": normalize_oscillator_condition(stoch14_condition)},
-        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else 87.0), "condition": normalize_oscillator_condition(stoch40_condition)},
-        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else 87.0), "condition": normalize_oscillator_condition(stoch60_condition)},
-        {"label": "RSI(14,14)", "column": "rsi_14_14", "level": float(rsi_level if rsi_level is not None else 70.0), "condition": normalize_oscillator_condition(rsi_condition)},
+        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "RSI(14,14)", "column": "rsi_14_14", "level": float(rsi_level if rsi_level is not None else default_rsi_level), "condition": normalize_oscillator_condition(rsi_condition)},
     ]
 
 
+def build_oscillator_spec_groups(up_inputs, down_inputs):
+    """Build UP-toward and DOWN-toward oscillator specs without reading rendered table HTML."""
+    return {
+        "up": build_oscillator_specs(*up_inputs, default_stoch_level=87.0, default_rsi_level=70.0),
+        "down": build_oscillator_specs(*down_inputs, default_stoch_level=13.0, default_rsi_level=30.0),
+    }
+
+
+def select_oscillator_specs_for_source(source, oscillator_specs):
+    """Select oscillator group by reliable task/source direction: resistance=up, support=down."""
+    if isinstance(oscillator_specs, dict):
+        group_key = source.get("toward_direction", "up") if source else "up"
+        return oscillator_specs.get(group_key) or oscillator_specs.get("up") or []
+    return oscillator_specs or []
+
+
 def format_oscillator_specs(specs):
+    if isinstance(specs, dict):
+        return " | ".join([
+            f"UP-toward: {format_oscillator_specs(specs.get('up', []))}",
+            f"DOWN-toward: {format_oscillator_specs(specs.get('down', []))}",
+        ])
     parts = []
     for spec in specs:
         if spec["condition"] == "disabled":
@@ -7793,6 +7834,7 @@ def build_oscillator_reversal_source_uncached(task):
 
     return {
         "level_kind": task.signal_direction,
+        "toward_direction": "up" if task.signal_direction == "resistance" else "down",
         "direction": "sell" if task.signal_direction == "resistance" else "buy",
         "signal_price": signal_price,
         "df": path_df,
@@ -7828,9 +7870,10 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
         return None
     cross_idx = int(cross_positions[0])
 
+    selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
     oscillator_idx = None
     for idx in range(cross_idx, len(df)):
-        if all(oscillator_condition_met(df[spec["column"]].to_numpy(dtype=float), idx, spec["level"], spec["condition"]) for spec in oscillator_specs):
+        if all(oscillator_condition_met(df[spec["column"]].to_numpy(dtype=float), idx, spec["level"], spec["condition"]) for spec in selected_specs):
             oscillator_idx = idx
             break
     if oscillator_idx is None:
@@ -7849,6 +7892,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
         "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
         "level_cross_idx": cross_idx,
         "oscillator_idx": oscillator_idx,
+        "toward_direction": source.get("toward_direction"),
     }
 
 
@@ -7902,12 +7946,20 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
     max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
     stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
     stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    up_sources = [s for s in sources if s.get("toward_direction") == "up"]
+    down_sources = [s for s in sources if s.get("toward_direction") == "down"]
+    up_paths = [p for p in paths if p.get("toward_direction") == "up"]
+    down_paths = [p for p in paths if p.get("toward_direction") == "down"]
     rows = [
         html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
         html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
         html.Tr([html.Td("Usable oscillator paths with candle data", style=td_style), html.Td(fmt_stat(len(sources), len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("UP-toward sources (resistance → SELL)", style=td_style), html.Td(fmt_stat(len(up_sources), len(sources)), style=td_style)]),
+        html.Tr([html.Td("DOWN-toward sources (support → BUY)", style=td_style), html.Td(fmt_stat(len(down_sources), len(sources)), style=td_style)]),
         html.Tr([html.Td("Price crossed signal level", style=td_style), html.Td(fmt_stat(level_cross_count, len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Oscillator reversal entries triggered", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("UP-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(up_paths), len(up_sources)), style=td_style)]),
+        html.Tr([html.Td("DOWN-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(down_paths), len(down_sources)), style=td_style)]),
         html.Tr([html.Td("Level crossed but oscillator did not trigger", style=td_style), html.Td(fmt_stat(max(level_cross_count - valid_total, 0), len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Active oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
         html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
@@ -8149,6 +8201,14 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-stoch-60-condition-input", "value"),
     State("osc-rsi-level-input", "value"),
     State("osc-rsi-condition-input", "value"),
+    State("osc-down-stoch-14-level-input", "value"),
+    State("osc-down-stoch-14-condition-input", "value"),
+    State("osc-down-stoch-40-level-input", "value"),
+    State("osc-down-stoch-40-condition-input", "value"),
+    State("osc-down-stoch-60-level-input", "value"),
+    State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-rsi-level-input", "value"),
+    State("osc-down-rsi-condition-input", "value"),
     State("osc-reversal-sl-input", "value"),
     State("osc-reversal-max-dd-input", "value"),
     State("osc-reversal-tp-levels-input", "value"),
@@ -8160,16 +8220,24 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update
     try:
-        oscillator_specs = build_oscillator_specs(
-            stoch14_level, stoch14_condition,
-            stoch40_level, stoch40_condition,
-            stoch60_level, stoch60_condition,
-            rsi_level, rsi_condition,
+        oscillator_specs = build_oscillator_spec_groups(
+            (
+                stoch14_level, stoch14_condition,
+                stoch40_level, stoch40_condition,
+                stoch60_level, stoch60_condition,
+                rsi_level, rsi_condition,
+            ),
+            (
+                down_stoch14_level, down_stoch14_condition,
+                down_stoch40_level, down_stoch40_condition,
+                down_stoch60_level, down_stoch60_condition,
+                down_rsi_level, down_rsi_condition,
+            ),
         )
         tp_levels = parse_dynamic_percent_levels(tp_text)
         stop_rules = parse_dynamic_stop_rules(stop_rules_text)
