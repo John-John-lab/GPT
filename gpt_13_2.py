@@ -3688,7 +3688,7 @@ def render_tab(tab):
                     html.Div([
                         html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
                         dcc.Input(id="dynamic-check-sl-input", type="number", value=0.12, min=0, step=0.01, style={"width": "90px"}),
-                        html.Label("Max drawdown from entry %:", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Label("Max adverse DD from entry % (positive):", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
                         dcc.Input(id="dynamic-check-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
@@ -3708,7 +3708,7 @@ def render_tab(tab):
                         dcc.Input(id="dynamic-check-be-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
-                        html.Label("Max drawdown grid %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Label("Max adverse DD grid %:", style={"width": "180px", "display": "inline-block"}),
                         dcc.Input(id="dynamic-check-dd-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
                         html.Span("Grid rows reuse raw candle paths built once per task for faster comparison.", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
@@ -6732,7 +6732,7 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         if direction == "buy":
             # If max-DD is tighter than the initial/trailing stop, classify the
             # adverse exit as DD cap first. This keeps scenario-grid counts
-            # intuitive when users test max DD below the stop-loss distance.
+            # intuitive when users test max adverse DD below the stop-loss distance.
             max_dd_is_tighter = max_dd_price is not None and max_dd_price >= stop_price
             if max_dd_is_tighter and low <= max_dd_price:
                 result["max_dd_hit"] = True
@@ -6818,7 +6818,7 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
                 f"level {fmt_stat(reached, scenario_total)} | "
                 f"TP0.5 {fmt_stat(tp05, scenario_total)} | "
                 f"SL {fmt_stat(stopped, scenario_total)} | "
-                f"DD cap {fmt_stat(max_dd, scenario_total)} | "
+                f"adverse DD cap {fmt_stat(max_dd, scenario_total)} | "
                 f"stop moved {fmt_stat(stop_moved, scenario_total)}",
                 style=td_style,
             ),
@@ -6843,7 +6843,7 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
         html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
         html.Tr([html.Td("Valid dynamic cases with candle data", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
-        html.Tr([html.Td("Max drawdown cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Reached signal level", style=td_style), html.Td(fmt_stat(level_reached, valid_total), style=td_style)]),
         html.Tr([html.Td("Stopped before level", style=td_style), html.Td(fmt_stat(stopped_before_level, valid_total), style=td_style)]),
         html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
@@ -6874,14 +6874,14 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
 
     sl_grid = sl_grid or []
     if sl_grid:
-        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same TP levels and dynamic stop rules; max DD unchanged", style=td_style)]))
+        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same TP levels and dynamic stop rules; max adverse DD unchanged", style=td_style)]))
         for sl_pct in sl_grid:
             scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
             rows.append(scenario_summary_row(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", scenario_results))
 
     be_grid = be_grid or []
     if be_grid:
-        rows.append(html.Tr([html.Td("— Breakeven arm grid —", style=td_style), html.Td("Move stop to entry when favorable move reaches trigger; initial SL/max DD unchanged", style=td_style)]))
+        rows.append(html.Tr([html.Td("— Breakeven arm grid —", style=td_style), html.Td("Move stop to entry when favorable move reaches trigger; initial SL/max adverse DD unchanged", style=td_style)]))
         for arm_pct in be_grid:
             scenario_rules = sorted(set(list(stop_rules) + [(arm_pct, 0.0)]), key=lambda item: item[0])
             scenario_results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, scenario_rules) for p in valid_paths]
@@ -6889,10 +6889,10 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
 
     dd_grid = dd_grid or []
     if dd_grid:
-        rows.append(html.Tr([html.Td("— Max drawdown cap grid —", style=td_style), html.Td("Initial SL, TP levels, and dynamic stop rules unchanged", style=td_style)]))
+        rows.append(html.Tr([html.Td("— Max adverse DD cap grid —", style=td_style), html.Td("Initial SL, TP levels, and dynamic stop rules unchanged", style=td_style)]))
         for dd_pct in dd_grid:
             scenario_results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, dd_pct, tp_levels, stop_rules) for p in valid_paths]
-            rows.append(scenario_summary_row(f"Max DD cap {fmt_dynamic_level_label(dd_pct)}", scenario_results))
+            rows.append(scenario_summary_row(f"Max adverse DD cap {fmt_dynamic_level_label(dd_pct)}", scenario_results))
 
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
@@ -6927,7 +6927,7 @@ def run_dynamic_strategy_checkup(n_clicks, stop_loss_pct, max_dd_pct, tp_text, s
         elapsed = time.time() - started
         status = (
             f"✅ Dynamic checkup complete in {elapsed:.2f}s. "
-            f"SL={float(stop_loss_pct or 0):g}%, max DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
+            f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}."
         )
         return status, table
