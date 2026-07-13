@@ -9,6 +9,13 @@ Bybit Downloader – Two Tabs + Summary + Optimized Buffering (10k candles)
 with Database Verification Tool and Real‑time Integrity Checks.
 Now with signal‑based downloading, candle analysis, and per‑task interactive charts.
 """
+
+# =============================================================================
+# 1. IMPORTS AND EXTERNAL INTEGRATIONS
+# =============================================================================
+# Keep imports centralized. Repository-local strategy/impulse/database imports are
+# intentionally explicit so the main app can be reorganized without changing math.
+
 import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functools, sys, bisect, math
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -36,8 +43,11 @@ from database import (
 )
 
 # =============================================================================
-# UI HELPER FUNCTIONS - Pure presentation logic (no calculations)
-# These functions format data for display only
+# 2. UI FORMATTING HELPERS
+# =============================================================================
+# Presentation-only helpers. These functions may format or categorize values for
+# display, but must not mutate tasks, publish Golden Store snapshots, or perform
+# calculations that change saved analysis results.
 # =============================================================================
 
 def fmt_time_ui(ts):
@@ -120,6 +130,14 @@ def get_adverse_range_ui(pct):
     elif pct >= 30: return ">30%"
     return None
 
+
+# =============================================================================
+# 3. MATH CONSTANTS AND TOWARD-LEVEL STRATEGY HELPERS
+# =============================================================================
+# Keep formulas and event/strategy math isolated from Dash callbacks. The helper
+# below still mutates the task exactly as before; this section only makes the
+# boundary explicit for future behavior-preserving extraction.
+# =============================================================================
 
 TOWARD_LEVEL_TARGET_PCTS = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
 TOWARD_LEVEL_STOP_LOSS_PCT = 0.12
@@ -231,6 +249,14 @@ def calculate_toward_level_strategy(task, df):
     task.toward_max_reached_pct = max(reached_targets) if reached_targets else None
     task.toward_no_stop_returned_entry = bool(returned_entry_after_favorable and not task.toward_stop_loss_hit)
 
+# =============================================================================
+# 4. ANALYSIS THREAD-SAFETY ALIASES AND SHADOW VERIFICATION
+# =============================================================================
+# These aliases and comparison helpers support the existing vectorized analysis
+# path. Preserve their behavior while gradually moving calculation details into
+# smaller helpers inside this file.
+# =============================================================================
+
 # 🔧 CRITICAL: Global aliases for thread-safe numpy/bisect access in background threads
 np_local_global = None
 bisect_local_global = None
@@ -281,8 +307,11 @@ def compare_results(original, vectorized, field_name, tolerance=1e-9):
         return True, None
 
 # =============================================================================
-# JSON PERSISTENCE & DATA INTEGRITY LAYER
-# Implements "Serialization Bridge" pattern for safe RAM ↔ Disk conversion
+# 5. JSON PERSISTENCE AND SNAPSHOT COMPATIBILITY
+# =============================================================================
+# Serialization Bridge for safe RAM ↔ disk conversion. This section owns JSON
+# safety, timestamp parsing, task-field catalogs, and old snapshot compatibility.
+# Be very careful when changing field names or runtime-field exclusions.
 # =============================================================================
 
 def sanitize_for_json(obj):
@@ -414,6 +443,49 @@ def _parse_timestamp(val):
         return None
 
 
+def task_to_serializable_dict(task):
+    """Convert one task object to the current JSON-safe snapshot dictionary.
+
+    This preserves the existing save behavior: iterate over live task attributes,
+    skip runtime-only fields, sanitize every stored value, and keep the warning for
+    missing critical derived fields.
+    """
+    d = {}
+    # Iterate through all attributes, excluding non-serializable threading objects
+    for k, v in task.__dict__.items():
+        # Skip threading/synchronization objects and internal caches
+        if k in RUNTIME_TASK_FIELDS:
+            continue
+
+        # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
+        d[k] = sanitize_for_json(v)
+
+    # Debug: Verify critical fields are present
+    if 'hit_1' not in d:
+        print(f"WARNING: Task {task.task_id[:8]} missing 'hit_1' in save! Current value: {getattr(task, 'hit_1', 'MISSING')}")
+
+    return d
+
+
+def tasks_to_serializable_snapshot(tasks):
+    """Convert live task objects into the list persisted by save_tasks_to_json()."""
+    return [task_to_serializable_dict(t) for t in (tasks or [])]
+
+
+def write_json_atomic(filepath, data):
+    """Write JSON through a temp file and atomic replace, preserving crash safety."""
+    temp_path = filepath + ".tmp"
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            # All data is pre-sanitized, no need for default=str
+            json.dump(data, f, indent=2)
+        os.replace(temp_path, filepath)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)  # Delete broken temp file
+        raise
+
+
 # =============================================================================
 # END JSON PERSISTENCE LAYER
 # =============================================================================
@@ -421,7 +493,12 @@ def _parse_timestamp(val):
 # DuckDB availability is now imported from database module
 # See: from database import DUCKDB_AVAILABLE
 
-# ---------- Configuration ----------
+# =============================================================================
+# 6. APPLICATION CONFIGURATION AND RUNTIME CONSTANTS
+# =============================================================================
+# Configuration remains in this file for now. Future refactors should move code
+# toward smaller sections first, not new files, to preserve callback wiring.
+# =============================================================================
 LOGS_DIR = "./task_logs"
 os.makedirs(LOGS_DIR, exist_ok=True)
 BYBIT_BASE_URL = "https://api.bybit.com"
@@ -484,6 +561,13 @@ class PerfTimer:
             perf_log(f"[TRACE] ✅ END: {self.label} ({total:.4f}s)")
         return self
 
+
+# =============================================================================
+# 7. TASK FIELD CATALOG FOR JSON / RECALC DURABILITY
+# =============================================================================
+# Documentation-first catalog preserving current broad JSON snapshot behavior.
+# Classify new task attributes here before changing save/load or recalculation.
+# =============================================================================
 
 # ---------- Task field catalog (documentation-first; preserves current behavior) ----------
 # These groups make JSON/recalc changes safer by naming the field types in one
@@ -676,6 +760,18 @@ def format_snapshot_audit_note(audit):
     return " | ".join(parts)
 
 
+# =============================================================================
+# 8. GOLDEN STORE, RECALC STATE, AND DISPLAY CACHE STATE
+# =============================================================================
+# Golden Store is the authoritative *in-memory display snapshot* for task
+# table/stat callbacks. It is safe for UI refresh and background publication,
+# but it is not durable storage across app restarts; JSON snapshots remain the
+# durable persistence layer. Prefer publishing through
+# publish_golden_task_snapshot() or bump_golden_store_version() so version bumps
+# and cache resets stay synchronized. Recalc/display globals are documented here
+# before deeper state-container refactors.
+# =============================================================================
+
 # 🔧 GOLDEN STORE: Pre-processed task data cache
 golden_task_store_data = None
 golden_store_version = 0
@@ -691,6 +787,13 @@ current_tasks = []  # Master dataset in RAM for atomic swaps
 page_html_cache = {}  # Cache for rendered page HTML: {page_num: html.Div}
 last_rendered_stats = {} # Cache for summary tables to prevent disappearance
 
+# Strategy-checkup source caches live with display caches because they are
+# read-only views of the current Golden Store task/data snapshot. Keep these
+# bounded: diagnostics should get faster on repeated parameter runs without
+# becoming an unbounded in-memory database.
+OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 1500
+oscillator_reversal_source_cache = OrderedDict()
+
 # Global stats cache for ALL tasks (calculated once per data version)
 cached_signal_stats_html = None  # Full Signal Performance Summary table
 cached_toward_strategy_stats_html = None  # Separate toward-level strategy summary table
@@ -700,7 +803,7 @@ stats_cache_version = -1         # Version of data these stats belong to
 
 
 def reset_display_caches(reason=""):
-    """Clear UI-only rendered page and summary caches after Golden Store changes."""
+    """Clear UI-only rendered page, summary, and diagnostic source caches."""
     global _cached_golden_version, cached_signal_stats_html, cached_toward_strategy_stats_html, cached_small_stats_data, stats_cache_version
     if "_page_html_cache" in globals():
         _page_html_cache.clear()
@@ -709,9 +812,45 @@ def reset_display_caches(reason=""):
     cached_toward_strategy_stats_html = None
     cached_small_stats_data = None
     stats_cache_version = -1
+    if "oscillator_reversal_source_cache" in globals():
+        oscillator_reversal_source_cache.clear()
     if reason:
         print(f"🔄 [GOLDEN] Display caches reset: {reason}")
 
+
+def get_golden_store_version():
+    """Return the current Golden Store version used by UI cache keys."""
+    return golden_store_version
+
+
+def has_golden_task_snapshot():
+    """Return True when Golden Store currently has a non-empty task snapshot."""
+    return golden_task_store_data is not None and len(golden_task_store_data) > 0
+
+
+def get_golden_task_snapshot():
+    """Return the current Golden Store snapshot without falling back to TaskManager."""
+    return golden_task_store_data if golden_task_store_data is not None else []
+
+
+def get_golden_task_count():
+    """Return the number of tasks currently held by the Golden Store snapshot."""
+    return len(golden_task_store_data) if golden_task_store_data is not None else 0
+
+
+
+
+def bump_golden_store_version(reason="version_bump"):
+    """Bump the in-memory Golden Store version and clear derived UI caches.
+
+    Use this for cases where task objects were mutated in place and the existing
+    Golden Store list still points at the same objects. Full snapshot replacement
+    should continue to use publish_golden_task_snapshot().
+    """
+    global golden_store_version
+    golden_store_version += 1
+    reset_display_caches(reason or "version_bump")
+    return golden_store_version
 
 def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
     """Publish the final task snapshot used by UI callbacks and reset display caches.
@@ -723,18 +862,26 @@ def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
     golden_task_store_data = list(tasks)
     report_unclassified_task_fields(golden_task_store_data, reason=f"publish:{reason or '-'}")
     if bump_version:
-        golden_store_version += 1
-    reset_display_caches(reason or "publish")
+        bump_golden_store_version(reason or "publish")
+    else:
+        reset_display_caches(reason or "publish")
     print(f"🔄 [GOLDEN] Published {len(golden_task_store_data)} tasks, version={golden_store_version}, reason={reason or '-'}")
     return golden_store_version
 
 
 def get_display_tasks_snapshot():
     """Return the Golden Store task snapshot, falling back to TaskManager if empty."""
-    if golden_task_store_data is not None and len(golden_task_store_data) > 0:
-        return golden_task_store_data
+    if has_golden_task_snapshot():
+        return get_golden_task_snapshot()
     with tm.lock:
         return list(tm.tasks.values())
+
+# =============================================================================
+# 9. DATA ACCESS, PARQUET CACHE, AND MARKET API HELPERS
+# =============================================================================
+# Data I/O helpers stay separate from UI callbacks and math. They may load, write,
+# merge, or fetch candles but should not render Dash components.
+# =============================================================================
 
 # ---------- Low-RAM Parquet Cache ----------
 @functools.lru_cache(maxsize=4)  # Holds max 4 DFs to protect old Mac RAM
@@ -765,7 +912,16 @@ def load_task_data_cached(task) -> pd.DataFrame:
         return pd.DataFrame()
     
     mtime = os.path.getmtime(fp)
-    df = _load_parquet_cached(fp, mtime).copy()
+    try:
+        df = _load_parquet_cached(fp, mtime).copy()
+    except Exception as exc:
+        # A partially written/corrupted parquet file (for example ZSTD
+        # decompression failure) should not crash diagnostics or UI callbacks.
+        # Clear the small LRU cache in case the failing reader state was cached,
+        # report the affected file, and let callers treat this task as no-data.
+        clear_parquet_cache()
+        print(f"⚠️ [CACHE] Failed to read parquet for {sym} {task.timeframe}: {fp} ({exc})")
+        return pd.DataFrame()
     
     # Guarantee timestamp is int64 milliseconds for safe searchsorted & math
     if 'timestamp' in df.columns:
@@ -916,6 +1072,13 @@ def find_earliest_candle(symbol, interval):
         return df.iloc[0]['timestamp']
     return int((datetime.now() - timedelta(days=730)).timestamp() * 1000)
 
+# =============================================================================
+# 10. SIGNAL PARSING
+# =============================================================================
+# Parsing converts user/file text into normalized signal dictionaries only. It
+# should not create tasks, mutate Golden Store, or render UI.
+# =============================================================================
+
 # ---------- Signal Parser ----------
 def parse_signal_text(text):
     """
@@ -969,7 +1132,15 @@ def parse_signal_text(text):
         })
     return signals
 
-# ---------- Task Manager ----------
+# =============================================================================
+# 11. TASK MODEL AND TASK EXECUTION LOGIC
+# =============================================================================
+# DownloadTask currently owns task state, download execution, analysis, and logs.
+# Keep original behavior intact; future internal refactors should split large
+# methods into helpers before moving code to separate files.
+# =============================================================================
+
+# ---------- Task Model ----------
 class DownloadTask:
     """Represents a single download job (multiple symbols possible)."""
     def __init__(self, task_id, symbols, timeframe, mode, start_date=None, end_date=None, overwrite=False, price_continuity_check=False,
@@ -2539,12 +2710,18 @@ class DownloadTask:
             from dash import no_update
             # Since we split update_summary into two callbacks, we just increment the version
             # to trigger both update_summary_stats_only and update_task_table_only
-            global golden_store_version
-            golden_store_version += 1
+            bump_golden_store_version("task_analysis_complete")
         except Exception:
             pass
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# =============================================================================
+# 12. TASK AND OPTIMIZER MANAGERS
+# =============================================================================
+# Runtime managers own queues/background jobs. Keep singleton creation explicit
+# so callbacks continue to share the same task and optimizer state.
+# =============================================================================
 
 class TaskManager:
     def __init__(self, max_workers=4):
@@ -2652,6 +2829,14 @@ class OptimizerManager:
             return self.jobs.get(job_id, {'status': 'idle', 'progress': 0.0, 'result': None, 'error': None})
 
 optimizer_mgr = OptimizerManager()
+
+# =============================================================================
+# 13. DASH APP, FLASK ROUTES, AND ROOT LAYOUT
+# =============================================================================
+# The app object and decorated callbacks/routes must stay after app creation.
+# Component IDs in layout are part of the callback contract; do not rename them
+# during organization-only refactors.
+# =============================================================================
 
 # ---------- Dash App ----------
 app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_callbacks='initial_duplicate')
@@ -3046,10 +3231,13 @@ def build_root_layout():
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
+    dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
     dcc.Store(id="volume-visible-store", data=False),  # default: Volume hidden
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
+    dcc.Store(id="measure-anchor-store", data=True),
+    dcc.Store(id="measure-hover-store", data=True),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
@@ -3098,103 +3286,146 @@ def build_root_layout():
                 children=[
                     # Button row (Toggle RSI + Toggle Strategy + Measure + Close)
                     html.Div(
-                        style={"position": "absolute", "top": "10px", "right": "10px", "display": "flex", "gap": "10px"},
+                        style={
+                            "position": "absolute",
+                            "top": "10px",
+                            "left": "10px",
+                            "right": "10px",
+                            "display": "flex",
+                            "justifyContent": "flex-end",
+                            "gap": "6px",
+                            "overflowX": "auto",
+                            "overflowY": "hidden",
+                            "paddingBottom": "4px",
+                            "maxWidth": "calc(100% - 20px)",
+                            "whiteSpace": "nowrap",
+                        },
                         children=[
                             html.Button("‹", id="prev-chart-btn", title="Previous task chart", n_clicks=0, style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 14px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "18px",
-                                "minWidth": "44px",
+                                "fontSize": "14px",
+                                "minWidth": "34px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("›", id="next-chart-btn", title="Next task chart", n_clicks=0, style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 14px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "18px",
-                                "minWidth": "44px",
+                                "fontSize": "14px",
+                                "minWidth": "34px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle RSI", id="toggle-rsi-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "100px",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Toggle Stoch", id="toggle-stochastic-btn", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Volume", id="toggle-volume-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "120px",
+                                "fontSize": "12px",
+                                "minWidth": "86px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Strategy", id="toggle-strategy-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "100px",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Measure", id="toggle-measure-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "100px",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Snap: On", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
+                                "background": "#e8f5e9",
+                                "color": "black",
+                                "border": "1px solid #2e7d32",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Hover: On", id="toggle-measure-hover-btn", title="Toggle chart hover boxes and spike/crosshair lines while measuring", style={
+                                "background": "#fff8e1",
+                                "color": "black",
+                                "border": "1px solid #f9a825",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "78px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Clear Measure", id="clear-measure-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid #999",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "110px",
+                                "fontSize": "12px",
+                                "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Impulses", id="toggle-impulses-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "100px",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Events", id="toggle-events-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
-                                "padding": "8px 16px",
+                                "padding": "6px 10px",
                                 "cursor": "pointer",
-                                "fontSize": "14px",
-                                "minWidth": "100px",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("✕", id="close-chart-modal", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "none",
-                                "fontSize": "20px",
+                                "fontSize": "16px",
                                 "cursor": "pointer"
                             }),
                         ]
@@ -3202,7 +3433,7 @@ def build_root_layout():
                     dcc.Graph(
                         id="task-chart",
                         style={"flex": "1", "minHeight": "0"},
-                        config={"scrollZoom": True, "displaylogo": False}
+                        config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect", "eraseshape"]}
                     ),
                     html.Div(id="measure-hint", style={"color": "#333", "fontSize": "12px", "textAlign": "center", "marginTop": "5px"}),
                     html.Div(id="measure-result", style={"color": "black", "marginTop": "10px", "textAlign": "center", "fontSize": "14px"})
@@ -3422,6 +3653,31 @@ def render_tab(tab):
                         value=["hide"]  # Default: checked
                     ),
                 ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Main table view:", style={"fontWeight": "bold", "marginRight": "10px"}),
+                    dcc.RadioItems(
+                        id="table-view-mode",
+                        options=[
+                            {"label": "Compact key columns (faster)", "value": "compact"},
+                            {"label": "Full table", "value": "full"},
+                        ],
+                        value="compact",
+                        inline=True,
+                    ),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Main table order:", style={"fontWeight": "bold", "marginRight": "10px"}),
+                    dcc.RadioItems(
+                        id="table-sort-mode",
+                        options=[
+                            {"label": "Newest signal first", "value": "newest"},
+                            {"label": "Original task order", "value": "original"},
+                        ],
+                        value="newest",
+                        inline=True,
+                    ),
+                    html.Span(" UI-only; JSON and calculations are unchanged.", style={"fontSize": "12px", "color": "#666", "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px"}),
             ], style={"marginBottom": "10px"}),
                     html.Button("Create Tasks from Signals", id="create-signal-tasks-btn", n_clicks=0),
                     html.Div([
@@ -3505,6 +3761,277 @@ def render_tab(tab):
                     ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px"})
                 ], style={"marginBottom": "20px"})
             ]),
+            # ----- Dynamic Toward-Level Strategy Checkup (on-demand diagnostics) -----
+            html.Details([
+                html.Summary("🧪 Dynamic Toward-Level Checkup – variable SL / TP / trailing stop", style={"fontWeight": "bold", "cursor": "pointer"}),
+                html.Div([
+                    html.P(
+                        "Runs an on-demand diagnostic over raw candle data without changing saved task fields. "
+                        "Entry uses the first candle after signal time, buy toward resistance and sell toward support.",
+                        style={"marginTop": "10px", "color": "#555"}
+                    ),
+                    html.Details([
+                        html.Summary("ⓘ How to use SL grid, BE grid, TP levels, and dynamic stop rules", style={"cursor": "pointer", "color": "#0b63b6", "fontWeight": "bold"}),
+                        html.Div([
+                            html.P("Think of the controls as separate layers:", style={"marginBottom": "6px"}),
+                            html.Ul([
+                                html.Li("Initial stop loss % = where the first protective stop starts from entry; Initial stop events count trades closed by that stop before another exit type."),
+                                html.Li("SL grid % = extra initial-stop values to test side by side, for example 0.12 / 0.25 / 0.5."),
+                                html.Li("Take profit levels % = favorable-move checkpoints to count, such as 0.5 / 1 / 2 / 4."),
+                                html.Li("Dynamic stop rules = not take-profit orders; they move the stop after price moves in your favor."),
+                                html.Li("BE arm grid % = quick tests for moving the stop to entry after +0.25%, +0.5%, +1%, etc."),
+                                html.Li("Max adverse DD grid % = optional adverse-move caps from entry tested side by side."),
+                                html.Li("Net expectancy uses the simulated exit return minus your round-trip costs for every trade."),
+                                html.Li("Money estimate multiplies each net return by your notional per trade, for example 1000 USD."),
+                            ], style={"marginTop": 0}),
+                            html.P("Dynamic stop rule format: trigger%:move-stop-to-profit%.", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                            html.Ul([
+                                html.Li("0.5:0 means: after price moves +0.5% in your favor, move stop to breakeven / entry."),
+                                html.Li("1:0.3 means: after price moves +1%, move stop to lock about +0.3% profit."),
+                                html.Li("2:1.5 means: after price moves +2%, move stop to lock about +1.5% profit."),
+                                html.Li("4:3 means: after price moves +4%, move stop to lock about +3% profit."),
+                            ], style={"marginTop": 0}),
+                            html.P(
+                                "The dynamic summary table shows the selected scenario plus grid rows: SL grid scenarios, BE-after rows, "
+                                "max adverse DD cap rows, TP hit rows, stop events, stop-after-TP, and dynamic-stop-moved counts.",
+                                style={"marginBottom": 0}
+                            ),
+                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#eef7ff", "border": "1px solid #cfe8ff", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False),
+                    html.Div([
+                        html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Loss distance from the simulated entry. Example: 0.12 means close if price moves 0.12% against the entry before a tighter dynamic stop is active.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-sl-input", type="number", value=0.12, min=0, step=0.01, style={"width": "90px"}),
+                        html.Label("Max adverse DD from entry % (positive):", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Optional adverse-move cap measured from entry, always entered as a positive percent. It is an exit reason only if this cap is hit before the normal stop/trailing stop.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Take profit levels %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Favorable move checkpoints from entry. Example: 0.5, 1, 2, 4 counts candles that move at least those percentages in the trade direction.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
+                        html.Span("Example: 0.5, 1, 2, 4", style={"marginLeft": "10px", "color": "#777"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Dynamic stop rules:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Comma-separated trigger:stop-profit pairs. Example 0.5:0 means: after price moves +0.5% in your favor, move the stop to breakeven. 1:0.3 means after +1%, lock +0.3% profit.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                        html.Span("trigger%:move-stop-to-profit% pairs", style={"marginLeft": "10px", "color": "#777"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("SL grid %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Extra stop-loss values to test side-by-side in the summary. They reuse the same raw candle paths for faster comparison.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-sl-grid-input", type="text", value="0.12, 0.15, 0.25, 0.35, 0.5", style={"width": "260px"}),
+                        html.Label("BE arm grid %:", style={"width": "130px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Breakeven-arm tests add a rule that moves stop to entry after this favorable move. Example 0.5 tests BE after +0.5%.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-be-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Max adverse DD grid %:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Extra adverse drawdown caps from entry to test side-by-side. A cap only counts when it becomes the actual exit before another stop.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-dd-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
+                        html.Span("Grid rows reuse raw candle paths built once per task for faster comparison.", style={"marginLeft": "10px", "color": "#777"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Notional per trade USD:", style={"width": "180px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Diagnostic position size used only for estimated P/L. Example: 1000 means each simulated trade is counted as a 1000 USD notional trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
+                        html.Label("Round-trip costs %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Estimated total entry+exit cost as percent of notional, including fees, spread, slippage, and funding if applicable. It is subtracted from every simulated trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
+                        html.Label("Open/no-exit return %:", style={"width": "165px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Fallback return for diagnostic paths that never hit SL, DD cap, or moved stop. Use 0 for conservative flat close, or another value if you have a forced end-of-window exit rule.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="dynamic-check-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Button("Run Dynamic Checkup", id="dynamic-check-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                    dcc.Loading(
+                        type="circle",
+                        children=[
+                            html.Div(id="dynamic-check-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                            html.Div(
+                                id="dynamic-check-results",
+                                style={
+                                    "marginTop": "10px",
+                                    "maxHeight": "420px",
+                                    "overflowY": "auto",
+                                    "border": "1px solid #ddd",
+                                    "borderRadius": "4px",
+                                    "padding": "8px",
+                                    "backgroundColor": "#fff",
+                                }
+                            ),
+                        ],
+                    ),
+                ], style={"padding": "10px", "backgroundColor": "#f7fbff", "borderRadius": "5px", "border": "1px solid #cfe8ff"})
+            ], open=False, style={"marginBottom": "20px"}),
+            # ----- Level-Reversal Strategy Checkup (on-demand diagnostics) -----
+            html.Details([
+                html.Summary("🧪 Level-Reversal Checkup – enter after signal level touch/overshoot", style={"fontWeight": "bold", "cursor": "pointer"}),
+                html.Div([
+                    html.P(
+                        "Tests the opposite idea: wait until price reaches the signal level (or overshoots it by a chosen percent), "
+                        "then enter the reversal direction. Resistance becomes SELL; support becomes BUY. This is read-only and does not change saved task fields.",
+                        style={"marginTop": "10px", "color": "#555"}
+                    ),
+                    html.Details([
+                        html.Summary("ⓘ How the level-reversal checkup works", style={"cursor": "pointer", "color": "#9a5a00", "fontWeight": "bold"}),
+                        html.Div([
+                            html.P("This box tests a different entry idea from the first dynamic box:", style={"marginBottom": "6px"}),
+                            html.Ul([
+                                html.Li("Resistance signal: wait for price to touch/overshoot the resistance level, then simulate a SELL reversal."),
+                                html.Li("Support signal: wait for price to touch/overshoot the support level, then simulate a BUY reversal."),
+                                html.Li("Entry offset beyond level % = 0 means enter at the level; 0.25 waits for 0.25% overshoot beyond the level."),
+                                html.Li("SL, TP levels, max adverse DD, and dynamic stop rules work the same way as the main dynamic checkup, but from this reversal entry."),
+                                html.Li("Initial stop events count reversal entries that were closed by the initial or moved stop; they do not mean the task is bad/corrupted."),
+                                html.Li("The summary is intentionally unified: it treats support/resistance as one concept — move toward the level, reject, then go back — instead of showing separate BUY/SELL cases."),
+                                html.Li("Entry offset grid % tests how many tasks still trigger if you require extra overshoot before reversal entry."),
+                                html.Li("Net expectancy and USD P/L rows use the same simulated exits, costs, and notional as the first dynamic box."),
+                            ], style={"marginTop": 0}),
+                            html.P("Examples:", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                            html.Ul([
+                                html.Li("Offset 0%: enter reversal as soon as the signal level is touched."),
+                                html.Li("Offset 0.25% on resistance: wait until high reaches resistance +0.25%, then test SELL reversal."),
+                                html.Li("Offset 0.25% on support: wait until low reaches support -0.25%, then test BUY reversal."),
+                                html.Li("Dynamic stop rule 1:0.3 still means: after +1% favorable reversal move, move stop to lock +0.3%."),
+                            ], style={"marginTop": 0}),
+                            html.P(
+                                "The level-reversal summary table shows triggered entries, not-triggered entries, TP hit rows, SL events, "
+                                "adverse-DD events, stop-after-TP, dynamic-stop-moved rows, SL grid rows, and entry-offset grid rows as one unified level-rejection strategy.",
+                                style={"marginBottom": 0}
+                            ),
+                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#fff4de", "border": "1px solid #f4d19b", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False),
+                    html.Div([
+                        html.Label("Entry offset beyond level %:", style={"width": "210px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="0 means enter at the signal level. 0.2 means wait for 0.2% beyond resistance/support before entering the reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-offset-input", type="number", value=0, min=0, step=0.05, style={"width": "90px"}),
+                        html.Label("Initial stop loss %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Loss distance from reversal entry. Resistance reversal is SELL, support reversal is BUY.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
+                        html.Label("Max adverse DD %:", style={"width": "140px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="level-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Take profit levels %:", style={"width": "210px", "display": "inline-block"}),
+                        dcc.Input(id="level-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
+                        html.Label("Dynamic stop rules:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="level-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("SL grid %:", style={"width": "210px", "display": "inline-block"}),
+                        dcc.Input(id="level-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
+                        html.Label("Entry offset grid %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        dcc.Input(id="level-reversal-offset-grid-input", type="text", value="0, 0.1, 0.25, 0.5", style={"width": "220px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Notional per trade USD:", style={"width": "210px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Diagnostic position size used only for estimated P/L. Example: 1000 means each triggered reversal entry is counted as a 1000 USD notional trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
+                        html.Label("Round-trip costs %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Estimated total entry+exit cost as percent of notional, including fees, spread, slippage, and funding if applicable. It is subtracted from every triggered reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
+                        html.Label("Open/no-exit return %:", style={"width": "165px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Fallback return for diagnostic paths that never hit SL, DD cap, or moved stop. Use 0 for conservative flat close unless you define a forced end-of-window exit rule.", style={"cursor": "help", "color": "#0b63b6"}),
+                        dcc.Input(id="level-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Button("Run Level-Reversal Checkup", id="level-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                    dcc.Loading(
+                        type="circle",
+                        children=[
+                            html.Div(id="level-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                            html.Div(
+                                id="level-reversal-results",
+                                style={
+                                    "marginTop": "10px",
+                                    "maxHeight": "420px",
+                                    "overflowY": "auto",
+                                    "border": "1px solid #ddd",
+                                    "borderRadius": "4px",
+                                    "padding": "8px",
+                                    "backgroundColor": "#fff",
+                                }
+                            ),
+                        ],
+                    ),
+                ], style={"padding": "10px", "backgroundColor": "#fffaf2", "borderRadius": "5px", "border": "1px solid #f4d19b"})
+            ], open=False, style={"marginBottom": "20px"}),
+            # ----- Oscillator-confirmed Level-Reversal Checkup -----
+            html.Details([
+                html.Summary("🧪 Oscillator Level-Reversal Checkup – level cross + Stoch/RSI trigger", style={"fontWeight": "bold", "cursor": "pointer"}),
+                html.Div([
+                    html.P(
+                        "Waits for price to cross the signal level in the toward direction, then selects the UP-toward or DOWN-toward oscillator group. "
+                        "When all enabled Stoch/RSI conditions in that group match, it enters the reverse side and runs the same SL/TP/DD/trailing-stop simulation.",
+                        style={"marginTop": "10px", "color": "#555"}
+                    ),
+                    html.Details([
+                        html.Summary("ⓘ Logic and examples", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
+                        html.Div([
+                            html.Ul([
+                                html.Li("Resistance means the toward move is UP to resistance; the UP-toward group is used and the test enters SELL after confirmation."),
+                                html.Li("Support means the toward move is DOWN to support; the DOWN-toward group is used and the test enters BUY after confirmation."),
+                                html.Li("Use the UP-toward group for upper-limit logic, e.g. Stoch crossing down from 87 after price reaches resistance."),
+                                html.Li("Use the DOWN-toward group for lower-limit logic, e.g. Stoch crossing up from 13 after price reaches support."),
+                                html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10."),
+                                html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
+                                html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
+                                html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
+                                html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
+                            ], style={"marginTop": 0}),
+                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False),
+                    html.Div([
+                        html.H5("UP-toward oscillator group (resistance → reverse SELL)", style={"margin": "8px 0", "color": "#6a1b9a"}),
+                        html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                        dcc.Input(id="osc-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                        dcc.Input(id="osc-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "12px"}),
+                    html.Div([
+                        html.H5("DOWN-toward oscillator group (support → reverse BUY)", style={"margin": "8px 0", "color": "#1565c0"}),
+                        html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                        dcc.Input(id="osc-down-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-down-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                        dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Initial SL %:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
+                        html.Label("Max DD %:", style={"width": "85px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                        html.Label("TP levels %:", style={"width": "95px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "220px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Stop rules:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                        html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Notional USD:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
+                        html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
+                        html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                    dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                ], style={"padding": "10px", "backgroundColor": "#fbf3ff", "borderRadius": "5px", "border": "1px solid #ce93d8"})
+            ], open=False, style={"marginBottom": "20px"}),
             # ----- Strategy Info Panel (collapsible) – Professional version -----
             html.Details([
                 html.Summary("📊 Professional Strategy Framework – Multi‑Month Levels", style={"fontWeight": "bold", "cursor": "pointer"}),
@@ -3562,6 +4089,14 @@ def render_tab(tab):
         # Data Analysis tab - now imported from database module
         return create_data_analysis_tab()
 
+# =============================================================================
+# 14. CALLBACKS: SIGNAL INPUT AND TASK CREATION
+# =============================================================================
+# These callbacks parse uploaded/pasted signals and create DownloadTask objects.
+# They coordinate UI stores and Golden Store publication but should delegate math
+# to task/analysis helpers.
+# =============================================================================
+
 # ----- Callbacks for signal file handling -----
 @app.callback(
     Output("upload-status", "children"),
@@ -3612,9 +4147,58 @@ def toggle_period_input(period_type):
     else:
         return {'display': 'none'}, {'display': 'block'}
 
+
+def build_task_creation_options(ow, beyond_val, strat_val, imp_val, event_log_val, hide_logs_val, pre_buffer):
+    """Normalize Create Tasks UI values into the flags used by existing logic."""
+    return {
+        'ow_flag': "overwrite" in ow if ow else False,
+        'analyze_beyond': "beyond" in beyond_val if beyond_val else False,
+        'strat_disabled': "disable" in strat_val if strat_val else False,
+        'imp_disabled': "disable" in imp_val if imp_val else False,
+        'log_events': "disable" not in event_log_val if event_log_val else True,
+        'hide_logs_val': hide_logs_val,
+        'pre_buffer': pre_buffer,
+    }
+
+
+def initialize_task_creation_state(stored_ids, count, autoclear_val):
+    """Return the starting task id/count state for Create Tasks.
+
+    This preserves the existing auto-clear behavior exactly, including clearing
+    the task manager's in-memory task map before new task creation begins.
+    """
+    if autoclear_val and "autoclear" in autoclear_val:
+        tm.tasks.clear()
+        return [], 0
+    return stored_ids.copy() if stored_ids else [], count
+
+
+def build_background_parse_data(signals, period_type, start_date, end_date, hours, tf, task_options, new_ids, new_count):
+    """Build the payload consumed by _run_parse_background using existing keys."""
+    return {
+        'signals': signals,
+        'period_type': period_type,
+        'start_date': start_date,
+        'end_date': end_date,
+        'hours': hours,
+        'tf': tf,
+        'ow_flag': task_options['ow_flag'],
+        'analyze_beyond': task_options['analyze_beyond'],
+        'strat_disabled': task_options['strat_disabled'],
+        'imp_disabled': task_options['imp_disabled'],
+        'log_events': task_options['log_events'],
+        'hide_logs_val': task_options['hide_logs_val'],
+        'pre_buffer': task_options['pre_buffer'],
+        'existing_ids': list(new_ids),
+        'existing_count': new_count
+    }
+
+
 @app.callback(
     Output("task-ids-store", "data", allow_duplicate=True),
     Output("task-count-store", "data", allow_duplicate=True),
+    Output("task-page-store", "data", allow_duplicate=True),
+    Output("golden-store-version", "data", allow_duplicate=True),
     Input("create-signal-tasks-btn", "n_clicks"),
     State("signal-data-store", "data"),
     State("period-type", "value"),
@@ -3637,22 +4221,12 @@ def toggle_period_input(period_type):
 def create_signal_tasks(n_clicks, signals, period_type, start_date, end_date, hours, tf, ow, beyond_val, stored_ids, strat_val, imp_val, pre_buffer, event_log_val, hide_logs_val, autoclear_val, count):
     """Parses signals and creates tasks with background processing for large batches."""
     if not signals:
-        return stored_ids, count
+        return stored_ids, count, dash.no_update, dash.no_update
     
-    ow_flag = "overwrite" in ow if ow else False
-    analyze_beyond = "beyond" in beyond_val if beyond_val else False
-    strat_disabled = "disable" in strat_val if strat_val else False
-    imp_disabled = "disable" in imp_val if imp_val else False
-    log_events = "disable" not in event_log_val if event_log_val else True
-    
-    # AUTO-CLEAR LOGIC: Wipe memory if checkbox is checked
-    if autoclear_val and "autoclear" in autoclear_val:
-        tm.tasks.clear()
-        new_ids = []
-        new_count = 0
-    else:
-        new_ids = stored_ids.copy() if stored_ids else []
-        new_count = count
+    task_options = build_task_creation_options(
+        ow, beyond_val, strat_val, imp_val, event_log_val, hide_logs_val, pre_buffer
+    )
+    new_ids, new_count = initialize_task_creation_state(stored_ids, count, autoclear_val)
         
     buffer_ms = SIGNAL_BUFFER_MINUTES * 60 * 1000
     
@@ -3664,36 +4238,27 @@ def create_signal_tasks(n_clicks, signals, period_type, start_date, end_date, ho
         print(f"🚀 Large batch detected ({total_signals} signals) - using background processing...")
         
         # 🔧 Prepare serialized data for background thread
-        import copy
-        parse_data = {
-            'signals': signals,
-            'period_type': period_type,
-            'start_date': start_date,
-            'end_date': end_date,
-            'hours': hours,
-            'tf': tf,
-            'ow_flag': ow_flag,
-            'analyze_beyond': analyze_beyond,
-            'strat_disabled': strat_disabled,
-            'imp_disabled': imp_disabled,
-            'log_events': log_events,
-            'hide_logs_val': hide_logs_val,
-            'pre_buffer': pre_buffer,
-            'existing_ids': list(new_ids),
-            'existing_count': new_count
-        }
+        parse_data = build_background_parse_data(
+            signals, period_type, start_date, end_date, hours, tf,
+            task_options, new_ids, new_count
+        )
         
         # 🔧 Start background thread
         import threading
         threading.Thread(target=_run_parse_background, args=(parse_data,), daemon=True).start()
         
-        # 🔧 Return updated IDs immediately so UI can track new tasks
-        return new_ids, new_count
+        # 🔧 Return updated IDs immediately and reset the table to the first page.
+        # The background thread publishes the final Golden Store snapshot; the
+        # interval-based version sync below propagates that server-side version
+        # bump back into the client store so the table refreshes when parsing is done.
+        return new_ids, new_count, 0, get_golden_store_version()
     
     # 🔧 SMALL BATCH: Process synchronously (original logic with improved progress)
-    return _process_signals_sync(signals, period_type, start_date, end_date, hours, tf, 
-                                  ow_flag, analyze_beyond, strat_disabled, imp_disabled, 
-                                  log_events, hide_logs_val, pre_buffer, new_ids, new_count)
+    return _process_signals_sync(signals, period_type, start_date, end_date, hours, tf,
+                                  task_options['ow_flag'], task_options['analyze_beyond'],
+                                  task_options['strat_disabled'], task_options['imp_disabled'],
+                                  task_options['log_events'], task_options['hide_logs_val'],
+                                  task_options['pre_buffer'], new_ids, new_count)
 
 
 def _process_signals_sync(signals, period_type, start_date, end_date, hours, tf, 
@@ -3794,9 +4359,11 @@ def _process_signals_sync(signals, period_type, start_date, end_date, hours, tf,
     # This syncs tm.tasks (working storage) → golden_task_store_data (UI display source)
     with tm.lock:
         task_snapshot = list(tm.tasks.values())
-    publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
+    published_version = publish_golden_task_snapshot(task_snapshot, reason="parse_sync")
     
-    return new_ids, new_count
+    # Reset to page 1 and bump the client-side Golden Store version so the
+    # summary and task-table callbacks render the tasks created by this click.
+    return new_ids, new_count, 0, published_version
 
 
 def _run_parse_background(parse_data):
@@ -4085,9 +4652,205 @@ def update_progress(_, stores):
             texts.append("0.0% 0/0/0")
     return logs, progs, texts
 
+# =============================================================================
+# 15. CALLBACKS: SUMMARY STATISTICS AND TASK TABLE REFRESH
+# =============================================================================
+# Heavy summary rendering and lightweight table rendering are intentionally split
+# for performance. Golden Store version changes are the primary refresh signal.
+# =============================================================================
+
 # ============================================================================
 # 🔧 SPLIT CALLBACK #1: Summary Statistics Only (HEAVY - runs ONCE per data load)
 # ============================================================================
+def get_toward_entry_level_distance_pct(task):
+    """Return absolute distance from toward entry to parsed level as percent."""
+    entry_price = getattr(task, 'toward_entry_price', None)
+    level_price = getattr(task, 'signal_price', None)
+    try:
+        if entry_price is None or level_price is None:
+            return None
+        entry_price = float(entry_price)
+        level_price = float(level_price)
+        if entry_price <= 0:
+            return None
+        return abs(level_price - entry_price) / entry_price * 100
+    except Exception:
+        return None
+
+
+def get_toward_distance_bucket(distance_pct):
+    """Bucket entry-to-level distance for toward-strategy diagnostics."""
+    if distance_pct is None or (isinstance(distance_pct, float) and is_na(distance_pct)):
+        return None
+    if 0 <= distance_pct < 0.12:
+        return "0-0.12%"
+    if 0.12 <= distance_pct < 0.5:
+        return "0.12-0.5%"
+    if 0.5 <= distance_pct < 1:
+        return "0.5-1%"
+    if 1 <= distance_pct < 2:
+        return "1-2%"
+    if 2 <= distance_pct < 4:
+        return "2-4%"
+    if distance_pct >= 4:
+        return "4%+"
+    return None
+
+
+def build_toward_strategy_summary_rows(tasks, td_style, fmt_stat):
+    """Build transparent toward-strategy funnel/diagnostic rows without changing math."""
+    toward_cases = [t for t in tasks if getattr(t, 'toward_entry_price', None) is not None]
+    toward_total = len(toward_cases)
+    toward_stop_losses = sum(1 for t in toward_cases if getattr(t, 'toward_stop_loss_hit', False))
+    toward_no_sl_return = sum(1 for t in toward_cases if getattr(t, 'toward_no_stop_returned_entry', False))
+    toward_level_reached = sum(1 for t in toward_cases if getattr(t, 'toward_level_reached', False))
+    stopped_before_level = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_stop_loss_hit', False) and not getattr(t, 'toward_level_reached', False)
+    )
+    reached_before_stop = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False) and not getattr(t, 'toward_stop_loss_hit', False)
+    )
+    both_stop_and_level = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False) and getattr(t, 'toward_stop_loss_hit', False)
+    )
+    neither_stop_nor_level = max(0, toward_total - stopped_before_level - reached_before_stop - both_stop_and_level)
+
+    distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
+    distance_counts = {r: 0 for r in distance_ranges}
+    distance_reached_counts = {r: 0 for r in distance_ranges}
+    for task in toward_cases:
+        bucket = get_toward_distance_bucket(get_toward_entry_level_distance_pct(task))
+        if bucket:
+            distance_counts[bucket] += 1
+            if getattr(task, 'toward_level_reached', False) and not getattr(task, 'toward_stop_loss_hit', False):
+                distance_reached_counts[bucket] += 1
+    distance_row_1 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[:3])
+    distance_row_2 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[3:])
+
+    def fmt_bucket_rate(bucket):
+        total = distance_counts.get(bucket, 0)
+        reached = distance_reached_counts.get(bucket, 0)
+        pct = (reached / total * 100) if total else 0
+        return f"{bucket}:{reached}/{total} ({pct:.1f}%)"
+
+    distance_reach_row_1 = " | ".join(fmt_bucket_rate(r) for r in distance_ranges[:3])
+    distance_reach_row_2 = " | ".join(fmt_bucket_rate(r) for r in distance_ranges[3:])
+
+    tp05_found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 0.5)
+    tp05_then_reached = sum(
+        1 for t in toward_cases
+        if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 0.5
+        and getattr(t, 'toward_level_reached', False)
+        and not getattr(t, 'toward_stop_loss_hit', False)
+    )
+    tp05_then_stopped = sum(
+        1 for t in toward_cases
+        if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 0.5
+        and getattr(t, 'toward_stop_loss_hit', False)
+        and not getattr(t, 'toward_level_reached', False)
+    )
+    fixed_sl_before_tp05 = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_stop_loss_hit', False)
+        and (getattr(t, 'toward_max_reached_pct', None) or 0) < 0.5
+    )
+    reached_level_before_tp05 = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False)
+        and not getattr(t, 'toward_stop_loss_hit', False)
+        and (getattr(t, 'toward_max_reached_pct', None) or 0) < 0.5
+    )
+
+    def fmt_conditional(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0 (0.0%)"
+
+    def subtotal_for_buckets(buckets, counts):
+        return sum(counts.get(bucket, 0) for bucket in buckets)
+
+    dist_le_05_buckets = ["0-0.12%", "0.12-0.5%"]
+    dist_le_1_buckets = ["0-0.12%", "0.12-0.5%", "0.5-1%"]
+    dist_le_05_total = subtotal_for_buckets(dist_le_05_buckets, distance_counts)
+    dist_le_05_reached = subtotal_for_buckets(dist_le_05_buckets, distance_reached_counts)
+    dist_le_1_total = subtotal_for_buckets(dist_le_1_buckets, distance_counts)
+    dist_le_1_reached = subtotal_for_buckets(dist_le_1_buckets, distance_reached_counts)
+
+    def fmt_quick_expectancy(win_count, win_pct, loss_count, loss_pct):
+        total = win_count + loss_count
+        gross_pct = (win_count * win_pct) - (loss_count * loss_pct)
+        avg_pct = gross_pct / total if total else 0.0
+        return f"gross {gross_pct:.2f}% | avg {avg_pct:.3f}%/case before fees"
+
+    tp1_found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 1.0)
+    tp1_then_reached = sum(
+        1 for t in toward_cases
+        if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 1.0
+        and getattr(t, 'toward_level_reached', False)
+        and not getattr(t, 'toward_stop_loss_hit', False)
+    )
+    tp1_then_stopped = sum(
+        1 for t in toward_cases
+        if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 1.0
+        and getattr(t, 'toward_stop_loss_hit', False)
+        and not getattr(t, 'toward_level_reached', False)
+    )
+    tp05_loss_count = max(0, toward_total - tp05_found)
+
+    toward_strategy_rows = [
+        html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward stop losses 0.12%", style=td_style), html.Td(fmt_stat(toward_stop_losses, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward stopped before level", style=td_style), html.Td(fmt_stat(stopped_before_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward reached level", style=td_style), html.Td(fmt_stat(toward_level_reached, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward reached before stop", style=td_style), html.Td(fmt_stat(reached_before_stop, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward both SL and level flags", style=td_style), html.Td(fmt_stat(both_stop_and_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward no SL + returned entry", style=td_style), html.Td(fmt_stat(toward_no_sl_return, toward_total), style=td_style)]),
+        html.Tr([html.Td("Toward neither SL nor level", style=td_style), html.Td(fmt_stat(neither_stop_nor_level, toward_total), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 0-1%", style=td_style), html.Td(distance_row_1, style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 1%+", style=td_style), html.Td(distance_row_2, style=td_style)]),
+        html.Tr([html.Td("Reach rate by dist 0-1%", style=td_style), html.Td(distance_reach_row_1, style=td_style)]),
+        html.Tr([html.Td("Reach rate by dist 1%+", style=td_style), html.Td(distance_reach_row_2, style=td_style)]),
+        html.Tr([html.Td("Entry dist ≤0.5% reached", style=td_style), html.Td(fmt_conditional(dist_le_05_reached, dist_le_05_total), style=td_style)]),
+        html.Tr([html.Td("Entry dist ≤1% reached", style=td_style), html.Td(fmt_conditional(dist_le_1_reached, dist_le_1_total), style=td_style)]),
+        html.Tr([html.Td("TP 0.5 arm before fixed SL", style=td_style), html.Td(fmt_stat(tp05_found, toward_total), style=td_style)]),
+        html.Tr([html.Td("TP 0.5 arm → reached level", style=td_style), html.Td(fmt_conditional(tp05_then_reached, tp05_found), style=td_style)]),
+        html.Tr([html.Td("TP 0.5 arm → fixed SL before level", style=td_style), html.Td(fmt_conditional(tp05_then_stopped, tp05_found), style=td_style)]),
+        html.Tr([html.Td("Fixed SL before TP 0.5 arm", style=td_style), html.Td(fmt_stat(fixed_sl_before_tp05, toward_total), style=td_style)]),
+        html.Tr([html.Td("Reached level before TP 0.5 arm", style=td_style), html.Td(fmt_stat(reached_level_before_tp05, toward_total), style=td_style)]),
+        html.Tr([html.Td("BE-after-0.5 protected fixed-SL cases", style=td_style), html.Td(fmt_conditional(tp05_then_stopped, tp05_found), style=td_style)]),
+        html.Tr([html.Td("TP 1.0 arm before fixed SL", style=td_style), html.Td(fmt_stat(tp1_found, toward_total), style=td_style)]),
+        html.Tr([html.Td("TP 1.0 arm → reached level", style=td_style), html.Td(fmt_conditional(tp1_then_reached, tp1_found), style=td_style)]),
+        html.Tr([html.Td("TP 1.0 arm → fixed SL before level", style=td_style), html.Td(fmt_conditional(tp1_then_stopped, tp1_found), style=td_style)]),
+        html.Tr([html.Td("Quick exp: TP0.5 vs SL0.12", style=td_style), html.Td(fmt_quick_expectancy(tp05_found, 0.5, tp05_loss_count, 0.12), style=td_style)]),
+        html.Tr([html.Td("Quick exp: TP0.5 vs SL0.15", style=td_style), html.Td(fmt_quick_expectancy(tp05_found, 0.5, tp05_loss_count, 0.15), style=td_style)]),
+        html.Tr([html.Td("Quick exp: TP0.5 vs SL0.25", style=td_style), html.Td(fmt_quick_expectancy(tp05_found, 0.5, tp05_loss_count, 0.25), style=td_style)]),
+    ]
+
+    for pct in TOWARD_LEVEL_TARGET_PCTS:
+        label = "4%+" if pct >= 4 else f"{pct:g}%"
+        found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct)
+        found_reached = sum(
+            1 for t in toward_cases
+            if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct
+            and getattr(t, 'toward_level_reached', False)
+            and not getattr(t, 'toward_stop_loss_hit', False)
+        )
+        found_stopped = sum(
+            1 for t in toward_cases
+            if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct
+            and getattr(t, 'toward_stop_loss_hit', False)
+            and not getattr(t, 'toward_level_reached', False)
+        )
+        toward_strategy_rows.extend([
+            html.Tr([html.Td(f"Toward TP {label} found", style=td_style), html.Td(fmt_stat(found, toward_total), style=td_style)]),
+            html.Tr([html.Td(f"Toward TP {label} + reached level", style=td_style), html.Td(fmt_stat(found_reached, reached_before_stop), style=td_style)]),
+            html.Tr([html.Td(f"Toward TP {label} + stopped before level", style=td_style), html.Td(fmt_stat(found_stopped, stopped_before_level), style=td_style)]),
+        ])
+
+    return toward_strategy_rows
+
+
 @app.callback(
     Output("summary-stats-container", "children"),
     Input("golden-store-version", "data"),  # ✅ FIXED: Only trigger when data version changes (not on page clicks)
@@ -4257,25 +5020,7 @@ def update_summary_stats_only(version, lock_state):
     row1_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[:5]])
     row2_delta = " | ".join([f"{r}:{delta_counts[r]}" for r in ranges[5:]])
 
-    toward_cases = [t for t in tasks if getattr(t, 'toward_entry_price', None) is not None]
-    toward_total = len(toward_cases)
-    toward_stop_losses = sum(1 for t in toward_cases if getattr(t, 'toward_stop_loss_hit', False))
-    toward_no_sl_return = sum(1 for t in toward_cases if getattr(t, 'toward_no_stop_returned_entry', False))
-    toward_level_reached = sum(1 for t in toward_cases if getattr(t, 'toward_level_reached', False))
-    toward_target_rows = []
-    for pct in TOWARD_LEVEL_TARGET_PCTS:
-        found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= pct)
-        label = "4%+" if pct >= 4 else f"{pct:g}%"
-        toward_target_rows.append(html.Tr([
-            html.Td(f"Toward TP {label} found", style=td_style),
-            html.Td(fmt_stat(found, toward_total), style=td_style),
-        ]))
-    toward_strategy_rows = [
-        html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward stop losses 0.12%", style=td_style), html.Td(fmt_stat(toward_stop_losses, toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward reached level", style=td_style), html.Td(fmt_stat(toward_level_reached, toward_total), style=td_style)]),
-        html.Tr([html.Td("Toward no SL + returned entry", style=td_style), html.Td(fmt_stat(toward_no_sl_return, toward_total), style=td_style)]),
-    ] + toward_target_rows
+    toward_strategy_rows = build_toward_strategy_summary_rows(tasks, td_style, fmt_stat)
     toward_strategy_table = html.Table([html.Tbody(toward_strategy_rows)], style={"border": "1px solid #2e7d32", "padding": "5px", "marginTop": "10px", "backgroundColor": "#f1fff1"})
 
     signal_stats_rows = [
@@ -4338,11 +5083,6 @@ _page_html_cache = OrderedDict()
 _cached_golden_version = None
 
 
-def get_golden_store_version():
-    """Return the current Golden Store version used by UI cache keys."""
-    return golden_store_version
-
-
 def normalize_task_page(current_page, total_pages):
     """Clamp a requested page index to the available task-table page range."""
     try:
@@ -4352,13 +5092,33 @@ def normalize_task_page(current_page, total_pages):
     return max(0, min(page, max(1, total_pages) - 1))
 
 
-def get_display_page_slice(current_page, page_size=PAGE_SIZE, tasks=None):
+def get_task_display_sort_key(task):
+    """Return a UI-only sort key for newest-signal-first table display."""
+    try:
+        signal_time = getattr(task, "signal_time", None)
+        if signal_time is None or is_na(signal_time):
+            return -1.0
+        return float(signal_time)
+    except Exception:
+        return -1.0
+
+
+def sort_tasks_for_table_display(tasks, sort_mode="newest"):
+    """Sort tasks for table display only; never mutate task data or JSON order."""
+    task_list = list(tasks)
+    if sort_mode == "newest":
+        return sorted(task_list, key=get_task_display_sort_key, reverse=True)
+    return task_list
+
+
+def get_display_page_slice(current_page, page_size=PAGE_SIZE, tasks=None, sort_mode="newest"):
     """Return the Golden Store task snapshot and one visible page slice.
 
-    This is UI pagination only: it keeps the 300-row page model, preserves task
-    order, and does not calculate or mutate any task fields.
+    This is UI pagination only: it keeps the 300-row page model, can apply a
+    display-only sort, and does not calculate or mutate any task fields.
     """
-    task_list = get_display_tasks_snapshot() if tasks is None else tasks
+    raw_task_list = get_display_tasks_snapshot() if tasks is None else tasks
+    task_list = sort_tasks_for_table_display(raw_task_list, sort_mode=sort_mode)
     total_pages = max(1, (len(task_list) + page_size - 1) // page_size)
     page = normalize_task_page(current_page, total_pages)
     start_idx = page * page_size
@@ -4378,10 +5138,12 @@ def should_show_table_logs(hide_logs_value):
     return "hide" not in (hide_logs_value or ["hide"])
 
 
-def make_task_page_cache_key(current_page, version, show_table_logs):
+def make_task_page_cache_key(current_page, version, show_table_logs, table_view_mode="compact", table_sort_mode="newest"):
     """Build the versioned task-table page cache key used by the LRU cache."""
     log_cache_mode = "logs_on" if show_table_logs else "logs_off"
-    return f"page_{current_page}_v{version}_{log_cache_mode}"
+    safe_view_mode = table_view_mode if table_view_mode in ("compact", "full") else "compact"
+    safe_sort_mode = table_sort_mode if table_sort_mode in ("newest", "original") else "newest"
+    return f"page_{current_page}_v{version}_{log_cache_mode}_{safe_view_mode}_{safe_sort_mode}"
 
 
 def build_cached_summary_panels(current_golden_version, tasks):
@@ -4445,9 +5207,11 @@ def cache_task_page(cache_key, page):
     Input("recalc-lock-store", "data"),
     Input("analysis-complete-trigger", "data"),  # 🔧 NEW: Trigger UI refresh after recalculation completes
     Input("hide-logs-checkbox", "value"),  # UI-only: live toggle for table log rendering
+    Input("table-view-mode", "value"),  # UI-only: compact/full main table toggle
+    Input("table-sort-mode", "value"),  # UI-only: newest/original task order toggle
     prevent_initial_call=False
 )
-def update_task_table_only(current_page, version, lock_state, analysis_trigger, hide_logs_value):
+def update_task_table_only(current_page, version, lock_state, analysis_trigger, hide_logs_value, table_view_mode, table_sort_mode):
     """Render task table ONLY. Uses aggressive caching to skip HTML generation on page changes."""
     global golden_task_store_data, golden_store_version, _page_html_cache, _cached_golden_version, cached_signal_stats_html, cached_small_stats_data, stats_cache_version
     
@@ -4483,8 +5247,10 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
         timer.check("Lock Active").end()
         return html.Div("⏳ Recalculating... Please wait", style={"textAlign": "center", "padding": "20px", "fontSize": "16px", "color": "#666"})
     
+    table_sort_mode = table_sort_mode if table_sort_mode in ("newest", "original") else "newest"
+
     # Get tasks from Golden Store
-    page_slice = get_display_page_slice(current_page)
+    page_slice = get_display_page_slice(current_page, sort_mode=table_sort_mode)
     tasks = page_slice["tasks"]
     source = "golden store" if golden_task_store_data is not None and len(golden_task_store_data) > 0 else "task_manager"
     perf_log(f"[TRACE] ✓ Loaded {len(tasks)} tasks from {source}")
@@ -4518,9 +5284,10 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     # UI-only table log toggle. Checked means keep table rows lightweight.
     # This does not modify task.log, JSON, or the Disable event logs processing flag.
     show_table_logs = should_show_table_logs(hide_logs_value)
+    table_view_mode = table_view_mode if table_view_mode in ("compact", "full") else "compact"
 
     # ⚡ CRITICAL FIX: Cache MUST use the normalized page, version, and log display mode.
-    cache_key = make_task_page_cache_key(current_page, current_golden_version, show_table_logs)
+    cache_key = make_task_page_cache_key(current_page, current_golden_version, show_table_logs, table_view_mode, table_sort_mode)
 
     # Return cached page if available (INSTANT - no HTML generation)
     cached_page = get_cached_task_page(cache_key)
@@ -4606,15 +5373,15 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     
     timer.check("Step 3: Helper Functions Setup")
     
-    # Generate the visible table page ONLY (300 max) as raw HTML strings.
+    # Generate the visible table page ONLY (300 max) as Dash components.
     # Keep this presentation-only: it formats fields that are already present on tasks.
-    perf_log(f"[TRACE] 🚀 Starting table HTML generation for {len(visible_tasks)} tasks using optimized HTML string renderer...")
+    perf_log(f"[TRACE] 🚀 Starting {table_view_mode} table generation for {len(visible_tasks)} tasks using Dash components...")
     t_table_start = time.time()
-    table_html, row_count = render_task_table_html(visible_tasks, show_table_logs=show_table_logs)
+    table_component, row_count = render_task_table_component(visible_tasks, show_table_logs=show_table_logs, compact=(table_view_mode == "compact"))
     table_elapsed = time.time() - t_table_start
     per_row_ms = (table_elapsed / row_count * 1000) if row_count else 0
-    perf_log(f"[TRACE] ✓ Generated table HTML for {row_count} rows in {table_elapsed:.2f}s ({per_row_ms:.1f}ms per row) - USING RAW HTML STRINGS")
-    timer.check(f"Step 4-5: Table HTML Generation ({row_count} rows)")
+    perf_log(f"[TRACE] ✓ Generated {table_view_mode} table for {row_count} rows in {table_elapsed:.2f}s ({per_row_ms:.1f}ms per row)")
+    timer.check(f"Step 4-5: Table Component Generation ({row_count} rows)")
 
 
 
@@ -4629,7 +5396,7 @@ def update_task_table_only(current_page, version, lock_state, analysis_trigger, 
     result = html.Div([
         html.H4("Task Summary"),
         nav_container,
-        dcc.Markdown(table_html, dangerously_allow_html=True, style={"overflow-x": "auto", "overflow-y": "auto", "max-height": "75vh", "width": "100%"}),
+        table_component,
         html.P(f"📄 Page {current_page+1} of {total_pages} | Showing tasks {start_idx+1}-{min(end_idx, len(tasks))} of {len(tasks)}", style={"textAlign":"center", "fontSize":"12px", "color":"#555"}),
         stats_table,
         html.H5("Signal Performance Summary", style={"marginTop": "15px", "marginBottom": "5px"}),
@@ -4673,6 +5440,12 @@ TASK_TABLE_HEADERS = [
     ("Price Δ% (sgnl-lvl)", "80px"),
     ("Reached", "70px"),
     ("Reversed", "70px"),
+    ("Toward Dir", "80px"),
+    ("Toward Entry", "110px"),
+    ("Toward SL Hit 0.12%", "120px"),
+    ("Toward Max TP (0.5–4%+)", "160px"),
+    ("Toward Level Hit", "120px"),
+    ("No-SL Ret Entry", "130px"),
     ("Hit 1% (lvl-fwd.dir)", "50px"),
     ("Hit 1.5% (lvl-fwd.dir)", "60px"),
     ("Hit 2% (lvl-fwd.dir)", "50px"),
@@ -4692,14 +5465,14 @@ TASK_TABLE_HEADERS = [
     ("Max Adv T(lvl)", "140px"),
     ("Max Exp %(lvl)", "100px"),
     ("Max Exp T(lvl)", "140px"),
-    ("Max Adv %(sgnl)", "100px"),
-    ("Max Adv T(sgnl)", "140px"),
-    ("Max Exp %(sgnl)", "100px"),
-    ("Max Exp T(sgnl)", "140px"),
     ("Max Adv %(bef ret lvl)", "140px"),
     ("Time (bef ret lvl)", "140px"),
+    ("Max Adv %(sgnl)", "100px"),
+    ("Max Adv T(sgnl)", "140px"),
     ("Max Adv %(bef ret sgnl)", "140px"),
     ("Time (bef ret sgnl)", "140px"),
+    ("Max Exp %(sgnl)", "100px"),
+    ("Max Exp T(sgnl)", "140px"),
     ("DD% (Lvl)", "80px"),
     ("DD Time (Lvl)", "140px"),
     ("DD% (1%)", "80px"),
@@ -4712,23 +5485,194 @@ TASK_TABLE_HEADERS = [
     ("Confidence", "80px"),
     ("Impulse #", "80px"),
     ("Log", "200px"),
-    ("Actions", "180px"),
+    ("Actions", "420px"),
 ]
 
 
 TASK_TABLE_HEADER_HTML = (
     '<thead style="position:sticky;top:0;background-color:#f0f0f0;z-index:10"><tr>'
     + "".join(
-        f'<th style="min-width:{width}">{label}</th>'
+        f'<th style="min-width:{width};white-space:nowrap;padding:4px 6px;border:1px solid #ddd">{label}</th>'
         for label, width in TASK_TABLE_HEADERS
     )
     + "</tr></thead>"
 )
 
 
+# =============================================================================
+# 16. UI RENDERERS: TASK TABLE, PAGINATION, AND SUMMARY TABLES
+# =============================================================================
+# Renderer helpers convert already-calculated task fields into Dash/raw HTML. They
+# should not change task state, Golden Store, JSON, or analysis results.
+# =============================================================================
+
 def render_task_table_header_html():
     """Return the prebuilt raw sticky table header HTML used by the fast task table."""
     return TASK_TABLE_HEADER_HTML
+
+
+COMPACT_TASK_TABLE_HEADERS = [
+    ("ID", "80px"),
+    ("Status", "80px"),
+    ("Progress", "70px"),
+    ("Symbols", "100px"),
+    ("Direction", "80px"),
+    ("Signal Time", "120px"),
+    ("Reached", "70px"),
+    ("Toward Dir", "80px"),
+    ("Toward Entry", "110px"),
+    ("Toward SL", "80px"),
+    ("Toward Max TP", "110px"),
+    ("Toward Level", "100px"),
+    ("Strategy", "120px"),
+    ("Confidence", "80px"),
+    ("Impulse #", "80px"),
+    ("Actions", "280px"),
+]
+
+
+def render_task_action_buttons(t, compact=True):
+    """Render task action buttons as Dash components so event delegation still works."""
+    task_id_str = str(t.task_id)
+    is_completed = t.status == "completed"
+    btn_disabled = "not-allowed" if not is_completed else "pointer"
+    btn_opacity = "0.6" if not is_completed else "1"
+    impulse_count = sum(1 for sig in t.strategy_signals if sig.get('type') == 'impulse')
+
+    def action_div(label, action, bg, cursor="pointer", opacity="1", font_size="11px"):
+        return html.Div(
+            label,
+            **{"data-action": action, "data-task-id": task_id_str},
+            style={
+                "margin": "2px",
+                "padding": "4px 8px",
+                "backgroundColor": bg,
+                "borderRadius": "3px",
+                "cursor": cursor,
+                "display": "inline-block",
+                "fontSize": font_size,
+                "opacity": opacity,
+            },
+            className="interactive-button",
+        )
+
+    buttons = [
+        action_div("Stop", "stop", "#ffcccc"),
+        action_div("Resume" if t.paused else "Pause", "pause", "#fff3cd" if t.paused else "#d1ecf1"),
+        action_div("Chart", "chart", "#d4edda" if is_completed else "#e9ecef", btn_disabled, btn_opacity),
+        action_div("Details", "details", "#d4edda" if is_completed else "#e9ecef", btn_disabled, btn_opacity),
+    ]
+    if not compact:
+        impulse_has_data = is_completed and impulse_count > 0
+        buttons.extend([
+            action_div("Impulse", "impulse", "#d4edda" if impulse_has_data else "#e9ecef", "pointer" if impulse_has_data else "not-allowed", "1" if impulse_has_data else "0.6"),
+            action_div("Re-run Strategy", "rerun-strat", "#d4edda" if is_completed else "#e9ecef", btn_disabled, btn_opacity, "9px"),
+            action_div("Re-run Impulse", "rerun-impulse", "#d4edda" if is_completed else "#e9ecef", btn_disabled, btn_opacity, "9px"),
+        ])
+    symbol = t.symbols[0] if t.symbols else ""
+    tv_url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}&interval={t.timeframe}"
+    buttons.append(html.A(html.Div("TV", style={"margin": "2px", "padding": "4px 8px", "backgroundColor": "#e7f3ff", "borderRadius": "3px", "display": "inline-block", "fontSize": "11px"}), href=tv_url, target="_blank", title="Open TradingView Chart"))
+    return html.Div(buttons)
+
+
+def get_task_table_display_values(t, show_table_logs=False):
+    """Return all full-table display values in TASK_TABLE_HEADERS order."""
+    direction_display = t.signal_direction if t.signal_direction else '-'
+    signal_time_display = fmt_time_ui(t.signal_time) if t.signal_time else '-'
+    first_event_display = fmt_time_ui(t.first_event_time) if t.first_event_time else '-'
+    strategy_conf = t.strategy_confidence if t.strategy_confidence else 0
+    impulse_count = sum(1 for sig in t.strategy_signals if sig.get('type') == 'impulse')
+    if not show_table_logs:
+        log_value = html.Span(f"Logs hidden — {len(t.log) if getattr(t, 'log', None) else 0} lines", style={"color": "#888", "fontStyle": "italic", "fontSize": "12px"})
+    else:
+        log_value = html.Div("\n".join(t.log) if t.log else "No logs yet...", style={"width": "100%", "maxHeight": "100px", "minHeight": "50px", "fontFamily": "monospace", "fontSize": "11px", "overflowY": "auto", "whiteSpace": "pre-wrap", "padding": "4px", "border": "1px solid #ddd", "borderRadius": "3px", "backgroundColor": "#fafafa"})
+
+    return [
+        str(t.task_id)[:8],
+        t.status,
+        f"{t.progress:.1f}%",
+        ", ".join(t.symbols),
+        t.mode,
+        direction_display,
+        signal_time_display,
+        first_event_display,
+        "Yes" if t.first_event_is_pin else "No",
+        fmt_dd_ui(t.price_change_pct) if t.price_change_pct is not None else '-',
+        "Yes" if t.reached_level else "No",
+        "Yes" if t.reversed_direction else "No",
+        (getattr(t, 'toward_entry_direction', None) or '-').upper() if getattr(t, 'toward_entry_direction', None) else '-',
+        f"{float(getattr(t, 'toward_entry_price')):.6g}" if getattr(t, 'toward_entry_price', None) is not None else '-',
+        "Yes" if getattr(t, 'toward_stop_loss_hit', False) else "No",
+        fmt_toward_level_target_ui(getattr(t, 'toward_max_reached_pct', None)),
+        "Yes" if getattr(t, 'toward_level_reached', False) else "No",
+        "Yes" if getattr(t, 'toward_no_stop_returned_entry', False) else "No",
+        "Yes" if t.hit_1 else "No",
+        "Yes" if t.hit_1_5 else "No",
+        "Yes" if t.hit_2 else "No",
+        "Yes" if t.first_hit_1_expected else "No",
+        fmt_time_ui(t.first_hit_1_expected_time),
+        "Yes" if t.first_hit_1_5_expected else "No",
+        fmt_time_ui(t.first_hit_1_5_expected_time),
+        "Yes" if t.first_hit_2_expected else "No",
+        fmt_time_ui(t.first_hit_2_expected_time),
+        "Yes" if t.first_hit_1_opposite else "No",
+        fmt_time_ui(t.first_hit_1_opposite_time),
+        "Yes" if t.first_hit_1_5_opposite else "No",
+        fmt_time_ui(t.first_hit_1_5_opposite_time),
+        "Yes" if t.first_hit_2_opposite else "No",
+        fmt_time_ui(t.first_hit_2_opposite_time),
+        fmt_dd_ui(t.max_adverse_move_pct),
+        fmt_time_ui(t.max_adverse_time),
+        fmt_dd_ui(t.max_expected_move_pct),
+        fmt_time_ui(t.max_expected_time),
+        "Not returned" if not t.returned_to_signal else fmt_dd_ui(t.max_adverse_before_return_pct),
+        fmt_time_ui(t.max_adverse_before_return_time) if t.returned_to_signal else "-",
+        fmt_dd_ui(t.max_adverse_sgnl_pct),
+        fmt_time_ui(t.max_adverse_sgnl_time),
+        "Not returned" if not t.returned_to_sgnl else fmt_dd_ui(t.max_adverse_before_return_sgnl_pct),
+        fmt_time_ui(t.max_adverse_before_return_sgnl_time) if t.returned_to_sgnl else "-",
+        fmt_dd_ui(t.max_expected_sgnl_pct),
+        fmt_time_ui(t.max_expected_sgnl_time),
+        fmt_dd_ui(t.drawdown_before_level),
+        fmt_time_ui(t.drawdown_before_level_time),
+        fmt_dd_ui(t.drawdown_before_1pct),
+        fmt_time_ui(t.drawdown_before_1pct_time),
+        fmt_dd_ui(t.drawdown_before_1_5pct),
+        fmt_time_ui(t.drawdown_before_1_5pct_time),
+        fmt_dd_ui(t.drawdown_before_2pct),
+        fmt_time_ui(t.drawdown_before_2pct_time),
+        t.strategy_log_summary if t.strategy_log_summary else '-',
+        f"{strategy_conf:.1f}%" if strategy_conf else "-",
+        str(impulse_count),
+        log_value,
+        render_task_action_buttons(t, compact=False),
+    ]
+
+
+def render_task_table_component(visible_tasks, show_table_logs=False, compact=True):
+    """Render the task table as Dash components instead of Markdown/raw HTML."""
+    headers = COMPACT_TASK_TABLE_HEADERS if compact else TASK_TABLE_HEADERS
+    compact_indices = [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 53, 54, 55, 57]
+    header_cells = [
+        html.Th(label, style={"minWidth": width, "whiteSpace": "nowrap", "padding": "4px 6px", "border": "1px solid #ddd"})
+        for label, width in headers
+    ]
+    rows = []
+    for task in visible_tasks:
+        values = get_task_table_display_values(task, show_table_logs=show_table_logs)
+        row_values = [values[i] for i in compact_indices] if compact else values
+        cells = [
+            html.Td(value, style={"minWidth": headers[idx][1], "whiteSpace": "nowrap", "padding": "4px 6px", "border": "1px solid #ddd", "verticalAlign": "top"})
+            for idx, value in enumerate(row_values)
+        ]
+        rows.append(html.Tr(cells, **{"data-task-row": str(task.task_id)}))
+
+    table = html.Table(
+        [html.Thead(html.Tr(header_cells), style={"position": "sticky", "top": 0, "backgroundColor": "#f0f0f0", "zIndex": 10}), html.Tbody(rows)],
+        id="task-summary-table",
+        style={"width": "max-content", "minWidth": "100%", "borderCollapse": "collapse", "tableLayout": "auto", "fontSize": "12px"},
+    )
+    return html.Div(table, style={"overflowX": "auto", "overflowY": "auto", "maxHeight": "75vh", "width": "100%"}), len(visible_tasks)
 
 
 def render_task_table_html(visible_tasks, show_table_logs=False):
@@ -4744,7 +5688,11 @@ def render_task_table_html(visible_tasks, show_table_logs=False):
         render_task_table_row(t, show_table_logs=show_table_logs) for t in visible_tasks
     ) + "</tbody>"
     table_html = (
-        '<table style="width:100%;border-collapse:collapse">'
+        '<style>'
+        '#task-summary-table th,#task-summary-table td{white-space:nowrap;padding:4px 6px;border:1px solid #ddd;vertical-align:top;}'
+        '#task-summary-table td:nth-last-child(2){white-space:normal;}'
+        '</style>'
+        '<table id="task-summary-table" style="width:max-content;min-width:100%;border-collapse:collapse;table-layout:auto">'
         + render_task_table_header_html()
         + body_html
         + "</table>"
@@ -4793,7 +5741,7 @@ def render_task_table_row(t, show_table_logs=False):
     else:
         import html as html_lib
         log_text = "\n".join(t.log) if t.log else "No logs yet..."
-        log_escaped = html_lib.escape(log_text)
+        log_escaped = html_lib.escape(log_text).replace("\n", "<br>")
         log_html = f'<div style="width:100%;max-height:100px;min-height:50px;font-family:monospace;font-size:11px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word;padding:4px;border:1px solid #ddd;border-radius:3px;background-color:#fafafa">{log_escaped}</div>'
     
     # Build action buttons as HTML strings
@@ -4834,7 +5782,7 @@ def render_task_table_row(t, show_table_logs=False):
     button_html = f'<div>{stop_btn}{pause_btn}{chart_btn}{details_btn}{impulse_btn}{rerun_strat_btn}{rerun_impulse_btn}{tv_btn}</div>'
 
     # Build and return RAW HTML STRING for the entire row
-    return f"""<tr data-task-row="{task_id_str}">
+    row_html = f"""<tr data-task-row="{task_id_str}">
         <td style="min-width:80px">{task_id_str[:8]}</td>
         <td style="min-width:80px">{t.status}</td>
         <td style="min-width:70px">{t.progress:.1f}%</td>
@@ -4892,8 +5840,12 @@ def render_task_table_row(t, show_table_logs=False):
         <td style="min-width:80px">{confidence_display}</td>
         <td style="min-width:80px">{impulse_display}</td>
         <td style="min-width:200px">{log_html}</td>
-        <td style="min-width:180px">{button_html}</td>
+        <td style="min-width:420px">{button_html}</td>
     </tr>"""
+    # dcc.Markdown treats indented HTML lines as code blocks, which caused raw
+    # <td> tags to display in the page. Compact the row so Markdown receives a
+    # continuous raw-HTML block while preserving log line breaks as <br> tags.
+    return "".join(line.strip() for line in row_html.splitlines())
 
 
 def render_task_table_header():
@@ -4916,10 +5868,10 @@ def render_task_table_header():
         html.Th("Reversed", style={"minWidth": "70px"}),
         html.Th("Toward Dir", style={"minWidth": "80px"}),
         html.Th("Toward Entry", style={"minWidth": "100px"}),
-        html.Th("Toward SL 0.12%", style={"minWidth": "80px"}),
-        html.Th("Toward Max TP", style={"minWidth": "90px"}),
-        html.Th("Toward Level", style={"minWidth": "80px"}),
-        html.Th("No SL Ret Entry", style={"minWidth": "100px"}),
+        html.Th("Toward SL Hit 0.12%", style={"minWidth": "120px"}),
+        html.Th("Toward Max TP (0.5–4%+)", style={"minWidth": "160px"}),
+        html.Th("Toward Level Hit", style={"minWidth": "120px"}),
+        html.Th("No-SL Ret Entry", style={"minWidth": "130px"}),
         html.Th("Hit 1% (lvl-fwd.dir)", style={"minWidth": "50px"}),
         html.Th("Hit 1.5% (lvl-fwd.dir)", style={"minWidth": "60px"}),
         html.Th("Hit 2% (lvl-fwd.dir)", style={"minWidth": "50px"}),
@@ -4939,14 +5891,14 @@ def render_task_table_header():
         html.Th("Max Adv T(lvl)", style={"minWidth": "140px"}),
         html.Th("Max Exp %(lvl)", style={"minWidth": "100px"}),
         html.Th("Max Exp T(lvl)", style={"minWidth": "140px"}),
-        html.Th("Max Adv %(sgnl)", style={"minWidth": "100px"}),
-        html.Th("Max Adv T(sgnl)", style={"minWidth": "140px"}),
-        html.Th("Max Exp %(sgnl)", style={"minWidth": "100px"}),
-        html.Th("Max Exp T(sgnl)", style={"minWidth": "140px"}),           
         html.Th("Max Adv %(bef ret lvl)", style={"minWidth": "140px"}),
         html.Th("Time (bef ret lvl)", style={"minWidth": "140px"}),
+        html.Th("Max Adv %(sgnl)", style={"minWidth": "100px"}),
+        html.Th("Max Adv T(sgnl)", style={"minWidth": "140px"}),
         html.Th("Max Adv %(bef ret sgnl)", style={"minWidth": "140px"}),
         html.Th("Time (bef ret sgnl)", style={"minWidth": "140px"}),
+        html.Th("Max Exp %(sgnl)", style={"minWidth": "100px"}),
+        html.Th("Max Exp T(sgnl)", style={"minWidth": "140px"}),
         html.Th("DD% (Lvl)", style={"minWidth": "80px"}),
         html.Th("DD Time (Lvl)", style={"minWidth": "140px"}),
         html.Th("DD% (1%)", style={"minWidth": "80px"}),
@@ -4959,7 +5911,7 @@ def render_task_table_header():
         html.Th("Confidence", style={"minWidth": "80px"}),
         html.Th("Impulse #", style={"minWidth": "80px"}),
         html.Th("Log", style={"minWidth": "200px"}),
-        html.Th("Actions", style={"minWidth": "180px"})
+        html.Th("Actions", style={"minWidth": "420px"})
     ]), style={'position': 'sticky', 'top': 0, 'backgroundColor': '#f0f0f0', 'zIndex': 10})
 
 
@@ -5188,6 +6140,13 @@ def page_for_task(task_id, tasks):
             return idx // PAGE_SIZE
     return no_update
 
+# =============================================================================
+# 17. CALLBACKS: CHART MODAL, CHART NAVIGATION, AND VISIBILITY TOGGLES
+# =============================================================================
+# Chart callbacks/renderers should consume task data and display state only. Keep
+# measurement, visibility, and modal state separate from analysis calculations.
+# =============================================================================
+
 @app.callback(
     Output("prev-chart-btn", "disabled"),
     Output("next-chart-btn", "disabled"),
@@ -5336,6 +6295,15 @@ def toggle_rsi(n_clicks, current):
     return not current
 
 @app.callback(
+    Output("stochastic-visible-store", "data"),
+    Input("toggle-stochastic-btn", "n_clicks"),
+    State("stochastic-visible-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_stochastic(n_clicks, current):
+    return not current
+
+@app.callback(
     Output("volume-visible-store", "data"),
     Input("toggle-volume-btn", "n_clicks"),
     State("volume-visible-store", "data"),
@@ -5361,6 +6329,24 @@ def toggle_strategy(n_clicks, current):
     prevent_initial_call=True
 )
 def toggle_measure(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("measure-anchor-store", "data"),
+    Input("toggle-measure-anchor-btn", "n_clicks"),
+    State("measure-anchor-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_measure_anchor(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("measure-hover-store", "data"),
+    Input("toggle-measure-hover-btn", "n_clicks"),
+    State("measure-hover-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_measure_hover(n_clicks, current):
     return not current
 
 @app.callback(
@@ -5399,16 +6385,56 @@ def update_measure_button(active):
         "background": "#e3f2fd" if active else "transparent",
         "color": "black",
         "border": "2px solid #1976d2" if active else "1px solid black",
-        "padding": "8px 16px",
+        "padding": "6px 10px",
         "cursor": "pointer",
-        "fontSize": "14px",
-        "minWidth": "100px",
+        "fontSize": "12px",
+        "minWidth": "76px",
         "whiteSpace": "nowrap",
         "fontWeight": "bold" if active else "normal"
     }
     return ("📏 Measuring" if active else "Measure"), base_style
 
-def _extract_measure_point(click_data):
+@app.callback(
+    Output("toggle-measure-anchor-btn", "children"),
+    Output("toggle-measure-anchor-btn", "style"),
+    Input("measure-anchor-store", "data"),
+    prevent_initial_call=False
+)
+def update_measure_anchor_button(anchor_enabled):
+    base_style = {
+        "background": "#e8f5e9" if anchor_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #2e7d32" if anchor_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "76px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if anchor_enabled else "normal"
+    }
+    return ("Snap: On" if anchor_enabled else "Snap: Off"), base_style
+
+@app.callback(
+    Output("toggle-measure-hover-btn", "children"),
+    Output("toggle-measure-hover-btn", "style"),
+    Input("measure-hover-store", "data"),
+    prevent_initial_call=False
+)
+def update_measure_hover_button(hover_enabled):
+    base_style = {
+        "background": "#fff8e1" if hover_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #f9a825" if hover_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "78px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if hover_enabled else "normal"
+    }
+    return ("Hover: On" if hover_enabled else "Hover: Off"), base_style
+
+def _extract_measure_point(click_data, anchor_enabled=True):
     """Return {'x': ..., 'y': ...} from Plotly clickData.
 
     Plotly candlestick clicks do not consistently expose a `y` key.  The chart
@@ -5420,6 +6446,9 @@ def _extract_measure_point(click_data):
     point = click_data['points'][0]
     x_val = point.get('x')
     y_val = point.get('y')
+
+    if not anchor_enabled and point.get('curveNumber') is not None and point.get('y') is None:
+        return None
 
     if y_val is None:
         if point.get('close') is not None:
@@ -5465,23 +6494,101 @@ def _format_measure_time_delta(first_x, second_x, timeframe=None):
         bars_text = f"{bars:.1f} candles"
     return time_text, bars_text
 
+
+def _extract_measure_box(relayout_data):
+    """Return a TradingView-style drawn rectangle from Plotly relayoutData."""
+    if not isinstance(relayout_data, dict):
+        return None
+
+    shapes = relayout_data.get("shapes")
+    if isinstance(shapes, list) and shapes:
+        for shape in reversed(shapes):
+            if not isinstance(shape, dict):
+                continue
+            if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
+                return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
+
+    shape_indexes = []
+    for key in relayout_data:
+        match = re.match(r"shapes\[(\d+)\]\.", str(key))
+        if match:
+            shape_indexes.append(int(match.group(1)))
+    for idx in sorted(set(shape_indexes), reverse=True):
+        prefix = f"shapes[{idx}]."
+        shape = {
+            "x0": relayout_data.get(prefix + "x0"),
+            "x1": relayout_data.get(prefix + "x1"),
+            "y0": relayout_data.get(prefix + "y0"),
+            "y1": relayout_data.get(prefix + "y1"),
+            "type": relayout_data.get(prefix + "type", "rect"),
+        }
+        if shape["type"] in (None, "rect") and all(shape.get(k) is not None for k in ("x0", "x1", "y0", "y1")):
+            return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
+    return None
+
+
+@app.callback(
+    Output("measure-points-store", "data", allow_duplicate=True),
+    Output("measure-result-store", "data", allow_duplicate=True),
+    Input("task-chart", "relayoutData"),
+    State("measure-mode-store", "data"),
+    State("chart-task-id", "data"),
+    prevent_initial_call=True
+)
+def capture_measure_box(relayout_data, measure_mode, task_id):
+    if not measure_mode or not relayout_data:
+        return dash.no_update, dash.no_update
+
+    box = _extract_measure_box(relayout_data)
+    if not box:
+        return dash.no_update, dash.no_update
+
+    try:
+        y0 = float(box["y0"])
+        y1 = float(box["y1"])
+    except (TypeError, ValueError):
+        return dash.no_update, dash.no_update
+
+    first = {"x": box["x0"], "y": y0}
+    second = {"x": box["x1"], "y": y1}
+    price_diff = y1 - y0
+    pct_change = (price_diff / y0) * 100 if y0 else 0
+    direction = "Up" if price_diff >= 0 else "Down"
+    task = tm.get_task(task_id) if task_id else None
+    timeframe = task.timeframe if task else None
+    time_text, bars_text = _format_measure_time_delta(first["x"], second["x"], timeframe)
+    result = {
+        "text": f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
+        "task_id": task_id,
+        "first": first,
+        "second": second,
+        "shape": box,
+        "price_diff": price_diff,
+        "pct_change": pct_change,
+        "time_text": time_text,
+        "bars_text": bars_text,
+    }
+    return {"task_id": task_id, "first": first, "second": second}, result
+
+
 @app.callback(
     Output("measure-points-store", "data"),
     Output("measure-result-store", "data"),
     Input("task-chart", "clickData"),
     State("measure-mode-store", "data"),
+    State("measure-anchor-store", "data"),
     State("measure-points-store", "data"),
     State("chart-task-id", "data"),
     prevent_initial_call=True
 )
-def capture_click(clickData, measure_mode, points, task_id):
+def capture_click(clickData, measure_mode, measure_anchor, points, task_id):
     if not measure_mode or not clickData:
         return dash.no_update, dash.no_update
 
-    clicked = _extract_measure_point(clickData)
+    clicked = _extract_measure_point(clickData, anchor_enabled=bool(measure_anchor))
     if clicked is None:
         return dash.no_update, {
-            "text": "📏 Could not read that candle price. Try clicking near the candle body/close marker.",
+            "text": "📏 Could not read that candle price. Try clicking near a candle body/close marker, or turn Snap back On.",
             "first": None,
             "second": None
         }
@@ -5557,11 +6664,15 @@ def show_measure_result(result):
 @app.callback(
     Output("measure-hint", "children"),
     Input("measure-mode-store", "data"),
+    Input("measure-anchor-store", "data"),
+    Input("measure-hover-store", "data"),
     prevent_initial_call=False
 )
-def measure_hint(active):
+def measure_hint(active, anchor_enabled, hover_enabled):
     if active:
-        return "📏 Measure mode active: click one candle, then another. The chart measures close-price %, elapsed time, and candle count."
+        snap_text = "Snap On: clicks anchor to close-price helper points." if anchor_enabled else "Snap Off: close-price helper anchors are hidden; click directly on candle/trace points."
+        hover_text = "Hover On: chart tooltips/spike lines still show." if hover_enabled else "Hover Off: chart tooltips and spike lines are hidden for clean measuring."
+        return f"📏 Measure mode active: drag a rectangle/box on the chart like TradingView, or click two points. {snap_text} {hover_text}"
     return "Click Measure to enable the TradingView-style ruler."
 
 # ----- Strategy details modal callbacks (using data-action pattern) -----
@@ -5667,16 +6778,19 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Output("task-chart", "figure"),
     Input("chart-task-id", "data"),
     Input("rsi-visible-store", "data"),
+    Input("stochastic-visible-store", "data"),
     Input("volume-visible-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
     Input("measure-mode-store", "data"),
+    Input("measure-anchor-store", "data"),
+    Input("measure-hover-store", "data"),
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_anchor, measure_hover, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -5713,6 +6827,15 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
+    def compute_stochastic(high, low, close, k_length=14, d_length=1, smooth=3):
+        lowest_low = low.rolling(window=k_length, min_periods=k_length).min()
+        highest_high = high.rolling(window=k_length, min_periods=k_length).max()
+        price_range = (highest_high - lowest_low).replace(0, np.nan)
+        raw_k = (close - lowest_low) / price_range * 100
+        k_line = raw_k.rolling(window=smooth, min_periods=smooth).mean()
+        d_line = k_line.rolling(window=d_length, min_periods=d_length).mean()
+        return k_line, d_line
+
     has_volume = 'volume' in df.columns
     if volume_visible and has_volume:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
@@ -5724,13 +6847,15 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
             customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
         ), row=1, col=1)
-        # Invisible close-price points make the Measure tool reliable because
-        # candlestick clickData can omit a usable y/price value.
-        target_fig.add_trace(go.Scatter(
-            x=df['x'], y=df['close'], mode='markers',
-            name='_measure_click_points', showlegend=False, hoverinfo='skip',
-            marker=dict(size=18, color='rgba(0,0,0,0)')
-        ), row=1, col=1)
+        if measure_anchor:
+            # Invisible close-price points make the Measure tool reliable because
+            # candlestick clickData can omit a usable y/price value.  The Snap
+            # toggle hides these helper points when users do not want anchoring.
+            target_fig.add_trace(go.Scatter(
+                x=df['x'], y=df['close'], mode='markers',
+                name='_measure_click_points', showlegend=False, hoverinfo='skip',
+                marker=dict(size=18, color='rgba(0,0,0,0)')
+            ), row=1, col=1)
 
     def add_volume_trace(target_fig, row, title="Volume"):
         colors = np.where(df['close'] >= df['open'], '#26a69a', '#ef5350')
@@ -5741,63 +6866,81 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         ), row=row, col=1)
         target_fig.update_yaxes(title_text=title, row=row, col=1)
 
-    # Low-spec chart cache: compute RSI once per period view
+    def add_rsi_trace(target_fig, row):
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
+            line=dict(color='purple', width=1.5), connectgaps=True
+        ), row=row, col=1)
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=[50] * len(df), mode='lines',
+            name=f'_spike_helper_rsi_{row}', showlegend=False, hoverinfo='skip',
+            line=dict(width=1, color='rgba(0,0,0,0.01)')
+        ), row=row, col=1)
+        target_fig.add_hline(y=70, line_dash="dash", line_color="red", row=row, col=1)
+        target_fig.add_hline(y=30, line_dash="dash", line_color="green", row=row, col=1)
+        target_fig.update_yaxes(title_text="RSI", row=row, col=1, range=[0, 100])
+
+    def add_stochastic_trace(target_fig, row, k_col, d_col, title, color):
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df[k_col], mode='lines', name=f'{title} %K',
+            line=dict(color=color, width=1.4), connectgaps=True
+        ), row=row, col=1)
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
+            line=dict(color='#555', width=0.9, dash='dot'), connectgaps=True,
+            showlegend=False
+        ), row=row, col=1)
+        target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
+        target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
+        target_fig.update_yaxes(title_text=title, row=row, col=1, range=[0, 100])
+
+    # Low-spec chart cache: compute indicators once per period view
     cache_key = (start_ms, end_ms)
     if cache_key not in task._chart_cache:
         df['rsi'] = compute_rsi(df['close'])
+        df['stoch_k_14_1_3'], df['stoch_d_14_1_3'] = compute_stochastic(df['high'], df['low'], df['close'], 14, 1, 3)
+        df['stoch_k_40_1_4'], df['stoch_d_40_1_4'] = compute_stochastic(df['high'], df['low'], df['close'], 40, 1, 4)
+        df['stoch_k_60_1_10'], df['stoch_d_60_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 60, 1, 10)
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     else:
         df = task._chart_cache[cache_key]
     # Create figure
     volume_enabled = bool(volume_visible and has_volume)
-    if rsi_visible and volume_enabled:
-        fig = make_subplots(
-            rows=3, cols=1, shared_xaxes=True,
-            vertical_spacing=0.04, row_heights=[0.62, 0.20, 0.18]
-        )
-        add_main_candles(fig)
-        # RSI line
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
-            line=dict(color='purple', width=1.5), connectgaps=True
-        ), row=2, col=1)
-        # Helper trace on RSI (ensures hover line works – kept for consistency)
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=[50]*len(df), mode='lines',
-            name='_spike_helper_rsi', showlegend=False, hoverinfo='skip',
-            line=dict(width=1, color='rgba(0,0,0,0.01)')
-        ), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
-        add_volume_trace(fig, row=3)
-    elif rsi_visible:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.7, 0.3])
-        add_main_candles(fig)
-        # RSI line
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
-            line=dict(color='purple', width=1.5), connectgaps=True
-        ), row=2, col=1)
-        # Helper trace on RSI (ensures hover line works – kept for consistency)
-        fig.add_trace(go.Scatter(
-            x=df['x'], y=[50]*len(df), mode='lines',
-            name='_spike_helper_rsi', showlegend=False, hoverinfo='skip',
-            line=dict(width=1, color='rgba(0,0,0,0.01)')
-        ), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
-    elif volume_enabled:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.05, row_heights=[0.72, 0.28])
-        add_main_candles(fig)
-        add_volume_trace(fig, row=2)
-    else:
+    indicator_specs = []
+    if rsi_visible:
+        indicator_specs.append(("rsi", None))
+    if stochastic_visible:
+        indicator_specs.extend([
+            ("stoch", ("stoch_k_14_1_3", "stoch_d_14_1_3", "Stoch 14/1/3", "#1565c0")),
+            ("stoch", ("stoch_k_40_1_4", "stoch_d_40_1_4", "Stoch 40/1/4", "#ef6c00")),
+            ("stoch", ("stoch_k_60_1_10", "stoch_d_60_1_10", "Stoch 60/1/10", "#2e7d32")),
+        ])
+    if volume_enabled:
+        indicator_specs.append(("volume", None))
+
+    total_rows = 1 + len(indicator_specs)
+    if total_rows == 1:
         fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
-        add_main_candles(fig)
+    else:
+        indicator_height = 0.12 if stochastic_visible else 0.18
+        row_heights = [max(0.42, 1.0 - indicator_height * len(indicator_specs))]
+        row_heights.extend([indicator_height] * len(indicator_specs))
+        fig = make_subplots(
+            rows=total_rows, cols=1, shared_xaxes=True,
+            vertical_spacing=0.035, row_heights=row_heights
+        )
+    add_main_candles(fig)
+
+    current_row = 2
+    for indicator_type, indicator_data in indicator_specs:
+        if indicator_type == "rsi":
+            add_rsi_trace(fig, current_row)
+        elif indicator_type == "stoch":
+            add_stochastic_trace(fig, current_row, *indicator_data)
+        elif indicator_type == "volume":
+            add_volume_trace(fig, row=current_row)
+        current_row += 1
 
     if volume_visible and not has_volume:
         fig.add_annotation(
@@ -5832,7 +6975,7 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
             fig.add_trace(go.Scatter(
                 x=[event_dt], y=[ev.get('close', signal_price)],
                 mode='markers', marker=dict(size=10, color=color),
-                name=event_type, showlegend=False
+                name=event_type, showlegend=False, hoverinfo='skip'
             ), row=1, col=1)
     # Y-range for main chart (with padding)
     y_min = df['low'].min()
@@ -5844,14 +6987,14 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
     fig.add_trace(go.Scatter(
         x=[signal_dt, signal_dt], y=[y_min, y_max],
         mode='lines', line=dict(dash='dash', color='white', width=1),
-        name='Signal Time', showlegend=False
+        name='Signal Time', showlegend=False, hoverinfo='skip'
     ), row=1, col=1)
     # Signal diamond marker
     fig.add_trace(go.Scatter(
         x=[signal_dt], y=[task.signal_price],
         mode='markers',
         marker=dict(size=10, color='white', symbol='diamond', line=dict(width=1, color='yellow')),
-        name='Signal Time Marker', showlegend=False
+        name='Signal Time Marker', showlegend=False, hoverinfo='skip'
     ), row=1, col=1)
     # ----- Strategy markers (separate: impulse vs other) -----
     if hasattr(task, 'strategy_signals') and task.strategy_signals:
@@ -5869,7 +7012,7 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
                     x=[sig_time], y=[sig['entry_price']],
                     mode='markers', marker=marker,
                     name=f"{sig['type']} {sig['direction']}",
-                    showlegend=False
+                    showlegend=False, hoverinfo='skip'
                 ), row=1, col=1)
         # Impulse signals – only if impulse_visible is True
         if impulse_visible:
@@ -5884,22 +7027,40 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
                     name=f"Impulse {sig['direction']}",
                     showlegend=False,
                     text=sig.get('extra_info', ''),
-                    hoverinfo='text+y'
+                    hoverinfo='skip'
                 ), row=1, col=1)
     # TradingView-style measurement overlay: first click marker, then a ruler
     # line with a compact result label after the second click.
     measure_first = None
     measure_second = None
     measure_text = ""
+    measure_shape = None
     if isinstance(measure_result, dict) and measure_result.get('task_id') == task_id:
         measure_first = measure_result.get('first')
         measure_second = measure_result.get('second')
         measure_text = measure_result.get('text', '')
+        measure_shape = measure_result.get('shape')
     if isinstance(measure_points, dict) and measure_points.get('task_id') == task_id:
         measure_first = measure_points.get('first') or measure_first
         measure_second = measure_points.get('second') or measure_second
 
-    if measure_mode and measure_first and not measure_second:
+    if measure_shape:
+        fig.add_shape(
+            type="rect",
+            x0=measure_shape["x0"], x1=measure_shape["x1"],
+            y0=measure_shape["y0"], y1=measure_shape["y1"],
+            xref="x", yref="y",
+            line=dict(color="#1976d2", width=2, dash="dot"),
+            fillcolor="rgba(25,118,210,0.08)",
+        )
+        short_text = measure_text.replace('📦 ', '')
+        fig.add_annotation(
+            x=measure_shape["x1"], y=measure_shape["y1"], xref='x', yref='y',
+            text=short_text, showarrow=True, arrowhead=2, ax=40, ay=-40,
+            bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
+            font=dict(color='white', size=11)
+        )
+    elif measure_mode and measure_first and not measure_second:
         fig.add_trace(go.Scatter(
             x=[measure_first['x']], y=[measure_first['y']],
             mode='markers', showlegend=False, name='Measure start',
@@ -5928,10 +7089,13 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         xaxis_rangeslider_visible=False,
         template="plotly_white",
-        hovermode="x unified",
+        hovermode=("closest" if (not measure_mode or measure_hover) else False),
+        hoverdistance=6,
+        spikedistance=6,
         clickmode="event+select",
-        dragmode="pan",
-        height=780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500),
+        dragmode="drawrect" if measure_mode else "pan",
+        newshape=dict(line_color="#1976d2", fillcolor="rgba(25,118,210,0.08)", opacity=0.35),
+        height=980 if stochastic_visible else (780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500)),
         margin=dict(l=50, r=50, t=50, b=50)
     )
     # X-axis tick format and native Plotly spike lines.
@@ -5941,12 +7105,17 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
         tickformat="%H:%M",
         ticklabelmode="period",
         ticks="outside",
-        showspikes=True,
+        showspikes=bool(not measure_mode or measure_hover),
         spikemode="across",
         spikesnap="cursor",
         spikethickness=1,
         spikedash="dash"
     )
+    if measure_mode and not measure_hover:
+        # Clean measurement mode: hide all hover labels, event-marker tooltips,
+        # signal marker tooltips, and helper-trace hover boxes so nothing covers
+        # the exact chart point being measured.
+        fig.update_traces(hoverinfo="skip", hovertemplate=None)
     return fig
 
 # =============================================================================
@@ -5957,6 +7126,1186 @@ def update_task_chart(task_id, rsi_visible, volume_visible, strategy_visible, im
 # =============================================================================
 
 # ----- Impulse callbacks -----
+# =============================================================================
+# 18. CALLBACKS: IMPULSE / STRATEGY DETAILS AND OPTIMIZATION UI
+# =============================================================================
+# UI around strategy/impulse parameters, details, grid search, and walk-forward.
+# Core detection remains in strategies.py / impulse.py or task analysis helpers.
+# =============================================================================
+
+def parse_dynamic_percent_levels(text, default_levels=(0.5, 1.0, 2.0, 4.0)):
+    """Parse comma/space separated positive percent levels for dynamic diagnostics."""
+    if text is None or str(text).strip() == "":
+        return list(default_levels)
+    levels = []
+    for raw_part in re.split(r"[,;\s]+", str(text)):
+        part = raw_part.strip().replace("%", "").replace("+", "")
+        if not part:
+            continue
+        value = float(part)
+        if value <= 0:
+            raise ValueError("Percent levels must be greater than 0.")
+        levels.append(value)
+    if not levels:
+        return list(default_levels)
+    return sorted(set(levels))
+
+
+def parse_dynamic_nonnegative_percent_levels(text, default_levels=(0.0,)):
+    """Parse comma/space separated non-negative percent levels for offset grids."""
+    if text is None or str(text).strip() == "":
+        return list(default_levels)
+    levels = []
+    for raw_part in re.split(r"[,;\s]+", str(text)):
+        part = raw_part.strip().replace("%", "").replace("+", "")
+        if not part:
+            continue
+        value = float(part)
+        if value < 0:
+            raise ValueError("Percent levels must be 0 or greater.")
+        levels.append(value)
+    if not levels:
+        return list(default_levels)
+    return sorted(set(levels))
+
+
+def parse_dynamic_stop_rules(text):
+    """Parse trigger%:stop-profit% pairs for dynamic stop movement diagnostics."""
+    if text is None or str(text).strip() == "":
+        return []
+    rules = []
+    for raw_rule in re.split(r"[,;]+", str(text)):
+        rule = raw_rule.strip()
+        if not rule:
+            continue
+        if ":" not in rule:
+            raise ValueError("Dynamic stop rules must use trigger:stop format, e.g. 1:0.5.")
+        trigger_text, stop_text = rule.split(":", 1)
+        trigger_pct = float(trigger_text.strip().replace("%", "").replace("+", ""))
+        stop_profit_pct = float(stop_text.strip().replace("%", "").replace("+", ""))
+        if trigger_pct <= 0:
+            raise ValueError("Dynamic stop trigger levels must be greater than 0.")
+        rules.append((trigger_pct, stop_profit_pct))
+    return sorted(set(rules), key=lambda item: item[0])
+
+
+# =============================================================================
+# 18A. READ-ONLY STRATEGY CHECKUP HELPERS
+# =============================================================================
+# Keep experimental diagnostics here: parse UI settings -> build raw candle path
+# -> evaluate a scenario -> render summary rows. These helpers should not mutate
+# DownloadTask analysis fields. Future curves/strategies should extend the spec
+# and source/path builders in this section rather than mixing diagnostics into
+# chart rendering, task-table rendering, or DownloadTask.analyze_signal().
+# =============================================================================
+
+def fmt_dynamic_level_label(level):
+    """Format dynamic diagnostic percent labels."""
+    try:
+        level = float(level)
+    except Exception:
+        return str(level)
+    if level >= 4:
+        return f"{level:g}%+"
+    return f"{level:g}%"
+
+
+def is_task_eligible_for_dynamic_checkup(task):
+    """Return False before parquet access for tasks that are not ready for diagnostics.
+
+    Important wording: incomplete tasks and older JSON records with missing newer
+    derived fields are not "corrupted"; they are simply not eligible for this
+    completed-task diagnostic until recalculation/download finishes.
+    """
+    if task is None:
+        return False
+    status = str(getattr(task, "status", "") or "").lower()
+    if status != "completed":
+        return False
+    if any(token in status for token in ("corrupt", "failed", "error")):
+        return False
+    for flag_name in ("corrupted", "is_corrupted", "data_corrupted", "json_corrupted", "load_corrupted"):
+        if bool(getattr(task, flag_name, False)):
+            return False
+    return True
+
+
+def build_dynamic_checkup_path(task):
+    """Load and normalize one task's raw candle path once for fast scenario grids."""
+    if not is_task_eligible_for_dynamic_checkup(task):
+        return None
+    if task is None or getattr(task, "signal_time", None) is None or getattr(task, "signal_price", None) is None:
+        return None
+    if getattr(task, "signal_direction", None) not in ("resistance", "support"):
+        return None
+    df = load_task_data_cached(task)
+    if df is None or df.empty:
+        return None
+    df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+    entry_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
+    if entry_idx >= len(df_sorted):
+        return None
+    entry_row = df_sorted.iloc[entry_idx]
+    entry_price = entry_row.get("open", entry_row.get("close"))
+    if entry_price is None or (isinstance(entry_price, (float, np.floating)) and is_na(entry_price)):
+        return None
+    entry_price = float(entry_price)
+    signal_price = float(task.signal_price)
+    if entry_price <= 0 or signal_price <= 0:
+        return None
+    path_df = df_sorted.iloc[entry_idx:][["high", "low"]].astype(float)
+    return {
+        "direction": "buy" if task.signal_direction == "resistance" else "sell",
+        "entry_price": entry_price,
+        "signal_price": signal_price,
+        "highs": path_df["high"].to_numpy(copy=False),
+        "lows": path_df["low"].to_numpy(copy=False),
+        "entry_level_distance_pct": abs(signal_price - entry_price) / entry_price * 100,
+    }
+
+
+def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
+    """Evaluate one preloaded path for a specific SL/DD/trailing-stop scenario."""
+    result = {
+        "valid": False,
+        "level_reached": False,
+        "stop_hit": False,
+        "max_dd_hit": False,
+        "stopped_before_level": False,
+        "stop_after_tp": False,
+        "tp_hits": set(),
+        "stop_moves": set(),
+        "entry_level_distance_pct": None,
+        "max_move_pct": 0.0,
+        "exit_return_pct": None,
+        "exit_reason": "open",
+    }
+    if not path:
+        return result
+
+    direction = path["direction"]
+    entry_price = path["entry_price"]
+    signal_price = path["signal_price"]
+    result["valid"] = True
+    result["entry_level_distance_pct"] = path["entry_level_distance_pct"]
+
+    stop_loss_pct = max(0.0, float(stop_loss_pct or 0.0))
+    current_stop_return_pct = -stop_loss_pct
+    stop_price = entry_price * (1 - stop_loss_pct / 100) if direction == "buy" else entry_price * (1 + stop_loss_pct / 100)
+    max_dd_pct = float(max_dd_pct or 0.0)
+    max_dd_price = None
+    if max_dd_pct > 0:
+        max_dd_price = entry_price * (1 - max_dd_pct / 100) if direction == "buy" else entry_price * (1 + max_dd_pct / 100)
+
+    for high, low in zip(path["highs"], path["lows"]):
+        if direction == "buy":
+            # If max-DD is tighter than the initial/trailing stop, classify the
+            # adverse exit as DD cap first. This keeps scenario-grid counts
+            # intuitive when users test max adverse DD below the stop-loss distance.
+            max_dd_is_tighter = max_dd_price is not None and max_dd_price >= stop_price
+            if max_dd_is_tighter and low <= max_dd_price:
+                result["max_dd_hit"] = True
+                result["exit_return_pct"] = -max_dd_pct
+                result["exit_reason"] = "max_adverse_dd"
+                break
+            if low <= stop_price:
+                result["stop_hit"] = True
+                result["exit_return_pct"] = current_stop_return_pct
+                result["exit_reason"] = "stop"
+                break
+            if max_dd_price is not None and low <= max_dd_price:
+                result["max_dd_hit"] = True
+                result["exit_return_pct"] = -max_dd_pct
+                result["exit_reason"] = "max_adverse_dd"
+                break
+            move_pct = (high - entry_price) / entry_price * 100
+            if high >= signal_price:
+                result["level_reached"] = True
+        else:
+            max_dd_is_tighter = max_dd_price is not None and max_dd_price <= stop_price
+            if max_dd_is_tighter and high >= max_dd_price:
+                result["max_dd_hit"] = True
+                result["exit_return_pct"] = -max_dd_pct
+                result["exit_reason"] = "max_adverse_dd"
+                break
+            if high >= stop_price:
+                result["stop_hit"] = True
+                result["exit_return_pct"] = current_stop_return_pct
+                result["exit_reason"] = "stop"
+                break
+            if max_dd_price is not None and high >= max_dd_price:
+                result["max_dd_hit"] = True
+                result["exit_return_pct"] = -max_dd_pct
+                result["exit_reason"] = "max_adverse_dd"
+                break
+            move_pct = (entry_price - low) / entry_price * 100
+            if low <= signal_price:
+                result["level_reached"] = True
+
+        result["max_move_pct"] = max(result["max_move_pct"], move_pct)
+        for level in tp_levels:
+            if move_pct >= level:
+                result["tp_hits"].add(level)
+
+        for trigger_pct, stop_profit_pct in stop_rules:
+            if move_pct < trigger_pct:
+                continue
+            if direction == "buy":
+                candidate_stop = entry_price * (1 + stop_profit_pct / 100)
+                if candidate_stop > stop_price:
+                    stop_price = candidate_stop
+                    current_stop_return_pct = stop_profit_pct
+                    result["stop_moves"].add(trigger_pct)
+            else:
+                candidate_stop = entry_price * (1 - stop_profit_pct / 100)
+                if candidate_stop < stop_price:
+                    stop_price = candidate_stop
+                    current_stop_return_pct = stop_profit_pct
+                    result["stop_moves"].add(trigger_pct)
+
+    result["stopped_before_level"] = bool((result["stop_hit"] or result["max_dd_hit"]) and not result["level_reached"])
+    result["stop_after_tp"] = bool((result["stop_hit"] or result["max_dd_hit"]) and len(result["tp_hits"]) > 0)
+    return result
+
+
+def analyze_dynamic_path_milestones(path):
+    """Read-only path milestones independent of the active SL/DD scenario."""
+    result = {
+        "valid": False,
+        "tp05": False,
+        "tp1": False,
+        "dd05": False,
+        "dd05_before_tp1": False,
+        "tp1_before_dd05": False,
+        "entry_return_after_tp05": False,
+        "entry_return_after_tp1": False,
+        "dd05_after_tp05": False,
+        "dd05_after_tp1": False,
+        "tp1_before_entry_return_after_tp05": False,
+    }
+    if not path:
+        return result
+
+    direction = path["direction"]
+    entry_price = path["entry_price"]
+    result["valid"] = True
+    tp05_seen = False
+    tp1_seen = False
+    entry_return_after_tp05_seen = False
+
+    for high, low in zip(path["highs"], path["lows"]):
+        if direction == "buy":
+            favorable_pct = (high - entry_price) / entry_price * 100
+            adverse_pct = (entry_price - low) / entry_price * 100
+            returned_entry = low <= entry_price
+        else:
+            favorable_pct = (entry_price - low) / entry_price * 100
+            adverse_pct = (high - entry_price) / entry_price * 100
+            returned_entry = high >= entry_price
+
+        if adverse_pct >= 0.5:
+            result["dd05"] = True
+            if not tp1_seen:
+                result["dd05_before_tp1"] = True
+            if tp05_seen:
+                result["dd05_after_tp05"] = True
+            if tp1_seen:
+                result["dd05_after_tp1"] = True
+
+        if favorable_pct >= 0.5:
+            result["tp05"] = True
+            tp05_seen = True
+
+        if tp05_seen and returned_entry:
+            result["entry_return_after_tp05"] = True
+            entry_return_after_tp05_seen = True
+
+        if favorable_pct >= 1.0:
+            result["tp1"] = True
+            if not result["dd05"]:
+                result["tp1_before_dd05"] = True
+            if not entry_return_after_tp05_seen:
+                result["tp1_before_entry_return_after_tp05"] = True
+            tp1_seen = True
+
+        if tp1_seen and returned_entry:
+            result["entry_return_after_tp1"] = True
+
+    return result
+
+
+def simulate_dynamic_checkup_for_task(task, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
+    """Run a read-only raw-candle diagnostic for one task without mutating task fields."""
+    path = build_dynamic_checkup_path(task)
+    return evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules)
+
+
+def normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct):
+    """Normalize diagnostic expectancy settings used by strategy checkups."""
+    notional = max(0.0, float(notional_usd if notional_usd is not None else 1000.0))
+    costs = max(0.0, float(round_trip_cost_pct if round_trip_cost_pct is not None else 0.0))
+    open_return = float(open_return_pct if open_return_pct is not None else 0.0)
+    return notional, costs, open_return
+
+
+def get_diagnostic_net_return_pct(result, round_trip_cost_pct=0.0, open_return_pct=0.0):
+    """Estimate net percent return for a simulated diagnostic result.
+
+    TP levels in these checkups are checkpoints, not forced exits. Realized return
+    therefore comes from SL/trailing-stop/DD-cap exits; still-open paths use the
+    configurable open/no-exit fallback return. Round-trip costs are subtracted
+    from every valid simulated trade.
+    """
+    if not result or not result.get("valid"):
+        return None
+    gross_return = result.get("exit_return_pct")
+    if gross_return is None:
+        gross_return = open_return_pct
+    return float(gross_return) - float(round_trip_cost_pct or 0.0)
+
+
+def build_expectancy_summary_rows(results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Estimated"):
+    """Build copyable net-expectancy diagnostic rows for a strategy summary."""
+    valid_results = [r for r in results if r and r.get("valid")]
+    total = len(valid_results)
+
+    def money(value):
+        return f"${value:,.2f}"
+
+    if not total:
+        return [
+            html.Tr([html.Td(f"{label_prefix} net expectancy", style=td_style), html.Td("0 / 0", style=td_style)]),
+        ]
+
+    net_returns = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in valid_results]
+    net_returns = [r for r in net_returns if r is not None]
+    gross_returns = [float(r.get("exit_return_pct") if r.get("exit_return_pct") is not None else open_return_pct) for r in valid_results]
+    gross_profit_pct = sum(r for r in gross_returns if r > 0)
+    gross_loss_pct = abs(sum(r for r in gross_returns if r < 0))
+    profit_factor = "∞" if gross_loss_pct == 0 and gross_profit_pct > 0 else (f"{gross_profit_pct / gross_loss_pct:.2f}" if gross_loss_pct else "n/a")
+
+    avg_net_pct = sum(net_returns) / total
+    total_net_pct = sum(net_returns)
+    total_profit_usd = total_net_pct / 100 * notional_usd
+    winners = sum(1 for r in net_returns if r > 0)
+    losers = sum(1 for r in net_returns if r < 0)
+    flat = total - winners - losers
+    open_count = sum(1 for r in valid_results if r.get("exit_return_pct") is None)
+
+    return [
+        html.Tr([html.Td("— Net expectancy / money estimate —", style=td_style), html.Td("Diagnostic only; TP rows are checkpoints unless your dynamic stop closes later", style=td_style)]),
+        html.Tr([html.Td("Notional per trade", style=td_style), html.Td(money(notional_usd), style=td_style)]),
+        html.Tr([html.Td("Round-trip costs", style=td_style), html.Td(f"{round_trip_cost_pct:g}% subtracted from every trade", style=td_style)]),
+        html.Tr([html.Td("Open/no-exit fallback", style=td_style), html.Td(f"{open_return_pct:g}% used for {open_count} open paths", style=td_style)]),
+        html.Tr([html.Td(f"{label_prefix} avg net return / trade", style=td_style), html.Td(f"{avg_net_pct:.3f}%", style=td_style)]),
+        html.Tr([html.Td(f"{label_prefix} total net return sum", style=td_style), html.Td(f"{total_net_pct:.2f}% across {total} trades", style=td_style)]),
+        html.Tr([html.Td(f"{label_prefix} total net P/L", style=td_style), html.Td(money(total_profit_usd), style=td_style)]),
+        html.Tr([html.Td("Net winners / losers / flat", style=td_style), html.Td(f"{winners} / {losers} / {flat}", style=td_style)]),
+        html.Tr([html.Td("Gross profit factor before costs", style=td_style), html.Td(profit_factor, style=td_style)]),
+    ]
+
+
+def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, be_grid=None, dd_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
+    """Build an on-demand summary table from raw dynamic-check diagnostic results."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
+    notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
+    total_tasks = len(tasks)
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    paths = [build_dynamic_checkup_path(t) for t in eligible_tasks]
+    valid_paths = [p for p in paths if p]
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+    milestones = [analyze_dynamic_path_milestones(p) for p in valid_paths]
+    valid_results = [r for r in results if r["valid"]]
+    valid_milestones = [m for m in milestones if m["valid"]]
+    valid_total = len(valid_results)
+
+    def fmt_stat(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
+
+    def scenario_summary_row(label, scenario_results):
+        scenario_total = len(scenario_results)
+        reached = sum(1 for r in scenario_results if r["level_reached"])
+        stopped = sum(1 for r in scenario_results if r["stop_hit"])
+        max_dd = sum(1 for r in scenario_results if r["max_dd_hit"])
+        tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
+        stop_moved = sum(1 for r in scenario_results if r["stop_moves"])
+        avg_net = 0.0
+        total_net_usd = 0.0
+        if scenario_total:
+            scenario_net = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in scenario_results]
+            scenario_net = [r for r in scenario_net if r is not None]
+            avg_net = sum(scenario_net) / scenario_total
+            total_net_usd = sum(scenario_net) / 100 * notional_usd
+        return html.Tr([
+            html.Td(label, style=td_style),
+            html.Td(
+                f"level {fmt_stat(reached, scenario_total)} | "
+                f"TP0.5 {fmt_stat(tp05, scenario_total)} | "
+                f"SL {fmt_stat(stopped, scenario_total)} | "
+                f"adverse DD cap {fmt_stat(max_dd, scenario_total)} | "
+                f"stop moved {fmt_stat(stop_moved, scenario_total)} | "
+                f"avg net {avg_net:.3f}% | "
+                f"net P/L ${total_net_usd:,.2f}",
+                style=td_style,
+            ),
+        ])
+
+    stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
+    level_reached = sum(1 for r in valid_results if r["level_reached"])
+    stopped_before_level = sum(1 for r in valid_results if r["stopped_before_level"])
+    stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
+    stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    raw_tp05 = sum(1 for m in valid_milestones if m["tp05"])
+    raw_tp1 = sum(1 for m in valid_milestones if m["tp1"])
+    raw_dd05 = sum(1 for m in valid_milestones if m["dd05"])
+    raw_dd05_before_tp1 = sum(1 for m in valid_milestones if m["dd05_before_tp1"])
+    raw_tp1_before_dd05 = sum(1 for m in valid_milestones if m["tp1_before_dd05"])
+    raw_entry_return_after_tp05 = sum(1 for m in valid_milestones if m["entry_return_after_tp05"])
+    raw_entry_return_after_tp1 = sum(1 for m in valid_milestones if m["entry_return_after_tp1"])
+    raw_dd05_after_tp05 = sum(1 for m in valid_milestones if m["dd05_after_tp05"])
+    raw_dd05_after_tp1 = sum(1 for m in valid_milestones if m["dd05_after_tp1"])
+    raw_tp1_before_entry_return_after_tp05 = sum(1 for m in valid_milestones if m["tp1_before_entry_return_after_tp05"])
+
+    distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
+    distance_counts = {r: 0 for r in distance_ranges}
+    for result in valid_results:
+        bucket = get_toward_distance_bucket(result["entry_level_distance_pct"])
+        if bucket:
+            distance_counts[bucket] += 1
+
+    rows = [
+        html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
+        html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
+        html.Tr([html.Td("Valid dynamic cases with candle data", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Reached signal level", style=td_style), html.Td(fmt_stat(level_reached, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stopped before level", style=td_style), html.Td(fmt_stat(stopped_before_level, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 0-1%", style=td_style), html.Td(" | ".join(f"{r}:{distance_counts[r]}" for r in distance_ranges[:3]), style=td_style)]),
+        html.Tr([html.Td("Entry→Level dist 1%+", style=td_style), html.Td(" | ".join(f"{r}:{distance_counts[r]}" for r in distance_ranges[3:]), style=td_style)]),
+    ]
+
+    rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Dynamic scenario"))
+
+    reached_results = [r for r in valid_results if r["level_reached"]]
+    stopped_results = [r for r in valid_results if r["stopped_before_level"]]
+    for level in tp_levels:
+        label = fmt_dynamic_level_label(level)
+        tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
+        tp_reached = sum(1 for r in reached_results if level in r["tp_hits"])
+        tp_stopped = sum(1 for r in stopped_results if level in r["tp_hits"])
+        rows.extend([
+            html.Tr([html.Td(f"TP {label} found", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]),
+            html.Tr([html.Td(f"TP {label} conditional over reached level", style=td_style), html.Td(fmt_stat(tp_reached, len(reached_results)), style=td_style)]),
+            html.Tr([html.Td(f"TP {label} while stopped before level", style=td_style), html.Td(fmt_stat(tp_stopped, len(stopped_results)), style=td_style)]),
+        ])
+
+    rows.extend([
+        html.Tr([html.Td("Raw path touched adverse DD 0.5% from entry", style=td_style), html.Td(fmt_stat(raw_dd05, valid_total), style=td_style)]),
+        html.Tr([html.Td("Raw path adverse DD 0.5% before TP1", style=td_style), html.Td(fmt_stat(raw_dd05_before_tp1, valid_total), style=td_style)]),
+        html.Tr([html.Td("Raw path TP1 before adverse DD 0.5%", style=td_style), html.Td(fmt_stat(raw_tp1_before_dd05, valid_total), style=td_style)]),
+        html.Tr([html.Td("After TP0.5 returned to entry", style=td_style), html.Td(fmt_stat(raw_entry_return_after_tp05, raw_tp05), style=td_style)]),
+        html.Tr([html.Td("After TP1 returned to entry", style=td_style), html.Td(fmt_stat(raw_entry_return_after_tp1, raw_tp1), style=td_style)]),
+        html.Tr([html.Td("After TP0.5 touched adverse DD 0.5%", style=td_style), html.Td(fmt_stat(raw_dd05_after_tp05, raw_tp05), style=td_style)]),
+        html.Tr([html.Td("After TP1 touched adverse DD 0.5%", style=td_style), html.Td(fmt_stat(raw_dd05_after_tp1, raw_tp1), style=td_style)]),
+        html.Tr([html.Td("TP1 before entry return after TP0.5", style=td_style), html.Td(fmt_stat(raw_tp1_before_entry_return_after_tp05, raw_tp05), style=td_style)]),
+    ])
+
+    for trigger_pct, stop_profit_pct in stop_rules:
+        moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
+        rows.append(html.Tr([
+            html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style),
+            html.Td(fmt_stat(moved, valid_total), style=td_style),
+        ]))
+
+    sl_grid = sl_grid or []
+    if sl_grid:
+        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same TP levels and dynamic stop rules; max adverse DD unchanged", style=td_style)]))
+        for sl_pct in sl_grid:
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+            rows.append(scenario_summary_row(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", scenario_results))
+
+    be_grid = be_grid or []
+    if be_grid:
+        rows.append(html.Tr([html.Td("— Breakeven arm grid —", style=td_style), html.Td("Move stop to entry when favorable move reaches trigger; initial SL/max adverse DD unchanged", style=td_style)]))
+        for arm_pct in be_grid:
+            scenario_rules = sorted(set(list(stop_rules) + [(arm_pct, 0.0)]), key=lambda item: item[0])
+            scenario_results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, scenario_rules) for p in valid_paths]
+            rows.append(scenario_summary_row(f"BE after {fmt_dynamic_level_label(arm_pct)}", scenario_results))
+
+    dd_grid = dd_grid or []
+    if dd_grid:
+        rows.append(html.Tr([html.Td("— Max adverse DD cap grid —", style=td_style), html.Td("Initial SL, TP levels, and dynamic stop rules unchanged", style=td_style)]))
+        for dd_pct in dd_grid:
+            scenario_results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, dd_pct, tp_levels, stop_rules) for p in valid_paths]
+            rows.append(scenario_summary_row(f"Max adverse DD cap {fmt_dynamic_level_label(dd_pct)}", scenario_results))
+
+    return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+
+
+def build_level_reversal_source(task):
+    """Preload one task once for level-reversal offset/grid diagnostics."""
+    if not is_task_eligible_for_dynamic_checkup(task):
+        return None
+    if task is None or getattr(task, "signal_time", None) is None or getattr(task, "signal_price", None) is None:
+        return None
+    if getattr(task, "signal_direction", None) not in ("resistance", "support"):
+        return None
+
+    df = load_task_data_cached(task)
+    if df is None or df.empty:
+        return None
+
+    signal_price = float(task.signal_price)
+    if signal_price <= 0:
+        return None
+
+    df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+    search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
+    if search_idx >= len(df_sorted):
+        return None
+    path_df = df_sorted.iloc[search_idx:][["high", "low"]].astype(float)
+    if path_df.empty:
+        return None
+
+    return {
+        "level_kind": task.signal_direction,
+        "direction": "sell" if task.signal_direction == "resistance" else "buy",
+        "signal_price": signal_price,
+        "highs": path_df["high"].to_numpy(copy=False),
+        "lows": path_df["low"].to_numpy(copy=False),
+    }
+
+
+def build_level_reversal_path_from_source(source, entry_offset_pct=0.0):
+    """Build one offset path from a preloaded level-reversal source."""
+    if not source:
+        return None
+    entry_offset_pct = max(0.0, float(entry_offset_pct or 0.0))
+    signal_price = float(source["signal_price"])
+    if signal_price <= 0:
+        return None
+
+    if source["level_kind"] == "resistance":
+        direction = "sell"
+        entry_price = signal_price * (1 + entry_offset_pct / 100)
+        trigger_mask = source["highs"] >= entry_price
+    else:
+        direction = "buy"
+        entry_price = signal_price * (1 - entry_offset_pct / 100)
+        trigger_mask = source["lows"] <= entry_price
+
+    trigger_positions = np.flatnonzero(trigger_mask)
+    if len(trigger_positions) == 0:
+        return None
+
+    trigger_idx = int(trigger_positions[0])
+    highs = source["highs"][trigger_idx:]
+    lows = source["lows"][trigger_idx:]
+    if len(highs) == 0 or entry_price <= 0:
+        return None
+
+    return {
+        "direction": direction,
+        "entry_price": entry_price,
+        "signal_price": signal_price,
+        "highs": highs,
+        "lows": lows,
+        "entry_offset_pct": entry_offset_pct,
+        "entry_level_distance_pct": entry_offset_pct,
+    }
+
+
+def build_level_reversal_path(task, entry_offset_pct=0.0):
+    """Build a raw path for the opposite trade after level touch/overshoot."""
+    return build_level_reversal_path_from_source(build_level_reversal_source(task), entry_offset_pct)
+
+
+
+def compute_dynamic_rsi_series(close, period=14):
+    """Compute RSI for diagnostic oscillator checkups."""
+    close = pd.Series(close, dtype="float64")
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_dynamic_stochastic_series(high, low, close, k_length, d_length=1, smooth=3):
+    """Compute the chart-style stochastic %K/%D diagnostic lines."""
+    high = pd.Series(high, dtype="float64")
+    low = pd.Series(low, dtype="float64")
+    close = pd.Series(close, dtype="float64")
+    lowest_low = low.rolling(window=k_length, min_periods=k_length).min()
+    highest_high = high.rolling(window=k_length, min_periods=k_length).max()
+    price_range = (highest_high - lowest_low).replace(0, np.nan)
+    raw_k = (close - lowest_low) / price_range * 100
+    k_line = raw_k.rolling(window=smooth, min_periods=smooth).mean()
+    d_line = k_line.rolling(window=d_length, min_periods=d_length).mean()
+    return k_line, d_line
+
+
+def normalize_oscillator_condition(condition):
+    allowed = {"cross_down", "cross_up", "above", "below", "disabled"}
+    return condition if condition in allowed else "disabled"
+
+
+def oscillator_condition_met(values, idx, level, condition):
+    """Evaluate one oscillator condition at index idx."""
+    condition = normalize_oscillator_condition(condition)
+    if condition == "disabled":
+        return True
+    if idx < 0 or idx >= len(values):
+        return False
+    current = values[idx]
+    if pd.isna(current):
+        return False
+    level = float(level if level is not None else 0.0)
+    if condition == "above":
+        return current >= level
+    if condition == "below":
+        return current <= level
+    if idx == 0 or pd.isna(values[idx - 1]):
+        return False
+    previous = values[idx - 1]
+    if condition == "cross_down":
+        return previous > level and current <= level
+    if condition == "cross_up":
+        return previous < level and current >= level
+    return False
+
+
+def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
+    """Build normalized oscillator condition specs from UI values."""
+    return [
+        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "RSI(14,14)", "column": "rsi_14_14", "level": float(rsi_level if rsi_level is not None else default_rsi_level), "condition": normalize_oscillator_condition(rsi_condition)},
+    ]
+
+
+def build_oscillator_spec_groups(up_inputs, down_inputs):
+    """Build UP-toward and DOWN-toward oscillator specs without reading rendered table HTML."""
+    return {
+        "up": build_oscillator_specs(*up_inputs, default_stoch_level=87.0, default_rsi_level=70.0),
+        "down": build_oscillator_specs(*down_inputs, default_stoch_level=13.0, default_rsi_level=30.0),
+    }
+
+
+def select_oscillator_specs_for_source(source, oscillator_specs):
+    """Select oscillator group by reliable task/source direction: resistance=up, support=down."""
+    if isinstance(oscillator_specs, dict):
+        group_key = source.get("toward_direction", "up") if source else "up"
+        return oscillator_specs.get(group_key) or oscillator_specs.get("up") or []
+    return oscillator_specs or []
+
+
+def format_oscillator_specs(specs):
+    if isinstance(specs, dict):
+        return " | ".join([
+            f"UP-toward: {format_oscillator_specs(specs.get('up', []))}",
+            f"DOWN-toward: {format_oscillator_specs(specs.get('down', []))}",
+        ])
+    parts = []
+    for spec in specs:
+        if spec["condition"] == "disabled":
+            continue
+        parts.append(f"{spec['label']} {spec['condition'].replace('_', ' ')} {spec['level']:g}")
+    return "; ".join(parts) if parts else "all oscillator filters disabled"
+
+
+def make_oscillator_reversal_source_cache_key(task):
+    """Return a stable cache key for oscillator source data derived from one task snapshot."""
+    return (
+        getattr(task, "task_id", None),
+        getattr(task, "signal_time", None),
+        getattr(task, "signal_price", None),
+        getattr(task, "signal_direction", None),
+        getattr(task, "start_date", None),
+        getattr(task, "end_date", None),
+        getattr(task, "status", None),
+    )
+
+
+def build_oscillator_reversal_source_uncached(task):
+    """Preload candles and chart-matching oscillator lines for level-cross oscillator reversal diagnostics."""
+    if not is_task_eligible_for_dynamic_checkup(task):
+        return None
+    if task is None or getattr(task, "signal_time", None) is None or getattr(task, "signal_price", None) is None:
+        return None
+    if getattr(task, "signal_direction", None) not in ("resistance", "support"):
+        return None
+
+    df = load_task_data_cached(task)
+    if df is None or df.empty:
+        return None
+    required = {"timestamp", "high", "low", "close"}
+    if not required.issubset(df.columns):
+        return None
+
+    signal_price = float(task.signal_price)
+    if signal_price <= 0:
+        return None
+
+    df_sorted = df.sort_values("timestamp").reset_index(drop=True).copy()
+    for col in ["high", "low", "close"]:
+        df_sorted[col] = pd.to_numeric(df_sorted[col], errors="coerce")
+    df_sorted["stoch_k_14_1_3"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
+    df_sorted["stoch_k_40_1_4"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
+    df_sorted["stoch_k_60_1_10"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
+    df_sorted["rsi_14_14"] = compute_dynamic_rsi_series(df_sorted["close"], 14).rolling(window=14, min_periods=1).mean()
+
+    search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
+    if search_idx >= len(df_sorted):
+        return None
+    path_df = df_sorted.iloc[search_idx:].reset_index(drop=True)
+    if path_df.empty:
+        return None
+
+    return {
+        "level_kind": task.signal_direction,
+        "toward_direction": "up" if task.signal_direction == "resistance" else "down",
+        "direction": "sell" if task.signal_direction == "resistance" else "buy",
+        "signal_price": signal_price,
+        "df": path_df,
+    }
+
+
+def build_oscillator_reversal_source(task):
+    """Return a bounded cached oscillator source for fast repeated checkup runs."""
+    cache_key = make_oscillator_reversal_source_cache_key(task)
+    if cache_key in oscillator_reversal_source_cache:
+        oscillator_reversal_source_cache.move_to_end(cache_key)
+        return oscillator_reversal_source_cache[cache_key]
+    source = build_oscillator_reversal_source_uncached(task)
+    oscillator_reversal_source_cache[cache_key] = source
+    oscillator_reversal_source_cache.move_to_end(cache_key)
+    while len(oscillator_reversal_source_cache) > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX:
+        oscillator_reversal_source_cache.popitem(last=False)
+    return source
+
+
+def build_oscillator_reversal_path_from_source(source, oscillator_specs):
+    """Build a reversal path after level cross and oscillator confirmation."""
+    if not source:
+        return None
+    df = source["df"]
+    signal_price = float(source["signal_price"])
+    if source["level_kind"] == "resistance":
+        level_cross_mask = df["high"].to_numpy(dtype=float) >= signal_price
+    else:
+        level_cross_mask = df["low"].to_numpy(dtype=float) <= signal_price
+    cross_positions = np.flatnonzero(level_cross_mask)
+    if len(cross_positions) == 0:
+        return None
+    cross_idx = int(cross_positions[0])
+
+    selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
+    oscillator_idx = None
+    for idx in range(cross_idx, len(df)):
+        if all(oscillator_condition_met(df[spec["column"]].to_numpy(dtype=float), idx, spec["level"], spec["condition"]) for spec in selected_specs):
+            oscillator_idx = idx
+            break
+    if oscillator_idx is None:
+        return None
+
+    entry_price = float(df.iloc[oscillator_idx]["close"])
+    if entry_price <= 0:
+        return None
+    path_df = df.iloc[oscillator_idx:]
+    return {
+        "direction": source["direction"],
+        "entry_price": entry_price,
+        "signal_price": signal_price,
+        "highs": path_df["high"].to_numpy(dtype=float, copy=False),
+        "lows": path_df["low"].to_numpy(dtype=float, copy=False),
+        "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
+        "level_cross_idx": cross_idx,
+        "oscillator_idx": oscillator_idx,
+        "toward_direction": source.get("toward_direction"),
+    }
+
+
+def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
+    """Build a read-only diagnostic table for oscillator-confirmed reversal entries."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
+    notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
+    total_tasks = len(tasks)
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    sources = [build_oscillator_reversal_source(t) for t in eligible_tasks]
+    sources = [s for s in sources if s]
+    level_cross_count = 0
+    paths = []
+    for source in sources:
+        signal_price = float(source["signal_price"])
+        df = source["df"]
+        if source["level_kind"] == "resistance":
+            crossed = bool((df["high"].to_numpy(dtype=float) >= signal_price).any())
+        else:
+            crossed = bool((df["low"].to_numpy(dtype=float) <= signal_price).any())
+        if crossed:
+            level_cross_count += 1
+        path = build_oscillator_reversal_path_from_source(source, oscillator_specs)
+        if path:
+            paths.append(path)
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in paths]
+    valid_results = [r for r in results if r["valid"]]
+    valid_total = len(valid_results)
+
+    def fmt_stat(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
+
+    def scenario_summary(label, scenario_results):
+        scenario_total = len(scenario_results)
+        stop_events = sum(1 for r in scenario_results if r["stop_hit"])
+        max_dd_events = sum(1 for r in scenario_results if r["max_dd_hit"])
+        tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
+        tp1 = sum(1 for r in scenario_results if any(level >= 1.0 for level in r["tp_hits"]))
+        stop_moved = sum(1 for r in scenario_results if r["stop_moves"])
+        scenario_net = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in scenario_results]
+        scenario_net = [r for r in scenario_net if r is not None]
+        avg_net = sum(scenario_net) / scenario_total if scenario_total else 0.0
+        total_net_usd = sum(scenario_net) / 100 * notional_usd
+        return html.Tr([html.Td(label, style=td_style), html.Td(
+            f"entries {fmt_stat(scenario_total, len(eligible_tasks))} | TP0.5 {fmt_stat(tp05, scenario_total)} | TP1 {fmt_stat(tp1, scenario_total)} | "
+            f"SL {fmt_stat(stop_events, scenario_total)} | adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
+            f"stop moved {fmt_stat(stop_moved, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
+            style=td_style)])
+
+    stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
+    stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
+    stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    up_sources = [s for s in sources if s.get("toward_direction") == "up"]
+    down_sources = [s for s in sources if s.get("toward_direction") == "down"]
+    up_paths = [p for p in paths if p.get("toward_direction") == "up"]
+    down_paths = [p for p in paths if p.get("toward_direction") == "down"]
+    rows = [
+        html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
+        html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
+        html.Tr([html.Td("Usable oscillator paths with candle data", style=td_style), html.Td(fmt_stat(len(sources), len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("UP-toward sources (resistance → SELL)", style=td_style), html.Td(fmt_stat(len(up_sources), len(sources)), style=td_style)]),
+        html.Tr([html.Td("DOWN-toward sources (support → BUY)", style=td_style), html.Td(fmt_stat(len(down_sources), len(sources)), style=td_style)]),
+        html.Tr([html.Td("Price crossed signal level", style=td_style), html.Td(fmt_stat(level_cross_count, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Oscillator reversal entries triggered", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("UP-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(up_paths), len(up_sources)), style=td_style)]),
+        html.Tr([html.Td("DOWN-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(down_paths), len(down_sources)), style=td_style)]),
+        html.Tr([html.Td("Level crossed but oscillator did not trigger", style=td_style), html.Td(fmt_stat(max(level_cross_count - valid_total, 0), len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Active oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
+        html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+    ]
+    rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Oscillator reversal scenario"))
+    for level in tp_levels:
+        label = fmt_dynamic_level_label(level)
+        tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
+        rows.append(html.Tr([html.Td(f"TP {label} found after oscillator entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
+    for trigger_pct, stop_profit_pct in stop_rules:
+        moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
+        rows.append(html.Tr([html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style), html.Td(fmt_stat(moved, valid_total), style=td_style)]))
+    sl_grid = sl_grid or []
+    if sl_grid:
+        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same oscillator filters, TP levels, max adverse DD, and stop rules", style=td_style)]))
+        for sl_pct in sl_grid:
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in paths]
+            rows.append(scenario_summary(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", scenario_results))
+    return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+
+def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, offset_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
+    """Build a read-only diagnostic table for entering reversal at/after level."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
+    notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
+    total_tasks = len(tasks)
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    sources = [build_level_reversal_source(t) for t in eligible_tasks]
+    sources = [s for s in sources if s]
+    paths = [build_level_reversal_path_from_source(s, entry_offset_pct) for s in sources]
+    valid_paths = [p for p in paths if p]
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+    valid_results = [r for r in results if r["valid"]]
+    valid_total = len(valid_results)
+
+    def fmt_stat(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
+
+    def scenario_summary(label, scenario_paths, scenario_results):
+        scenario_total = len(scenario_results)
+        stop_events = sum(1 for r in scenario_results if r["stop_hit"])
+        max_dd_events = sum(1 for r in scenario_results if r["max_dd_hit"])
+        tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
+        tp1 = sum(1 for r in scenario_results if any(level >= 1.0 for level in r["tp_hits"]))
+        stop_moved = sum(1 for r in scenario_results if r["stop_moves"])
+        avg_net = 0.0
+        total_net_usd = 0.0
+        if scenario_total:
+            scenario_net = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in scenario_results]
+            scenario_net = [r for r in scenario_net if r is not None]
+            avg_net = sum(scenario_net) / scenario_total
+            total_net_usd = sum(scenario_net) / 100 * notional_usd
+        return html.Tr([
+            html.Td(label, style=td_style),
+            html.Td(
+                f"entries {fmt_stat(len(scenario_paths), len(eligible_tasks))} | "
+                f"TP0.5 {fmt_stat(tp05, scenario_total)} | "
+                f"TP1 {fmt_stat(tp1, scenario_total)} | "
+                f"SL {fmt_stat(stop_events, scenario_total)} | "
+                f"adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
+                f"stop moved {fmt_stat(stop_moved, scenario_total)} | "
+                f"avg net {avg_net:.3f}% | "
+                f"net P/L ${total_net_usd:,.2f}",
+                style=td_style,
+            ),
+        ])
+
+    stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
+    stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
+    stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    rows = [
+        html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
+        html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
+        html.Tr([html.Td("Usable level paths with candle data", style=td_style), html.Td(fmt_stat(len(sources), len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Level/offset entries triggered", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Not triggered / did not reach entry", style=td_style), html.Td(fmt_stat(len(eligible_tasks) - valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Initial stop events (closed by SL/trailing stop)", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+    ]
+
+    rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Level-reversal scenario"))
+
+    for level in tp_levels:
+        label = fmt_dynamic_level_label(level)
+        tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
+        rows.append(html.Tr([html.Td(f"TP {label} found after reversal entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
+
+    for trigger_pct, stop_profit_pct in stop_rules:
+        moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
+        rows.append(html.Tr([
+            html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style),
+            html.Td(fmt_stat(moved, valid_total), style=td_style),
+        ]))
+
+    sl_grid = sl_grid or []
+    if sl_grid:
+        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same entry offset, TP levels, max adverse DD, and dynamic stop rules", style=td_style)]))
+        for sl_pct in sl_grid:
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
+            rows.append(scenario_summary(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", valid_paths, scenario_results))
+
+    offset_grid = offset_grid or []
+    if offset_grid:
+        rows.append(html.Tr([html.Td("— Entry offset grid —", style=td_style), html.Td("0% means level touch; higher values require overshoot beyond level before reversal entry", style=td_style)]))
+        for offset_pct in offset_grid:
+            scenario_paths = [build_level_reversal_path_from_source(s, offset_pct) for s in sources]
+            scenario_paths = [p for p in scenario_paths if p]
+            scenario_results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in scenario_paths]
+            rows.append(scenario_summary(f"Entry offset {fmt_dynamic_level_label(offset_pct)}", scenario_paths, scenario_results))
+
+    return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+
+
+@app.callback(
+    Output("dynamic-check-status", "children"),
+    Output("dynamic-check-results", "children"),
+    Input("dynamic-check-run-btn", "n_clicks"),
+    State("dynamic-check-sl-input", "value"),
+    State("dynamic-check-max-dd-input", "value"),
+    State("dynamic-check-tp-levels-input", "value"),
+    State("dynamic-check-trail-rules-input", "value"),
+    State("dynamic-check-sl-grid-input", "value"),
+    State("dynamic-check-be-grid-input", "value"),
+    State("dynamic-check-dd-grid-input", "value"),
+    State("dynamic-check-notional-input", "value"),
+    State("dynamic-check-cost-input", "value"),
+    State("dynamic-check-open-return-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_dynamic_strategy_checkup(n_clicks, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, be_grid_text, dd_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+    """On-demand callback for raw-data dynamic strategy diagnostics."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        tp_levels = parse_dynamic_percent_levels(tp_text)
+        stop_rules = parse_dynamic_stop_rules(stop_rules_text)
+        sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
+        be_grid = parse_dynamic_percent_levels(be_grid_text, default_levels=())
+        dd_grid = parse_dynamic_percent_levels(dd_grid_text, default_levels=())
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_dynamic_checkup_summary_table(
+            tasks,
+            stop_loss_pct,
+            max_dd_pct,
+            tp_levels,
+            stop_rules,
+            sl_grid=sl_grid,
+            be_grid=be_grid,
+            dd_grid=dd_grid,
+            notional_usd=notional_usd,
+            round_trip_cost_pct=round_trip_cost_pct,
+            open_return_pct=open_return_pct,
+        )
+        elapsed = time.time() - started
+        status = (
+            f"✅ Dynamic checkup run #{n_clicks} complete in {elapsed:.2f}s. "
+            f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
+            f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
+            f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
+        )
+        return status, table
+    except Exception as exc:
+        return f"❌ Dynamic checkup failed: {exc}", no_update
+
+
+@app.callback(
+    Output("level-reversal-status", "children"),
+    Output("level-reversal-results", "children"),
+    Input("level-reversal-run-btn", "n_clicks"),
+    State("level-reversal-offset-input", "value"),
+    State("level-reversal-sl-input", "value"),
+    State("level-reversal-max-dd-input", "value"),
+    State("level-reversal-tp-levels-input", "value"),
+    State("level-reversal-trail-rules-input", "value"),
+    State("level-reversal-sl-grid-input", "value"),
+    State("level-reversal-offset-grid-input", "value"),
+    State("level-reversal-notional-input", "value"),
+    State("level-reversal-cost-input", "value"),
+    State("level-reversal-open-return-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, offset_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+    """On-demand callback for level-touch/overshoot reversal diagnostics."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        entry_offset_pct = float(entry_offset_pct or 0.0)
+        tp_levels = parse_dynamic_percent_levels(tp_text)
+        stop_rules = parse_dynamic_stop_rules(stop_rules_text)
+        sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
+        offset_grid = parse_dynamic_nonnegative_percent_levels(offset_grid_text, default_levels=(0.0,))
+        if 0.0 not in offset_grid:
+            offset_grid = sorted(set([0.0] + offset_grid))
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_level_reversal_summary_table(
+            tasks,
+            entry_offset_pct,
+            stop_loss_pct,
+            max_dd_pct,
+            tp_levels,
+            stop_rules,
+            sl_grid=sl_grid,
+            offset_grid=offset_grid,
+            notional_usd=notional_usd,
+            round_trip_cost_pct=round_trip_cost_pct,
+            open_return_pct=open_return_pct,
+        )
+        elapsed = time.time() - started
+        status = (
+            f"✅ Level-reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
+            f"entry offset={entry_offset_pct:g}%, SL={float(stop_loss_pct or 0):g}%, "
+            f"max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
+            f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
+            f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
+        )
+        return status, table
+    except Exception as exc:
+        return f"❌ Level-reversal checkup failed: {exc}", no_update
+
+
+@app.callback(
+    Output("osc-reversal-status", "children"),
+    Output("osc-reversal-results", "children"),
+    Input("osc-reversal-run-btn", "n_clicks"),
+    State("osc-stoch-14-level-input", "value"),
+    State("osc-stoch-14-condition-input", "value"),
+    State("osc-stoch-40-level-input", "value"),
+    State("osc-stoch-40-condition-input", "value"),
+    State("osc-stoch-60-level-input", "value"),
+    State("osc-stoch-60-condition-input", "value"),
+    State("osc-rsi-level-input", "value"),
+    State("osc-rsi-condition-input", "value"),
+    State("osc-down-stoch-14-level-input", "value"),
+    State("osc-down-stoch-14-condition-input", "value"),
+    State("osc-down-stoch-40-level-input", "value"),
+    State("osc-down-stoch-40-condition-input", "value"),
+    State("osc-down-stoch-60-level-input", "value"),
+    State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-rsi-level-input", "value"),
+    State("osc-down-rsi-condition-input", "value"),
+    State("osc-reversal-sl-input", "value"),
+    State("osc-reversal-max-dd-input", "value"),
+    State("osc-reversal-tp-levels-input", "value"),
+    State("osc-reversal-trail-rules-input", "value"),
+    State("osc-reversal-sl-grid-input", "value"),
+    State("osc-reversal-notional-input", "value"),
+    State("osc-reversal-cost-input", "value"),
+    State("osc-reversal-open-return-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+    """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        oscillator_specs = build_oscillator_spec_groups(
+            (
+                stoch14_level, stoch14_condition,
+                stoch40_level, stoch40_condition,
+                stoch60_level, stoch60_condition,
+                rsi_level, rsi_condition,
+            ),
+            (
+                down_stoch14_level, down_stoch14_condition,
+                down_stoch40_level, down_stoch40_condition,
+                down_stoch60_level, down_stoch60_condition,
+                down_rsi_level, down_rsi_condition,
+            ),
+        )
+        tp_levels = parse_dynamic_percent_levels(tp_text)
+        stop_rules = parse_dynamic_stop_rules(stop_rules_text)
+        sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_oscillator_reversal_summary_table(
+            tasks,
+            oscillator_specs,
+            stop_loss_pct,
+            max_dd_pct,
+            tp_levels,
+            stop_rules,
+            sl_grid=sl_grid,
+            notional_usd=notional_usd,
+            round_trip_cost_pct=round_trip_cost_pct,
+            open_return_pct=open_return_pct,
+        )
+        elapsed = time.time() - started
+        status = (
+            f"✅ Oscillator reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
+            f"filters={format_oscillator_specs(oscillator_specs)}; "
+            f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
+            f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
+            f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
+        )
+        return status, table
+    except Exception as exc:
+        return f"❌ Oscillator reversal checkup failed: {exc}", no_update
+
+
 @app.callback(
     Output("impulse-task-selector", "options"),
     Input("progress-interval", "n_intervals")
@@ -6640,6 +8989,14 @@ def rerun_impulse_on_all(n_clicks, range_mult, vol_mult, body_ratio, wick_ratio,
 # redownload functions, and database backup functionality.
 # =============================================================================
 
+# =============================================================================
+# 19. CALLBACKS: ACTIVE DOWNLOAD MONITOR AND DATA MAINTENANCE
+# =============================================================================
+# Monitor callbacks expose current task progress and control pause/stop actions.
+# Maintenance shortcuts queue work but should leave persistence and recalculation
+# rules to their dedicated sections below.
+# =============================================================================
+
 # ----- Active Download Monitor Callbacks -----
 @app.callback(
     Output("monitor-task-info", "children"),
@@ -6798,6 +9155,14 @@ def bulk_rerun_all(ev_n, str_n, imp_n):
     label = "Events" if triggered == "bulk-rerun-events" else "Strategy" if triggered == "bulk-rerun-strategy" else "Impulse"
     return f"✅ {label} re-run completed on {count} tasks. Table will refresh shortly."
 
+# =============================================================================
+# 20. CALLBACKS: PERSISTENCE, SAVE/LOAD JSON, AND FILE DROPDOWNS
+# =============================================================================
+# JSON persistence callbacks must preserve the compatibility rules and field
+# catalog above. Avoid introducing UI refresh side effects outside Golden Store
+# publication helpers.
+# =============================================================================
+
 # 1. Auto-refresh dropdown with existing JSON files
 @app.callback(
     Output("json-file-select", "options"),
@@ -6852,40 +9217,35 @@ def save_tasks_to_json(n, filename):
     report_unclassified_task_fields(tasks, reason="save_tasks_to_json")
     
     # Build reconstructed data list
-    serializable_data = []
-    
-    # Process all valid tasks from RAM
-    if tasks:
-        for t in tasks:
-            d = {}
-            # Iterate through all attributes, excluding non-serializable threading objects
-            for k, v in t.__dict__.items():
-                # Skip threading/synchronization objects and internal caches
-                if k in RUNTIME_TASK_FIELDS:
-                    continue
-                
-                # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
-                d[k] = sanitize_for_json(v)
-            
-            # Debug: Verify critical fields are present
-            if 'hit_1' not in d:
-                print(f"WARNING: Task {t.task_id[:8]} missing 'hit_1' in save! Current value: {getattr(t, 'hit_1', 'MISSING')}")
-            
-            serializable_data.append(d)
-    
+    serializable_data = tasks_to_serializable_snapshot(tasks)
+
     # 🔧 ATOMIC SAVE with sanitization (removed default=str fallback)
-    temp_path = filepath + ".tmp"
     try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            # All data is pre-sanitized, no need for default=str
-            json.dump(serializable_data, f, indent=2)
-        os.replace(temp_path, filepath)
+        write_json_atomic(filepath, serializable_data)
         return f"✅ Saved {len(tasks)} tasks to {filename}", filename
     except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)  # Delete broken temp file
         return f"❌ Save failed: {str(e)}", filename
 
+
+
+@app.callback(
+    Output("golden-store-version", "data", allow_duplicate=True),
+    Input("progress-interval", "n_intervals"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True
+)
+def sync_golden_store_version_from_server(_n_intervals, client_version):
+    """Propagate server-side Golden Store publishes into the Dash store.
+
+    Background workers can update the module-level Golden Store, but they cannot
+    directly update dcc.Store values in the browser. Polling this lightweight
+    version counter lets callbacks that depend on ``golden-store-version``
+    refresh after background task creation or other server-side publishes.
+    """
+    server_version = get_golden_store_version()
+    if server_version != client_version:
+        return server_version
+    return dash.no_update
 
 # 3. Load tasks from selected JSON file (Optimized & Thread-Safe)
 @app.callback(
@@ -6916,6 +9276,9 @@ def load_tasks_from_json(n, filepath):
 
     loaded_ids = []
     skipped = 0
+    skipped_missing_id = 0
+    skipped_duplicate = 0
+    skipped_unloadable = 0
     new_tasks = {}
     seen_ids = set()  # P3 IMPROVEMENT: Track unique task IDs
     
@@ -6932,10 +9295,12 @@ def load_tasks_from_json(n, filepath):
             if not task_id_candidate:
                 print(f"Skipping task without task_id: {d}")
                 skipped += 1
+                skipped_missing_id += 1
                 continue
             if task_id_candidate in seen_ids:
                 print(f"Duplicate task_id detected: {task_id_candidate}, skipping")
                 skipped += 1
+                skipped_duplicate += 1
                 continue
             seen_ids.add(task_id_candidate)
             
@@ -6968,6 +9333,7 @@ def load_tasks_from_json(n, filepath):
         except Exception as e:
             print(f"Error loading task: {e}")
             skipped += 1
+            skipped_unloadable += 1
             
     # 🔧 ATOMIC & THREAD-SAFE MEMORY UPDATE
     # Keep Golden Store in sync with loaded JSON so the paginated table can render
@@ -6985,7 +9351,15 @@ def load_tasks_from_json(n, filepath):
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
     if skipped > 0:
-        msg += f" | ⚠️ Skipped {skipped} corrupted tasks"
+        skip_parts = []
+        if skipped_missing_id:
+            skip_parts.append(f"{skipped_missing_id} missing task_id")
+        if skipped_duplicate:
+            skip_parts.append(f"{skipped_duplicate} duplicate")
+        if skipped_unloadable:
+            skip_parts.append(f"{skipped_unloadable} unloadable")
+        detail = f" ({', '.join(skip_parts)})" if skip_parts else ""
+        msg += f" | ⚠️ Skipped {skipped} invalid/duplicate/unloadable record(s){detail}"
     audit_note = format_snapshot_audit_note(snapshot_audit)
     if audit_note:
         msg += f" | {audit_note}"
@@ -7011,6 +9385,14 @@ def manual_clear_all(n):
         tm.tasks.clear()
     publish_golden_task_snapshot([], reason="manual_clear", bump_version=False)
     return "🗑️ All tasks cleared.", [], 0, 0
+
+# =============================================================================
+# 21. CALLBACKS: BULK ACTIONS, RECALCULATION, AND BACKGROUND WORKERS
+# =============================================================================
+# Long-running operations coordinate recalc state, task state, and Golden Store
+# publication. Keep stop/progress flags explicit and avoid changing calculation
+# logic during organization-only refactors.
+# =============================================================================
 
 @app.callback(
     Output("bulk-rerun-status", "children", allow_duplicate=True),
@@ -7337,6 +9719,13 @@ def trigger_ui_on_recalc_complete(n_intervals, is_disabled):
         return False, dash.no_update
     # Keep current state
     return dash.no_update, dash.no_update
+
+# =============================================================================
+# 22. DATABASE CALLBACK REGISTRATION AND APPLICATION ENTRYPOINT
+# =============================================================================
+# Database-specific UI/callbacks are delegated to database.py. Keep this final so
+# the main app is fully constructed before registration.
+# =============================================================================
 
 # Register database callbacks
 register_database_callbacks(app)
