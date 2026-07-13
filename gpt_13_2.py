@@ -6645,7 +6645,12 @@ def fmt_dynamic_level_label(level):
 
 
 def is_task_eligible_for_dynamic_checkup(task):
-    """Return False for incomplete/known-corrupt tasks before reading parquet data."""
+    """Return False before parquet access for tasks that are not ready for diagnostics.
+
+    Important wording: incomplete tasks and older JSON records with missing newer
+    derived fields are not "corrupted"; they are simply not eligible for this
+    completed-task diagnostic until recalculation/download finishes.
+    """
     if task is None:
         return False
     status = str(getattr(task, "status", "") or "").lower()
@@ -6824,8 +6829,8 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
 
     rows = [
         html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
-        html.Tr([html.Td("Completed / eligible tasks", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
-        html.Tr([html.Td("Valid dynamic cases", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
+        html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
+        html.Tr([html.Td("Valid dynamic cases with candle data", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Max drawdown cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Reached signal level", style=td_style), html.Td(fmt_stat(level_reached, valid_total), style=td_style)]),
@@ -7888,6 +7893,9 @@ def load_tasks_from_json(n, filepath):
 
     loaded_ids = []
     skipped = 0
+    skipped_missing_id = 0
+    skipped_duplicate = 0
+    skipped_unloadable = 0
     new_tasks = {}
     seen_ids = set()  # P3 IMPROVEMENT: Track unique task IDs
     
@@ -7904,10 +7912,12 @@ def load_tasks_from_json(n, filepath):
             if not task_id_candidate:
                 print(f"Skipping task without task_id: {d}")
                 skipped += 1
+                skipped_missing_id += 1
                 continue
             if task_id_candidate in seen_ids:
                 print(f"Duplicate task_id detected: {task_id_candidate}, skipping")
                 skipped += 1
+                skipped_duplicate += 1
                 continue
             seen_ids.add(task_id_candidate)
             
@@ -7940,6 +7950,7 @@ def load_tasks_from_json(n, filepath):
         except Exception as e:
             print(f"Error loading task: {e}")
             skipped += 1
+            skipped_unloadable += 1
             
     # 🔧 ATOMIC & THREAD-SAFE MEMORY UPDATE
     # Keep Golden Store in sync with loaded JSON so the paginated table can render
@@ -7957,7 +7968,15 @@ def load_tasks_from_json(n, filepath):
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
     if skipped > 0:
-        msg += f" | ⚠️ Skipped {skipped} corrupted tasks"
+        skip_parts = []
+        if skipped_missing_id:
+            skip_parts.append(f"{skipped_missing_id} missing task_id")
+        if skipped_duplicate:
+            skip_parts.append(f"{skipped_duplicate} duplicate")
+        if skipped_unloadable:
+            skip_parts.append(f"{skipped_unloadable} unloadable")
+        detail = f" ({', '.join(skip_parts)})" if skip_parts else ""
+        msg += f" | ⚠️ Skipped {skipped} invalid/duplicate/unloadable record(s){detail}"
     audit_note = format_snapshot_audit_note(snapshot_audit)
     if audit_note:
         msg += f" | {audit_note}"
