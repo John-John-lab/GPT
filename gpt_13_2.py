@@ -4384,12 +4384,52 @@ def build_toward_strategy_summary_rows(tasks, td_style, fmt_stat):
 
     distance_ranges = ["0-0.12%", "0.12-0.5%", "0.5-1%", "1-2%", "2-4%", "4%+"]
     distance_counts = {r: 0 for r in distance_ranges}
+    distance_reached_counts = {r: 0 for r in distance_ranges}
     for task in toward_cases:
         bucket = get_toward_distance_bucket(get_toward_entry_level_distance_pct(task))
         if bucket:
             distance_counts[bucket] += 1
+            if getattr(task, 'toward_level_reached', False) and not getattr(task, 'toward_stop_loss_hit', False):
+                distance_reached_counts[bucket] += 1
     distance_row_1 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[:3])
     distance_row_2 = " | ".join(f"{r}:{distance_counts.get(r, 0)}" for r in distance_ranges[3:])
+
+    def fmt_bucket_rate(bucket):
+        total = distance_counts.get(bucket, 0)
+        reached = distance_reached_counts.get(bucket, 0)
+        pct = (reached / total * 100) if total else 0
+        return f"{bucket}:{reached}/{total} ({pct:.1f}%)"
+
+    distance_reach_row_1 = " | ".join(fmt_bucket_rate(r) for r in distance_ranges[:3])
+    distance_reach_row_2 = " | ".join(fmt_bucket_rate(r) for r in distance_ranges[3:])
+
+    tp05_found = sum(1 for t in toward_cases if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 0.5)
+    tp05_then_reached = sum(
+        1 for t in toward_cases
+        if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 0.5
+        and getattr(t, 'toward_level_reached', False)
+        and not getattr(t, 'toward_stop_loss_hit', False)
+    )
+    tp05_then_stopped = sum(
+        1 for t in toward_cases
+        if (getattr(t, 'toward_max_reached_pct', None) or 0) >= 0.5
+        and getattr(t, 'toward_stop_loss_hit', False)
+        and not getattr(t, 'toward_level_reached', False)
+    )
+    fixed_sl_before_tp05 = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_stop_loss_hit', False)
+        and (getattr(t, 'toward_max_reached_pct', None) or 0) < 0.5
+    )
+    reached_level_before_tp05 = sum(
+        1 for t in toward_cases
+        if getattr(t, 'toward_level_reached', False)
+        and not getattr(t, 'toward_stop_loss_hit', False)
+        and (getattr(t, 'toward_max_reached_pct', None) or 0) < 0.5
+    )
+
+    def fmt_conditional(count, total):
+        return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0 (0.0%)"
 
     toward_strategy_rows = [
         html.Tr([html.Td("Toward strategy cases", style=td_style), html.Td(str(toward_total), style=td_style)]),
@@ -4402,6 +4442,13 @@ def build_toward_strategy_summary_rows(tasks, td_style, fmt_stat):
         html.Tr([html.Td("Toward neither SL nor level", style=td_style), html.Td(fmt_stat(neither_stop_nor_level, toward_total), style=td_style)]),
         html.Tr([html.Td("Entry→Level dist 0-1%", style=td_style), html.Td(distance_row_1, style=td_style)]),
         html.Tr([html.Td("Entry→Level dist 1%+", style=td_style), html.Td(distance_row_2, style=td_style)]),
+        html.Tr([html.Td("Reach rate by dist 0-1%", style=td_style), html.Td(distance_reach_row_1, style=td_style)]),
+        html.Tr([html.Td("Reach rate by dist 1%+", style=td_style), html.Td(distance_reach_row_2, style=td_style)]),
+        html.Tr([html.Td("TP 0.5 arm before fixed SL", style=td_style), html.Td(fmt_stat(tp05_found, toward_total), style=td_style)]),
+        html.Tr([html.Td("TP 0.5 arm → reached level", style=td_style), html.Td(fmt_conditional(tp05_then_reached, tp05_found), style=td_style)]),
+        html.Tr([html.Td("TP 0.5 arm → fixed SL before level", style=td_style), html.Td(fmt_conditional(tp05_then_stopped, tp05_found), style=td_style)]),
+        html.Tr([html.Td("Fixed SL before TP 0.5 arm", style=td_style), html.Td(fmt_stat(fixed_sl_before_tp05, toward_total), style=td_style)]),
+        html.Tr([html.Td("Reached level before TP 0.5 arm", style=td_style), html.Td(fmt_stat(reached_level_before_tp05, toward_total), style=td_style)]),
     ]
 
     for pct in TOWARD_LEVEL_TARGET_PCTS:
