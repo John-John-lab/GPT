@@ -763,9 +763,12 @@ def format_snapshot_audit_note(audit):
 # =============================================================================
 # 8. GOLDEN STORE, RECALC STATE, AND DISPLAY CACHE STATE
 # =============================================================================
-# Golden Store is the authoritative display snapshot for task table/stat callbacks.
-# Prefer publishing through publish_golden_task_snapshot() so version bumps and
-# cache resets stay synchronized. Recalc/display globals are documented here
+# Golden Store is the authoritative *in-memory display snapshot* for task
+# table/stat callbacks. It is safe for UI refresh and background publication,
+# but it is not durable storage across app restarts; JSON snapshots remain the
+# durable persistence layer. Prefer publishing through
+# publish_golden_task_snapshot() or bump_golden_store_version() so version bumps
+# and cache resets stay synchronized. Recalc/display globals are documented here
 # before deeper state-container refactors.
 # =============================================================================
 
@@ -835,6 +838,20 @@ def get_golden_task_count():
     return len(golden_task_store_data) if golden_task_store_data is not None else 0
 
 
+
+
+def bump_golden_store_version(reason="version_bump"):
+    """Bump the in-memory Golden Store version and clear derived UI caches.
+
+    Use this for cases where task objects were mutated in place and the existing
+    Golden Store list still points at the same objects. Full snapshot replacement
+    should continue to use publish_golden_task_snapshot().
+    """
+    global golden_store_version
+    golden_store_version += 1
+    reset_display_caches(reason or "version_bump")
+    return golden_store_version
+
 def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
     """Publish the final task snapshot used by UI callbacks and reset display caches.
 
@@ -845,8 +862,9 @@ def publish_golden_task_snapshot(tasks, reason="", bump_version=True):
     golden_task_store_data = list(tasks)
     report_unclassified_task_fields(golden_task_store_data, reason=f"publish:{reason or '-'}")
     if bump_version:
-        golden_store_version += 1
-    reset_display_caches(reason or "publish")
+        bump_golden_store_version(reason or "publish")
+    else:
+        reset_display_caches(reason or "publish")
     print(f"🔄 [GOLDEN] Published {len(golden_task_store_data)} tasks, version={golden_store_version}, reason={reason or '-'}")
     return golden_store_version
 
@@ -2692,8 +2710,7 @@ class DownloadTask:
             from dash import no_update
             # Since we split update_summary into two callbacks, we just increment the version
             # to trigger both update_summary_stats_only and update_task_table_only
-            global golden_store_version
-            golden_store_version += 1
+            bump_golden_store_version("task_analysis_complete")
         except Exception:
             pass
 
@@ -7114,6 +7131,16 @@ def parse_dynamic_stop_rules(text):
         rules.append((trigger_pct, stop_profit_pct))
     return sorted(set(rules), key=lambda item: item[0])
 
+
+# =============================================================================
+# 18A. READ-ONLY STRATEGY CHECKUP HELPERS
+# =============================================================================
+# Keep experimental diagnostics here: parse UI settings -> build raw candle path
+# -> evaluate a scenario -> render summary rows. These helpers should not mutate
+# DownloadTask analysis fields. Future curves/strategies should extend the spec
+# and source/path builders in this section rather than mixing diagnostics into
+# chart rendering, task-table rendering, or DownloadTask.analyze_signal().
+# =============================================================================
 
 def fmt_dynamic_level_label(level):
     """Format dynamic diagnostic percent labels."""
