@@ -6730,6 +6730,13 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
 
     for high, low in zip(path["highs"], path["lows"]):
         if direction == "buy":
+            # If max-DD is tighter than the initial/trailing stop, classify the
+            # adverse exit as DD cap first. This keeps scenario-grid counts
+            # intuitive when users test max DD below the stop-loss distance.
+            max_dd_is_tighter = max_dd_price is not None and max_dd_price >= stop_price
+            if max_dd_is_tighter and low <= max_dd_price:
+                result["max_dd_hit"] = True
+                break
             if low <= stop_price:
                 result["stop_hit"] = True
                 break
@@ -6740,6 +6747,10 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if high >= signal_price:
                 result["level_reached"] = True
         else:
+            max_dd_is_tighter = max_dd_price is not None and max_dd_price <= stop_price
+            if max_dd_is_tighter and high >= max_dd_price:
+                result["max_dd_hit"] = True
+                break
             if high >= stop_price:
                 result["stop_hit"] = True
                 break
