@@ -6644,8 +6644,25 @@ def fmt_dynamic_level_label(level):
     return f"{level:g}%"
 
 
+def is_task_eligible_for_dynamic_checkup(task):
+    """Return False for incomplete/known-corrupt tasks before reading parquet data."""
+    if task is None:
+        return False
+    status = str(getattr(task, "status", "") or "").lower()
+    if status != "completed":
+        return False
+    if any(token in status for token in ("corrupt", "failed", "error")):
+        return False
+    for flag_name in ("corrupted", "is_corrupted", "data_corrupted", "json_corrupted", "load_corrupted"):
+        if bool(getattr(task, flag_name, False)):
+            return False
+    return True
+
+
 def build_dynamic_checkup_path(task):
     """Load and normalize one task's raw candle path once for fast scenario grids."""
+    if not is_task_eligible_for_dynamic_checkup(task):
+        return None
     if task is None or getattr(task, "signal_time", None) is None or getattr(task, "signal_price", None) is None:
         return None
     if getattr(task, "signal_direction", None) not in ("resistance", "support"):
@@ -6762,7 +6779,8 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
     """Build an on-demand summary table from raw dynamic-check diagnostic results."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
     total_tasks = len(tasks)
-    paths = [build_dynamic_checkup_path(t) for t in tasks]
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    paths = [build_dynamic_checkup_path(t) for t in eligible_tasks]
     valid_paths = [p for p in paths if p]
     results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
     valid_results = [r for r in results if r["valid"]]
@@ -6806,7 +6824,8 @@ def build_dynamic_checkup_summary_table(tasks, stop_loss_pct, max_dd_pct, tp_lev
 
     rows = [
         html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
-        html.Tr([html.Td("Valid dynamic cases", style=td_style), html.Td(fmt_stat(valid_total, total_tasks), style=td_style)]),
+        html.Tr([html.Td("Completed / eligible tasks", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
+        html.Tr([html.Td("Valid dynamic cases", style=td_style), html.Td(fmt_stat(valid_total, len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Max drawdown cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Reached signal level", style=td_style), html.Td(fmt_stat(level_reached, valid_total), style=td_style)]),
