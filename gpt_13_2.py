@@ -3685,6 +3685,32 @@ def render_tab(tab):
                         "Entry uses the first candle after signal time, buy toward resistance and sell toward support.",
                         style={"marginTop": "10px", "color": "#555"}
                     ),
+                    html.Details([
+                        html.Summary("ⓘ How to use SL grid, BE grid, TP levels, and dynamic stop rules", style={"cursor": "pointer", "color": "#0b63b6", "fontWeight": "bold"}),
+                        html.Div([
+                            html.P("Think of the controls as separate layers:", style={"marginBottom": "6px"}),
+                            html.Ul([
+                                html.Li("Initial stop loss % = where the first protective stop starts from entry."),
+                                html.Li("SL grid % = extra initial-stop values to test side by side, for example 0.12 / 0.25 / 0.5."),
+                                html.Li("Take profit levels % = favorable-move checkpoints to count, such as 0.5 / 1 / 2 / 4."),
+                                html.Li("Dynamic stop rules = not take-profit orders; they move the stop after price moves in your favor."),
+                                html.Li("BE arm grid % = quick tests for moving the stop to entry after +0.25%, +0.5%, +1%, etc."),
+                                html.Li("Max adverse DD grid % = optional adverse-move caps from entry tested side by side."),
+                            ], style={"marginTop": 0}),
+                            html.P("Dynamic stop rule format: trigger%:move-stop-to-profit%.", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                            html.Ul([
+                                html.Li("0.5:0 means: after price moves +0.5% in your favor, move stop to breakeven / entry."),
+                                html.Li("1:0.3 means: after price moves +1%, move stop to lock about +0.3% profit."),
+                                html.Li("2:1.5 means: after price moves +2%, move stop to lock about +1.5% profit."),
+                                html.Li("4:3 means: after price moves +4%, move stop to lock about +3% profit."),
+                            ], style={"marginTop": 0}),
+                            html.P(
+                                "The dynamic summary table shows the selected scenario plus grid rows: SL grid scenarios, BE-after rows, "
+                                "max adverse DD cap rows, TP hit rows, stop events, stop-after-TP, and dynamic-stop-moved counts.",
+                                style={"marginBottom": 0}
+                            ),
+                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#eef7ff", "border": "1px solid #cfe8ff", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False),
                     html.Div([
                         html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
                         html.Span(" ⓘ", title="Loss distance from the simulated entry. Example: 0.12 means close if price moves 0.12% against the entry before a tighter dynamic stop is active.", style={"cursor": "help", "color": "#0b63b6"}),
@@ -3744,6 +3770,31 @@ def render_tab(tab):
                         "then enter the reversal direction. Resistance becomes SELL; support becomes BUY. This is read-only and does not change saved task fields.",
                         style={"marginTop": "10px", "color": "#555"}
                     ),
+                    html.Details([
+                        html.Summary("ⓘ How the level-reversal checkup works", style={"cursor": "pointer", "color": "#9a5a00", "fontWeight": "bold"}),
+                        html.Div([
+                            html.P("This box tests a different entry idea from the first dynamic box:", style={"marginBottom": "6px"}),
+                            html.Ul([
+                                html.Li("Resistance signal: wait for price to touch/overshoot the resistance level, then simulate a SELL reversal."),
+                                html.Li("Support signal: wait for price to touch/overshoot the support level, then simulate a BUY reversal."),
+                                html.Li("Entry offset beyond level % = 0 means enter at the level; 0.25 waits for 0.25% overshoot beyond the level."),
+                                html.Li("SL, TP levels, max adverse DD, and dynamic stop rules work the same way as the main dynamic checkup, but from this reversal entry."),
+                                html.Li("Entry offset grid % tests how many tasks still trigger if you require extra overshoot before reversal entry."),
+                            ], style={"marginTop": 0}),
+                            html.P("Examples:", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                            html.Ul([
+                                html.Li("Offset 0%: enter reversal as soon as the signal level is touched."),
+                                html.Li("Offset 0.25% on resistance: wait until high reaches resistance +0.25%, then test SELL reversal."),
+                                html.Li("Offset 0.25% on support: wait until low reaches support -0.25%, then test BUY reversal."),
+                                html.Li("Dynamic stop rule 1:0.3 still means: after +1% favorable reversal move, move stop to lock +0.3%."),
+                            ], style={"marginTop": 0}),
+                            html.P(
+                                "The level-reversal summary table shows triggered entries, not-triggered entries, TP hit rows, SL events, "
+                                "adverse-DD events, stop-after-TP, dynamic-stop-moved rows, SL grid rows, and entry-offset grid rows.",
+                                style={"marginBottom": 0}
+                            ),
+                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#fff4de", "border": "1px solid #f4d19b", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False),
                     html.Div([
                         html.Label("Entry offset beyond level %:", style={"width": "210px", "display": "inline-block"}),
                         html.Span(" ⓘ", title="0 means enter at the signal level. 0.2 means wait for 0.2% beyond resistance/support before entering the reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
