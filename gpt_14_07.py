@@ -3238,6 +3238,8 @@ def build_root_layout():
     dcc.Store(id="measure-mode-store", data=False),
     dcc.Store(id="measure-anchor-store", data=True),
     dcc.Store(id="measure-hover-store", data=True),
+    dcc.Store(id="chart-info-box-store", data=True),
+    dcc.Store(id="chart-extend-x-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
@@ -3389,6 +3391,26 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "78px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Info Box: On", id="toggle-chart-info-box-btn", title="Toggle the candle hover information box while keeping the vertical crosshair line", style={
+                                "background": "#fff8e1",
+                                "color": "black",
+                                "border": "1px solid #f9a825",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "94px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Extend X: Off", id="toggle-chart-extend-x-btn", title="Add TradingView-style empty space to the right side of the chart", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "94px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Clear Measure", id="clear-measure-btn", style={
@@ -6321,6 +6343,24 @@ def toggle_volume(n_clicks, current):
 def toggle_strategy(n_clicks, current):
     return not current
 
+@app.callback(
+    Output("chart-info-box-store", "data"),
+    Input("toggle-chart-info-box-btn", "n_clicks"),
+    State("chart-info-box-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_chart_info_box(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("chart-extend-x-store", "data"),
+    Input("toggle-chart-extend-x-btn", "n_clicks"),
+    State("chart-extend-x-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_chart_extend_x(n_clicks, current):
+    return not current
+
 # ----- Measurement tool callbacks -----
 @app.callback(
     Output("measure-mode-store", "data"),
@@ -6433,6 +6473,46 @@ def update_measure_hover_button(hover_enabled):
         "fontWeight": "bold" if hover_enabled else "normal"
     }
     return ("Hover: On" if hover_enabled else "Hover: Off"), base_style
+
+@app.callback(
+    Output("toggle-chart-info-box-btn", "children"),
+    Output("toggle-chart-info-box-btn", "style"),
+    Input("chart-info-box-store", "data"),
+    prevent_initial_call=False
+)
+def update_chart_info_box_button(info_enabled):
+    base_style = {
+        "background": "#fff8e1" if info_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #f9a825" if info_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "94px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if info_enabled else "normal"
+    }
+    return ("Info Box: On" if info_enabled else "Info Box: Off"), base_style
+
+@app.callback(
+    Output("toggle-chart-extend-x-btn", "children"),
+    Output("toggle-chart-extend-x-btn", "style"),
+    Input("chart-extend-x-store", "data"),
+    prevent_initial_call=False
+)
+def update_chart_extend_x_button(extend_enabled):
+    base_style = {
+        "background": "#e3f2fd" if extend_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if extend_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "94px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if extend_enabled else "normal"
+    }
+    return ("Extend X: On" if extend_enabled else "Extend X: Off"), base_style
 
 def _extract_measure_point(click_data, anchor_enabled=True):
     """Return {'x': ..., 'y': ...} from Plotly clickData.
@@ -6786,11 +6866,13 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("measure-mode-store", "data"),
     Input("measure-anchor-store", "data"),
     Input("measure-hover-store", "data"),
+    Input("chart-info-box-store", "data"),
+    Input("chart-extend-x-store", "data"),
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_anchor, measure_hover, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_anchor, measure_hover, chart_info_box, chart_extend_x, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -6845,7 +6927,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             x=df['x'], open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
             customdata=df[['close', 'timestamp']].values,
-            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+            increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+            hovertemplate=(
+                "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+                "Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}"
+                "<extra></extra>"
+            )
         ), row=1, col=1)
         if measure_anchor:
             # Invisible close-price points make the Measure tool reliable because
@@ -7089,7 +7176,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         xaxis_rangeslider_visible=False,
         template="plotly_white",
-        hovermode=("closest" if (not measure_mode or measure_hover) else False),
+        hovermode=("x" if (not measure_mode or measure_hover) else False),
         hoverdistance=6,
         spikedistance=6,
         clickmode="event+select",
@@ -7106,11 +7193,20 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         ticklabelmode="period",
         ticks="outside",
         showspikes=bool(not measure_mode or measure_hover),
-        spikemode="across",
+        spikemode="across+toaxis",
+        spikecolor="#666",
         spikesnap="cursor",
         spikethickness=1,
         spikedash="dash"
     )
+    fig.update_yaxes(showspikes=False)
+    if chart_extend_x and len(df) > 1:
+        candle_step = df['x'].iloc[-1] - df['x'].iloc[-2]
+        if candle_step.total_seconds() > 0:
+            right_padding_bars = max(20, min(120, int(len(df) * 0.25)))
+            fig.update_xaxes(range=[df['x'].iloc[0], df['x'].iloc[-1] + candle_step * right_padding_bars])
+    if not chart_info_box:
+        fig.update_traces(hoverinfo="skip", hovertemplate=None)
     if measure_mode and not measure_hover:
         # Clean measurement mode: hide all hover labels, event-marker tooltips,
         # signal marker tooltips, and helper-trace hover boxes so nothing covers
