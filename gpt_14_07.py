@@ -3998,6 +3998,9 @@ def render_tab(tab):
                                 html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
                                 html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
                                 html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
+                                html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
+                                html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
+                                html.Li("The optional stochastic close section reports whether the trade closed by the three stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
                                 html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
                             ], style={"marginTop": 0}),
                         ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
@@ -7486,6 +7489,9 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         "max_move_pct": 0.0,
         "exit_return_pct": None,
         "exit_reason": "open",
+        "stop_return_pct": None,
+        "initial_stop_hit": False,
+        "moved_stop_hit": False,
         "oscillator_exit_hit": False,
         "oscillator_exit_idx": None,
     }
@@ -7522,6 +7528,9 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if low <= stop_price:
                 result["stop_hit"] = True
                 result["exit_return_pct"] = current_stop_return_pct
+                result["stop_return_pct"] = current_stop_return_pct
+                result["initial_stop_hit"] = abs(current_stop_return_pct + stop_loss_pct) < 1e-12
+                result["moved_stop_hit"] = not result["initial_stop_hit"]
                 result["exit_reason"] = "stop"
                 break
             if max_dd_price is not None and low <= max_dd_price:
@@ -7542,6 +7551,9 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if high >= stop_price:
                 result["stop_hit"] = True
                 result["exit_return_pct"] = current_stop_return_pct
+                result["stop_return_pct"] = current_stop_return_pct
+                result["initial_stop_hit"] = abs(current_stop_return_pct + stop_loss_pct) < 1e-12
+                result["moved_stop_hit"] = not result["initial_stop_hit"]
                 result["exit_reason"] = "stop"
                 break
             if max_dd_price is not None and high >= max_dd_price:
@@ -8191,6 +8203,26 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
     }
 
 
+def bucket_stochastic_exit_return(return_pct):
+    """Bucket realized stochastic-close return for diagnostic summary rows."""
+    if return_pct is None:
+        return None
+    value = float(return_pct)
+    if value < 0:
+        return "Loss <0%"
+    if value < 0.5:
+        return "Profit 0-0.5%"
+    if value < 1:
+        return "Profit 0.5-1%"
+    if value < 2:
+        return "Profit 1-2%"
+    if value < 3:
+        return "Profit 2-3%"
+    if value < 4:
+        return "Profit 3-4%"
+    return "Profit 4%+"
+
+
 def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None):
     """Build a read-only diagnostic table for oscillator-confirmed reversal entries."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
@@ -8222,7 +8254,8 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
 
     def scenario_summary(label, scenario_results):
         scenario_total = len(scenario_results)
-        stop_events = sum(1 for r in scenario_results if r["stop_hit"])
+        original_sl_events = sum(1 for r in scenario_results if r.get("initial_stop_hit"))
+        moved_stop_events = sum(1 for r in scenario_results if r.get("moved_stop_hit"))
         max_dd_events = sum(1 for r in scenario_results if r["max_dd_hit"])
         tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
         tp1 = sum(1 for r in scenario_results if any(level >= 1.0 for level in r["tp_hits"]))
@@ -8234,11 +8267,13 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         total_net_usd = sum(scenario_net) / 100 * notional_usd
         return html.Tr([html.Td(label, style=td_style), html.Td(
             f"entries {fmt_stat(scenario_total, len(eligible_tasks))} | TP0.5 {fmt_stat(tp05, scenario_total)} | TP1 {fmt_stat(tp1, scenario_total)} | "
-            f"SL {fmt_stat(stop_events, scenario_total)} | adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
-            f"stop moved {fmt_stat(stop_moved, scenario_total)} | osc close {fmt_stat(oscillator_exits, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
+            f"original SL exit {fmt_stat(original_sl_events, scenario_total)} | moved-stop exit {fmt_stat(moved_stop_events, scenario_total)} | adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
+            f"stop armed {fmt_stat(stop_moved, scenario_total)} | stochastic close {fmt_stat(oscillator_exits, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
             style=td_style)])
 
     stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    original_sl_events = sum(1 for r in valid_results if r.get("initial_stop_hit"))
+    moved_stop_events = sum(1 for r in valid_results if r.get("moved_stop_hit"))
     max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
     stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
     stop_moved = sum(1 for r in valid_results if r["stop_moves"])
@@ -8247,6 +8282,14 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
     down_sources = [s for s in sources if s.get("toward_direction") == "down"]
     up_paths = [p for p in paths if p.get("toward_direction") == "up"]
     down_paths = [p for p in paths if p.get("toward_direction") == "down"]
+    stochastic_exit_bucket_order = ["Loss <0%", "Profit 0-0.5%", "Profit 0.5-1%", "Profit 1-2%", "Profit 2-3%", "Profit 3-4%", "Profit 4%+"]
+    stochastic_exit_buckets = {label: 0 for label in stochastic_exit_bucket_order}
+    for result in valid_results:
+        if result.get("oscillator_exit_hit"):
+            bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
+            if bucket:
+                stochastic_exit_buckets[bucket] += 1
+    actual_tp_executions = 0
     rows = [
         html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
         html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
@@ -8260,26 +8303,35 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         html.Tr([html.Td("Level crossed but oscillator did not trigger", style=td_style), html.Td(fmt_stat(max(level_cross_count - valid_total, 0), len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Active entry oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
         html.Tr([html.Td("Active stochastic close filters", style=td_style), html.Td(format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else "disabled", style=td_style)]),
-        html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
-        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
-        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
-        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
-        html.Tr([html.Td("Closed by stochastic exit", style=td_style), html.Td(fmt_stat(oscillator_exit_count, valid_total), style=td_style)]),
+        html.Tr([html.Td(f"Original SL exits (menu SL {float(stop_loss_pct or 0):g}%)", style=td_style), html.Td(fmt_stat(original_sl_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Moved/trailing stop exits", style=td_style), html.Td(fmt_stat(moved_stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Any stop exit (original + moved)", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap exits", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop exit after at least one TP checkpoint", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop armed/moved at least once", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+        html.Tr([html.Td("Actual TP orders executed", style=td_style), html.Td(f"{actual_tp_executions} / {valid_total} (TP levels are checkpoints only in this diagnostic)", style=td_style)]),
+        html.Tr([html.Td("Actual stochastic close exits", style=td_style), html.Td(fmt_stat(oscillator_exit_count, valid_total), style=td_style)]),
+        html.Tr([html.Td("Open/no actual exit fallback", style=td_style), html.Td(fmt_stat(sum(1 for r in valid_results if r.get("exit_return_pct") is None), valid_total), style=td_style)]),
     ]
     rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Oscillator reversal scenario"))
+    if oscillator_exit_specs:
+        rows.append(html.Tr([html.Td("— Stochastic close realized-return spread —", style=td_style), html.Td("Only trades actually closed by stochastic conditions", style=td_style)]))
+        for bucket_label in stochastic_exit_bucket_order:
+            rows.append(html.Tr([html.Td(bucket_label, style=td_style), html.Td(fmt_stat(stochastic_exit_buckets[bucket_label], oscillator_exit_count), style=td_style)]))
+    rows.append(html.Tr([html.Td("— TP checkpoint hits (not actual TP orders) —", style=td_style), html.Td("These count favorable price moves reached before the actual exit", style=td_style)]))
     for level in tp_levels:
         label = fmt_dynamic_level_label(level)
         tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
         rows.append(html.Tr([html.Td(f"TP {label} found after oscillator entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
     for trigger_pct, stop_profit_pct in stop_rules:
         moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
-        rows.append(html.Tr([html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style), html.Td(fmt_stat(moved, valid_total), style=td_style)]))
+        rows.append(html.Tr([html.Td(f"Dynamic stop armed: after +{fmt_dynamic_level_label(trigger_pct)} move stop to {stop_profit_pct:g}% return", style=td_style), html.Td(fmt_stat(moved, valid_total), style=td_style)]))
     sl_grid = sl_grid or []
     if sl_grid:
-        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same oscillator filters, TP levels, max adverse DD, and stop rules", style=td_style)]))
+        rows.append(html.Tr([html.Td("— Original SL grid scenarios —", style=td_style), html.Td("Each row reruns the same entries/exits with a different original stop-loss distance", style=td_style)]))
         for sl_pct in sl_grid:
             scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs) for p in paths]
-            rows.append(scenario_summary(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", scenario_results))
+            rows.append(scenario_summary(f"Original SL set to {fmt_dynamic_level_label(sl_pct)}", scenario_results))
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
 def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, offset_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
