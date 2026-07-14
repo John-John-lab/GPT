@@ -3238,6 +3238,8 @@ def build_root_layout():
     dcc.Store(id="measure-mode-store", data=False),
     dcc.Store(id="measure-anchor-store", data=True),
     dcc.Store(id="measure-hover-store", data=True),
+    dcc.Store(id="chart-info-box-store", data=True),
+    dcc.Store(id="chart-extend-x-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
@@ -3389,6 +3391,26 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "78px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Info Box: On", id="toggle-chart-info-box-btn", title="Toggle the candle hover information box while keeping the vertical crosshair line", style={
+                                "background": "#fff8e1",
+                                "color": "black",
+                                "border": "1px solid #f9a825",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "94px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Extend X: Off", id="toggle-chart-extend-x-btn", title="Add TradingView-style empty space to the right side of the chart", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "94px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Clear Measure", id="clear-measure-btn", style={
@@ -4023,6 +4045,43 @@ def render_tab(tab):
                         html.Label("Stop rules:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
                         html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
                     ], style={"marginBottom": "10px"}),
+                    html.Details([
+                        html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
+                        html.Div([
+                            html.P("When enabled, the simulated position waits for these three stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
+                            html.Div([
+                                dcc.Checklist(id="osc-exit-enabled-input", options=[{"label": "Enable stochastic close", "value": "enabled"}], value=[], style={"display": "inline-block", "marginRight": "20px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.H5("Close SELL positions (resistance entries)", style={"margin": "8px 0", "color": "#6a1b9a"}),
+                                html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-sell-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-sell-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "10px"}),
+                            html.Div([
+                                html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
+                                html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-buy-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-buy-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "4px"}),
+                        ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False, style={"marginBottom": "10px"}),
                     html.Div([
                         html.Label("Notional USD:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
                         html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
@@ -6321,6 +6380,24 @@ def toggle_volume(n_clicks, current):
 def toggle_strategy(n_clicks, current):
     return not current
 
+@app.callback(
+    Output("chart-info-box-store", "data"),
+    Input("toggle-chart-info-box-btn", "n_clicks"),
+    State("chart-info-box-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_chart_info_box(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("chart-extend-x-store", "data"),
+    Input("toggle-chart-extend-x-btn", "n_clicks"),
+    State("chart-extend-x-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_chart_extend_x(n_clicks, current):
+    return not current
+
 # ----- Measurement tool callbacks -----
 @app.callback(
     Output("measure-mode-store", "data"),
@@ -6433,6 +6510,120 @@ def update_measure_hover_button(hover_enabled):
         "fontWeight": "bold" if hover_enabled else "normal"
     }
     return ("Hover: On" if hover_enabled else "Hover: Off"), base_style
+
+@app.callback(
+    Output("toggle-chart-info-box-btn", "children"),
+    Output("toggle-chart-info-box-btn", "style"),
+    Input("chart-info-box-store", "data"),
+    prevent_initial_call=False
+)
+def update_chart_info_box_button(info_enabled):
+    base_style = {
+        "background": "#fff8e1" if info_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #f9a825" if info_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "94px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if info_enabled else "normal"
+    }
+    return ("Info Box: On" if info_enabled else "Info Box: Off"), base_style
+
+@app.callback(
+    Output("toggle-chart-extend-x-btn", "children"),
+    Output("toggle-chart-extend-x-btn", "style"),
+    Input("chart-extend-x-store", "data"),
+    prevent_initial_call=False
+)
+def update_chart_extend_x_button(extend_enabled):
+    base_style = {
+        "background": "#e3f2fd" if extend_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if extend_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "94px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if extend_enabled else "normal"
+    }
+    return ("Extend X: On" if extend_enabled else "Extend X: Off"), base_style
+
+
+clientside_callback(
+    """
+function(measureMode, measureHover, infoBox, extendX, figure) {
+    if (!figure || !figure.layout) {
+        return window.dash_clientside.no_update;
+    }
+    const fig = JSON.parse(JSON.stringify(figure));
+    fig.layout = fig.layout || {};
+    fig.layout.dragmode = measureMode ? 'drawrect' : 'pan';
+    const showHover = (!measureMode || measureHover);
+    fig.layout.hovermode = showHover ? 'x' : false;
+
+    const meta = fig.layout.meta || {};
+    const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
+    Object.keys(fig.layout).forEach(function(key) {
+        if (/^xaxis[0-9]*$/.test(key)) {
+            fig.layout[key].showspikes = showHover;
+            fig.layout[key].spikemode = 'across+toaxis';
+            fig.layout[key].spikecolor = '#666';
+            fig.layout[key].spikethickness = 1;
+            fig.layout[key].spikedash = 'dash';
+            if (targetRange && targetRange.length === 2) {
+                fig.layout[key].range = targetRange;
+                fig.layout[key].autorange = false;
+            } else if (!extendX) {
+                delete fig.layout[key].range;
+                fig.layout[key].autorange = true;
+            }
+        }
+        if (/^yaxis[0-9]*$/.test(key)) {
+            fig.layout[key].showspikes = false;
+        }
+    });
+
+    const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
+    (fig.data || []).forEach(function(trace) {
+        const isHelper = trace.name && String(trace.name).startsWith('_');
+        if (!showHover || !infoBox || isHelper) {
+            trace.hoverinfo = 'skip';
+            trace.hovertemplate = null;
+            return;
+        }
+        if (trace.type === 'candlestick') {
+            delete trace.hoverinfo;
+            trace.hovertemplate = candleTemplate;
+        } else if (trace.name && String(trace.name).includes('%D')) {
+            trace.hoverinfo = 'skip';
+            trace.hovertemplate = null;
+        } else if (trace.name && String(trace.name).includes('Volume')) {
+            delete trace.hoverinfo;
+            trace.hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
+        } else if (trace.name && String(trace.name).includes('RSI')) {
+            delete trace.hoverinfo;
+            trace.hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
+        } else if (trace.name && String(trace.name).includes('%K')) {
+            delete trace.hoverinfo;
+            const cleanName = String(trace.name).replace(' %K', '');
+            trace.hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+        }
+    });
+    fig.layout.uirevision = fig.layout.uirevision || 'chart';
+    return fig;
+}
+""",
+    Output("task-chart", "figure", allow_duplicate=True),
+    Input("measure-mode-store", "data"),
+    Input("measure-hover-store", "data"),
+    Input("chart-info-box-store", "data"),
+    Input("chart-extend-x-store", "data"),
+    State("task-chart", "figure"),
+    prevent_initial_call=True
+)
 
 def _extract_measure_point(click_data, anchor_enabled=True):
     """Return {'x': ..., 'y': ...} from Plotly clickData.
@@ -6783,14 +6974,12 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
-    Input("measure-mode-store", "data"),
     Input("measure-anchor-store", "data"),
-    Input("measure-hover-store", "data"),
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_anchor, measure_hover, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -6845,7 +7034,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             x=df['x'], open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
             customdata=df[['close', 'timestamp']].values,
-            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+            increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+            hovertemplate=(
+                "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+                "Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}"
+                "<extra></extra>"
+            )
         ), row=1, col=1)
         if measure_anchor:
             # Invisible close-price points make the Measure tool reliable because
@@ -6869,7 +7063,8 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     def add_rsi_trace(target_fig, row):
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
-            line=dict(color='purple', width=1.5), connectgaps=True
+            line=dict(color='purple', width=1.5), connectgaps=True,
+            hovertemplate='RSI: %{y:.2f}<extra></extra>'
         ), row=row, col=1)
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=[50] * len(df), mode='lines',
@@ -6883,12 +7078,13 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     def add_stochastic_trace(target_fig, row, k_col, d_col, title, color):
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df[k_col], mode='lines', name=f'{title} %K',
-            line=dict(color=color, width=1.4), connectgaps=True
+            line=dict(color=color, width=1.4), connectgaps=True,
+            hovertemplate=f'{title}: %{{y:.2f}}<extra></extra>'
         ), row=row, col=1)
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
             line=dict(color='#555', width=0.9, dash='dot'), connectgaps=True,
-            showlegend=False
+            showlegend=False, hoverinfo='skip'
         ), row=row, col=1)
         target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
         target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
@@ -7060,7 +7256,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
             font=dict(color='white', size=11)
         )
-    elif measure_mode and measure_first and not measure_second:
+    elif measure_first and not measure_second:
         fig.add_trace(go.Scatter(
             x=[measure_first['x']], y=[measure_first['y']],
             mode='markers', showlegend=False, name='Measure start',
@@ -7089,14 +7285,19 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         xaxis_rangeslider_visible=False,
         template="plotly_white",
-        hovermode=("closest" if (not measure_mode or measure_hover) else False),
+        hovermode="x",
         hoverdistance=6,
         spikedistance=6,
         clickmode="event+select",
-        dragmode="drawrect" if measure_mode else "pan",
+        dragmode="pan",
         newshape=dict(line_color="#1976d2", fillcolor="rgba(25,118,210,0.08)", opacity=0.35),
         height=980 if stochastic_visible else (780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500)),
-        margin=dict(l=50, r=50, t=50, b=50)
+        margin=dict(l=50, r=50, t=50, b=50),
+        meta={
+            "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
+            "extended_xrange": None,
+        },
+        uirevision=f"{task_id}-{start_ms}-{end_ms}"
     )
     # X-axis tick format and native Plotly spike lines.
     # showspikes + spikemode="across" keeps the thin dashed hover line synced
@@ -7105,17 +7306,23 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         tickformat="%H:%M",
         ticklabelmode="period",
         ticks="outside",
-        showspikes=bool(not measure_mode or measure_hover),
-        spikemode="across",
+        showspikes=True,
+        spikemode="across+toaxis",
+        spikecolor="#666",
         spikesnap="cursor",
         spikethickness=1,
         spikedash="dash"
     )
-    if measure_mode and not measure_hover:
-        # Clean measurement mode: hide all hover labels, event-marker tooltips,
-        # signal marker tooltips, and helper-trace hover boxes so nothing covers
-        # the exact chart point being measured.
-        fig.update_traces(hoverinfo="skip", hovertemplate=None)
+    fig.update_yaxes(showspikes=False)
+    if len(df) > 1:
+        candle_step = df['x'].iloc[-1] - df['x'].iloc[-2]
+        if candle_step.total_seconds() > 0:
+            right_padding_bars = max(20, min(120, int(len(df) * 0.25)))
+            fig.layout.meta["extended_xrange"] = [df['x'].iloc[0], df['x'].iloc[-1] + candle_step * right_padding_bars]
+    try:
+        fig.update_layout(hoversubplots="axis")
+    except ValueError:
+        pass
     return fig
 
 # =============================================================================
@@ -7264,8 +7471,8 @@ def build_dynamic_checkup_path(task):
     }
 
 
-def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
-    """Evaluate one preloaded path for a specific SL/DD/trailing-stop scenario."""
+def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=None):
+    """Evaluate one preloaded path for a specific SL/DD/trailing-stop/oscillator-close scenario."""
     result = {
         "valid": False,
         "level_reached": False,
@@ -7279,6 +7486,8 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         "max_move_pct": 0.0,
         "exit_return_pct": None,
         "exit_reason": "open",
+        "oscillator_exit_hit": False,
+        "oscillator_exit_idx": None,
     }
     if not path:
         return result
@@ -7296,8 +7505,10 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
     max_dd_price = None
     if max_dd_pct > 0:
         max_dd_price = entry_price * (1 - max_dd_pct / 100) if direction == "buy" else entry_price * (1 + max_dd_pct / 100)
+    selected_exit_specs = select_exit_specs_for_path(path, oscillator_exit_specs)
+    close_values = path.get("closes")
 
-    for high, low in zip(path["highs"], path["lows"]):
+    for idx, (high, low) in enumerate(zip(path["highs"], path["lows"])):
         if direction == "buy":
             # If max-DD is tighter than the initial/trailing stop, classify the
             # adverse exit as DD cap first. This keeps scenario-grid counts
@@ -7362,6 +7573,21 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
                     stop_price = candidate_stop
                     current_stop_return_pct = stop_profit_pct
                     result["stop_moves"].add(trigger_pct)
+
+        if selected_exit_specs and close_values is not None and idx > 0:
+            oscillator_ready = all(
+                spec.get("condition") == "disabled" or (
+                    spec.get("column") in path and oscillator_condition_met(path[spec["column"]], idx, spec["level"], spec["condition"])
+                )
+                for spec in selected_exit_specs
+            )
+            if oscillator_ready:
+                close_price = float(close_values[idx])
+                result["oscillator_exit_hit"] = True
+                result["oscillator_exit_idx"] = idx
+                result["exit_return_pct"] = ((close_price - entry_price) / entry_price * 100) if direction == "buy" else ((entry_price - close_price) / entry_price * 100)
+                result["exit_reason"] = "oscillator_close"
+                break
 
     result["stopped_before_level"] = bool((result["stop_hit"] or result["max_dd_hit"]) and not result["level_reached"])
     result["stop_after_tp"] = bool((result["stop_hit"] or result["max_dd_hit"]) and len(result["tp_hits"]) > 0)
@@ -7799,6 +8025,34 @@ def build_oscillator_spec_groups(up_inputs, down_inputs):
     }
 
 
+def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, default_stoch_level):
+    """Build normalized stochastic-only exit specs using the same curve style as oscillator entries."""
+    return [
+        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+    ]
+
+
+def build_stochastic_exit_spec_groups(enabled_values, sell_inputs, buy_inputs):
+    """Build optional stochastic close specs for SELL and BUY oscillator-reversal positions."""
+    enabled = bool(enabled_values and "enabled" in enabled_values)
+    if not enabled:
+        return None
+    groups = {
+        "sell": build_stochastic_exit_specs(*sell_inputs, default_stoch_level=13.0),
+        "buy": build_stochastic_exit_specs(*buy_inputs, default_stoch_level=87.0),
+    }
+    has_active_condition = any(spec["condition"] != "disabled" for specs in groups.values() for spec in specs)
+    return groups if has_active_condition else None
+
+
+def select_exit_specs_for_path(path, exit_specs):
+    if not exit_specs or not path:
+        return []
+    return exit_specs.get(path.get("direction"), []) if isinstance(exit_specs, dict) else (exit_specs or [])
+
+
 def select_oscillator_specs_for_source(source, oscillator_specs):
     """Select oscillator group by reliable task/source direction: resistance=up, support=down."""
     if isinstance(oscillator_specs, dict):
@@ -7809,10 +8063,10 @@ def select_oscillator_specs_for_source(source, oscillator_specs):
 
 def format_oscillator_specs(specs):
     if isinstance(specs, dict):
-        return " | ".join([
-            f"UP-toward: {format_oscillator_specs(specs.get('up', []))}",
-            f"DOWN-toward: {format_oscillator_specs(specs.get('down', []))}",
-        ])
+        preferred_labels = [("up", "UP-toward"), ("down", "DOWN-toward"), ("sell", "SELL close"), ("buy", "BUY close")]
+        parts = [f"{label}: {format_oscillator_specs(specs.get(key, []))}" for key, label in preferred_labels if key in specs]
+        extra_parts = [f"{key}: {format_oscillator_specs(value)}" for key, value in specs.items() if key not in {item[0] for item in preferred_labels}]
+        return " | ".join(parts + extra_parts) if parts or extra_parts else "all oscillator filters disabled"
     parts = []
     for spec in specs:
         if spec["condition"] == "disabled":
@@ -7926,6 +8180,10 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
         "signal_price": signal_price,
         "highs": path_df["high"].to_numpy(dtype=float, copy=False),
         "lows": path_df["low"].to_numpy(dtype=float, copy=False),
+        "closes": path_df["close"].to_numpy(dtype=float, copy=False),
+        "stoch_k_14_1_3": path_df["stoch_k_14_1_3"].to_numpy(dtype=float, copy=False),
+        "stoch_k_40_1_4": path_df["stoch_k_40_1_4"].to_numpy(dtype=float, copy=False),
+        "stoch_k_60_1_10": path_df["stoch_k_60_1_10"].to_numpy(dtype=float, copy=False),
         "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
         "level_cross_idx": cross_idx,
         "oscillator_idx": oscillator_idx,
@@ -7933,7 +8191,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
     }
 
 
-def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
+def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None):
     """Build a read-only diagnostic table for oscillator-confirmed reversal entries."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
     notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
@@ -7955,7 +8213,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         path = build_oscillator_reversal_path_from_source(source, oscillator_specs)
         if path:
             paths.append(path)
-    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in paths]
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs) for p in paths]
     valid_results = [r for r in results if r["valid"]]
     valid_total = len(valid_results)
 
@@ -7969,6 +8227,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
         tp1 = sum(1 for r in scenario_results if any(level >= 1.0 for level in r["tp_hits"]))
         stop_moved = sum(1 for r in scenario_results if r["stop_moves"])
+        oscillator_exits = sum(1 for r in scenario_results if r.get("oscillator_exit_hit"))
         scenario_net = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in scenario_results]
         scenario_net = [r for r in scenario_net if r is not None]
         avg_net = sum(scenario_net) / scenario_total if scenario_total else 0.0
@@ -7976,13 +8235,14 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         return html.Tr([html.Td(label, style=td_style), html.Td(
             f"entries {fmt_stat(scenario_total, len(eligible_tasks))} | TP0.5 {fmt_stat(tp05, scenario_total)} | TP1 {fmt_stat(tp1, scenario_total)} | "
             f"SL {fmt_stat(stop_events, scenario_total)} | adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
-            f"stop moved {fmt_stat(stop_moved, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
+            f"stop moved {fmt_stat(stop_moved, scenario_total)} | osc close {fmt_stat(oscillator_exits, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
             style=td_style)])
 
     stop_events = sum(1 for r in valid_results if r["stop_hit"])
     max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
     stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
     stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    oscillator_exit_count = sum(1 for r in valid_results if r.get("oscillator_exit_hit"))
     up_sources = [s for s in sources if s.get("toward_direction") == "up"]
     down_sources = [s for s in sources if s.get("toward_direction") == "down"]
     up_paths = [p for p in paths if p.get("toward_direction") == "up"]
@@ -7998,11 +8258,13 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         html.Tr([html.Td("UP-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(up_paths), len(up_sources)), style=td_style)]),
         html.Tr([html.Td("DOWN-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(down_paths), len(down_sources)), style=td_style)]),
         html.Tr([html.Td("Level crossed but oscillator did not trigger", style=td_style), html.Td(fmt_stat(max(level_cross_count - valid_total, 0), len(eligible_tasks)), style=td_style)]),
-        html.Tr([html.Td("Active oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
+        html.Tr([html.Td("Active entry oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
+        html.Tr([html.Td("Active stochastic close filters", style=td_style), html.Td(format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else "disabled", style=td_style)]),
         html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
         html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+        html.Tr([html.Td("Closed by stochastic exit", style=td_style), html.Td(fmt_stat(oscillator_exit_count, valid_total), style=td_style)]),
     ]
     rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Oscillator reversal scenario"))
     for level in tp_levels:
@@ -8016,7 +8278,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
     if sl_grid:
         rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same oscillator filters, TP levels, max adverse DD, and stop rules", style=td_style)]))
         for sl_pct in sl_grid:
-            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in paths]
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs) for p in paths]
             rows.append(scenario_summary(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", scenario_results))
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
@@ -8251,13 +8513,26 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-reversal-tp-levels-input", "value"),
     State("osc-reversal-trail-rules-input", "value"),
     State("osc-reversal-sl-grid-input", "value"),
+    State("osc-exit-enabled-input", "value"),
+    State("osc-exit-sell-stoch-14-level-input", "value"),
+    State("osc-exit-sell-stoch-14-condition-input", "value"),
+    State("osc-exit-sell-stoch-40-level-input", "value"),
+    State("osc-exit-sell-stoch-40-condition-input", "value"),
+    State("osc-exit-sell-stoch-60-level-input", "value"),
+    State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-14-level-input", "value"),
+    State("osc-exit-buy-stoch-14-condition-input", "value"),
+    State("osc-exit-buy-stoch-40-level-input", "value"),
+    State("osc-exit-buy-stoch-40-condition-input", "value"),
+    State("osc-exit-buy-stoch-60-level-input", "value"),
+    State("osc-exit-buy-stoch-60-condition-input", "value"),
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update
@@ -8276,6 +8551,19 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
                 down_rsi_level, down_rsi_condition,
             ),
         )
+        oscillator_exit_specs = build_stochastic_exit_spec_groups(
+            exit_enabled,
+            (
+                exit_sell_stoch14_level, exit_sell_stoch14_condition,
+                exit_sell_stoch40_level, exit_sell_stoch40_condition,
+                exit_sell_stoch60_level, exit_sell_stoch60_condition,
+            ),
+            (
+                exit_buy_stoch14_level, exit_buy_stoch14_condition,
+                exit_buy_stoch40_level, exit_buy_stoch40_condition,
+                exit_buy_stoch60_level, exit_buy_stoch60_condition,
+            ),
+        )
         tp_levels = parse_dynamic_percent_levels(tp_text)
         stop_rules = parse_dynamic_stop_rules(stop_rules_text)
         sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
@@ -8292,11 +8580,12 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
             notional_usd=notional_usd,
             round_trip_cost_pct=round_trip_cost_pct,
             open_return_pct=open_return_pct,
+            oscillator_exit_specs=oscillator_exit_specs,
         )
         elapsed = time.time() - started
         status = (
             f"✅ Oscillator reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
-            f"filters={format_oscillator_specs(oscillator_specs)}; "
+            f"entry filters={format_oscillator_specs(oscillator_specs)}; close filters={format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else 'disabled'}; "
             f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
             f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
