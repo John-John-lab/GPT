@@ -3238,6 +3238,8 @@ def build_root_layout():
     dcc.Store(id="measure-mode-store", data=False),
     dcc.Store(id="measure-anchor-store", data=True),
     dcc.Store(id="measure-hover-store", data=True),
+    dcc.Store(id="chart-info-box-store", data=True),
+    dcc.Store(id="chart-extend-x-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
@@ -3389,6 +3391,26 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "78px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Info Box: On", id="toggle-chart-info-box-btn", title="Toggle the candle hover information box while keeping the vertical crosshair line", style={
+                                "background": "#fff8e1",
+                                "color": "black",
+                                "border": "1px solid #f9a825",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "94px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Extend X: Off", id="toggle-chart-extend-x-btn", title="Add TradingView-style empty space to the right side of the chart", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "94px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Clear Measure", id="clear-measure-btn", style={
@@ -3976,6 +3998,10 @@ def render_tab(tab):
                                 html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
                                 html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
                                 html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
+                                html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
+                                html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
+                                html.Li("The optional stochastic close section reports whether the trade closed by the three stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
+                                html.Li("Condition windows broaden multi-oscillator checks: a window of 1 requires all enabled conditions on the same candle; a window of 3 allows each condition to occur within the current candle or previous 2 candles."),
                                 html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
                             ], style={"marginTop": 0}),
                         ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
@@ -4024,12 +4050,88 @@ def render_tab(tab):
                         html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Div([
+                        html.Label("Entry condition window:", style={"width": "150px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Number of candles where oscillator entry conditions may line up. 1 means all enabled conditions must be true on the same candle. 3 means each enabled condition may have occurred within the current candle or previous 2 candles.", style={"cursor": "help", "color": "#4a148c"}),
+                        dcc.Input(id="osc-entry-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
+                        html.Label("Close condition window:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
+                        dcc.Input(id="osc-exit-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
+                        html.Span("1 = same candle; 3 = current + previous 2 candles", style={"marginLeft": "10px", "color": "#777"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Details([
+                        html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
+                        html.Div([
+                            html.P("When enabled, the simulated position waits for these three stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
+                            html.Div([
+                                dcc.Checklist(id="osc-exit-enabled-input", options=[{"label": "Enable stochastic close", "value": "enabled"}], value=[], style={"display": "inline-block", "marginRight": "20px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.H5("Close SELL positions (resistance entries)", style={"margin": "8px 0", "color": "#6a1b9a"}),
+                                html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-sell-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-sell-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "10px"}),
+                            html.Div([
+                                html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
+                                html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-buy-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-buy-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            ], style={"marginBottom": "4px"}),
+                        ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
+                    ], open=False, style={"marginBottom": "10px"}),
+                    html.Div([
                         html.Label("Notional USD:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
                         html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
                         html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
                     ], style={"marginBottom": "10px"}),
                     html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
                     dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                    html.Details([
+                        html.Summary("🔎 Research optimizer – compare oscillator/SL/stop combinations", style={"fontWeight": "bold", "cursor": "pointer", "color": "#4a148c", "marginTop": "14px"}),
+                        html.Div([
+                            html.P("Research mode runs multiple what-if combinations over historical candles and ranks them by net expectancy. It is for discovery/optimization, not a no-lookahead trading signal. After finding a candidate, validate it on a separate date range.", style={"color": "#555", "margin": "6px 0"}),
+                            html.Details([html.Summary("ⓘ How research optimizer works", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}), html.Ul([
+                                html.Li("It reuses the oscillator settings above as the base condition set."),
+                                html.Li("Condition variants test Base, Relaxed, and Strict levels. Relaxed makes high-threshold groups easier and low-threshold groups easier; Strict does the opposite."),
+                                html.Li("Window grids test whether conditions should align on the same candle or within several candles."),
+                                html.Li("SL grid and stop-rule presets test risk management combinations side by side."),
+                                html.Li("The ranked table includes entries, win-rate %, stop exits, stochastic exits, TP checkpoint success %, profit buckets, net expectancy, profit factor, and a plain-language advice column."),
+                                html.Li("It does not magically know future live reversals; it researches historical candles to find which settings would have captured reversals with lower adverse movement and better net results."),
+                            ], style={"fontSize": "13px", "lineHeight": "1.4"})], open=False),
+                            html.Div([
+                                html.Label("Entry windows:", style={"width": "110px", "display": "inline-block"}), dcc.Input(id="osc-research-entry-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
+                                html.Label("Close windows:", style={"width": "110px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-exit-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
+                                html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-sl-grid-input", type="text", value="1, 1.5, 2, 2.5, 3", style={"width": "180px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Stop-rule presets:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Textarea(id="osc-research-stop-presets-input", value="1:0.35, 1.5:0.75, 2:1, 3:2, 4:3 | 0.7:0.25, 1:0.5, 2:1, 3:2, 4:3 | 1:0.5, 2:1, 3:2, 4:3", style={"width": "640px", "height": "44px", "verticalAlign": "middle"}),
+                                html.Span("Separate presets with |", style={"marginLeft": "8px", "color": "#777"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Max combinations:", style={"width": "120px", "display": "inline-block"}), dcc.Input(id="osc-research-max-combos-input", type="number", value=120, min=1, max=500, step=1, style={"width": "90px"}),
+                                html.Label("Top rows:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-top-input", type="number", value=20, min=5, max=100, step=1, style={"width": "80px"}),
+                                html.Button("Run Research Optimizer", id="osc-research-run-btn", n_clicks=0, style={"fontWeight": "bold", "marginLeft": "15px"}),
+                            ], style={"marginBottom": "8px"}),
+                            dcc.Loading(type="circle", children=[html.Div(id="osc-research-status", style={"marginTop": "8px", "fontWeight": "bold"}), html.Div(id="osc-research-results", style={"marginTop": "10px", "maxHeight": "520px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                        ], style={"padding": "8px", "backgroundColor": "#f6edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "marginTop": "8px"}),
+                    ], open=False),
                 ], style={"padding": "10px", "backgroundColor": "#fbf3ff", "borderRadius": "5px", "border": "1px solid #ce93d8"})
             ], open=False, style={"marginBottom": "20px"}),
             # ----- Strategy Info Panel (collapsible) – Professional version -----
@@ -6321,6 +6423,24 @@ def toggle_volume(n_clicks, current):
 def toggle_strategy(n_clicks, current):
     return not current
 
+@app.callback(
+    Output("chart-info-box-store", "data"),
+    Input("toggle-chart-info-box-btn", "n_clicks"),
+    State("chart-info-box-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_chart_info_box(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("chart-extend-x-store", "data"),
+    Input("toggle-chart-extend-x-btn", "n_clicks"),
+    State("chart-extend-x-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_chart_extend_x(n_clicks, current):
+    return not current
+
 # ----- Measurement tool callbacks -----
 @app.callback(
     Output("measure-mode-store", "data"),
@@ -6433,6 +6553,120 @@ def update_measure_hover_button(hover_enabled):
         "fontWeight": "bold" if hover_enabled else "normal"
     }
     return ("Hover: On" if hover_enabled else "Hover: Off"), base_style
+
+@app.callback(
+    Output("toggle-chart-info-box-btn", "children"),
+    Output("toggle-chart-info-box-btn", "style"),
+    Input("chart-info-box-store", "data"),
+    prevent_initial_call=False
+)
+def update_chart_info_box_button(info_enabled):
+    base_style = {
+        "background": "#fff8e1" if info_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #f9a825" if info_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "94px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if info_enabled else "normal"
+    }
+    return ("Info Box: On" if info_enabled else "Info Box: Off"), base_style
+
+@app.callback(
+    Output("toggle-chart-extend-x-btn", "children"),
+    Output("toggle-chart-extend-x-btn", "style"),
+    Input("chart-extend-x-store", "data"),
+    prevent_initial_call=False
+)
+def update_chart_extend_x_button(extend_enabled):
+    base_style = {
+        "background": "#e3f2fd" if extend_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if extend_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "94px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if extend_enabled else "normal"
+    }
+    return ("Extend X: On" if extend_enabled else "Extend X: Off"), base_style
+
+
+clientside_callback(
+    """
+function(measureMode, measureHover, infoBox, extendX, figure) {
+    if (!figure || !figure.layout) {
+        return window.dash_clientside.no_update;
+    }
+    const fig = JSON.parse(JSON.stringify(figure));
+    fig.layout = fig.layout || {};
+    fig.layout.dragmode = measureMode ? 'drawrect' : 'pan';
+    const showHover = (!measureMode || measureHover);
+    fig.layout.hovermode = showHover ? 'x' : false;
+
+    const meta = fig.layout.meta || {};
+    const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
+    Object.keys(fig.layout).forEach(function(key) {
+        if (/^xaxis[0-9]*$/.test(key)) {
+            fig.layout[key].showspikes = showHover;
+            fig.layout[key].spikemode = 'across+toaxis';
+            fig.layout[key].spikecolor = '#666';
+            fig.layout[key].spikethickness = 1;
+            fig.layout[key].spikedash = 'dash';
+            if (targetRange && targetRange.length === 2) {
+                fig.layout[key].range = targetRange;
+                fig.layout[key].autorange = false;
+            } else if (!extendX) {
+                delete fig.layout[key].range;
+                fig.layout[key].autorange = true;
+            }
+        }
+        if (/^yaxis[0-9]*$/.test(key)) {
+            fig.layout[key].showspikes = false;
+        }
+    });
+
+    const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
+    (fig.data || []).forEach(function(trace) {
+        const isHelper = trace.name && String(trace.name).startsWith('_');
+        if (!showHover || !infoBox || isHelper) {
+            trace.hoverinfo = 'skip';
+            trace.hovertemplate = null;
+            return;
+        }
+        if (trace.type === 'candlestick') {
+            delete trace.hoverinfo;
+            trace.hovertemplate = candleTemplate;
+        } else if (trace.name && String(trace.name).includes('%D')) {
+            trace.hoverinfo = 'skip';
+            trace.hovertemplate = null;
+        } else if (trace.name && String(trace.name).includes('Volume')) {
+            delete trace.hoverinfo;
+            trace.hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
+        } else if (trace.name && String(trace.name).includes('RSI')) {
+            delete trace.hoverinfo;
+            trace.hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
+        } else if (trace.name && String(trace.name).includes('%K')) {
+            delete trace.hoverinfo;
+            const cleanName = String(trace.name).replace(' %K', '');
+            trace.hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+        }
+    });
+    fig.layout.uirevision = fig.layout.uirevision || 'chart';
+    return fig;
+}
+""",
+    Output("task-chart", "figure", allow_duplicate=True),
+    Input("measure-mode-store", "data"),
+    Input("measure-hover-store", "data"),
+    Input("chart-info-box-store", "data"),
+    Input("chart-extend-x-store", "data"),
+    State("task-chart", "figure"),
+    prevent_initial_call=True
+)
 
 def _extract_measure_point(click_data, anchor_enabled=True):
     """Return {'x': ..., 'y': ...} from Plotly clickData.
@@ -6783,14 +7017,12 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
-    Input("measure-mode-store", "data"),
     Input("measure-anchor-store", "data"),
-    Input("measure-hover-store", "data"),
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_mode, measure_anchor, measure_hover, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -6845,7 +7077,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             x=df['x'], open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
             customdata=df[['close', 'timestamp']].values,
-            increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+            increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+            hovertemplate=(
+                "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+                "Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}"
+                "<extra></extra>"
+            )
         ), row=1, col=1)
         if measure_anchor:
             # Invisible close-price points make the Measure tool reliable because
@@ -6869,7 +7106,8 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     def add_rsi_trace(target_fig, row):
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
-            line=dict(color='purple', width=1.5), connectgaps=True
+            line=dict(color='purple', width=1.5), connectgaps=True,
+            hovertemplate='RSI: %{y:.2f}<extra></extra>'
         ), row=row, col=1)
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=[50] * len(df), mode='lines',
@@ -6883,12 +7121,13 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     def add_stochastic_trace(target_fig, row, k_col, d_col, title, color):
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df[k_col], mode='lines', name=f'{title} %K',
-            line=dict(color=color, width=1.4), connectgaps=True
+            line=dict(color=color, width=1.4), connectgaps=True,
+            hovertemplate=f'{title}: %{{y:.2f}}<extra></extra>'
         ), row=row, col=1)
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
             line=dict(color='#555', width=0.9, dash='dot'), connectgaps=True,
-            showlegend=False
+            showlegend=False, hoverinfo='skip'
         ), row=row, col=1)
         target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
         target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
@@ -7060,7 +7299,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
             font=dict(color='white', size=11)
         )
-    elif measure_mode and measure_first and not measure_second:
+    elif measure_first and not measure_second:
         fig.add_trace(go.Scatter(
             x=[measure_first['x']], y=[measure_first['y']],
             mode='markers', showlegend=False, name='Measure start',
@@ -7089,14 +7328,19 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         xaxis_rangeslider_visible=False,
         template="plotly_white",
-        hovermode=("closest" if (not measure_mode or measure_hover) else False),
+        hovermode="x",
         hoverdistance=6,
         spikedistance=6,
         clickmode="event+select",
-        dragmode="drawrect" if measure_mode else "pan",
+        dragmode="pan",
         newshape=dict(line_color="#1976d2", fillcolor="rgba(25,118,210,0.08)", opacity=0.35),
         height=980 if stochastic_visible else (780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500)),
-        margin=dict(l=50, r=50, t=50, b=50)
+        margin=dict(l=50, r=50, t=50, b=50),
+        meta={
+            "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
+            "extended_xrange": None,
+        },
+        uirevision=f"{task_id}-{start_ms}-{end_ms}"
     )
     # X-axis tick format and native Plotly spike lines.
     # showspikes + spikemode="across" keeps the thin dashed hover line synced
@@ -7105,17 +7349,23 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         tickformat="%H:%M",
         ticklabelmode="period",
         ticks="outside",
-        showspikes=bool(not measure_mode or measure_hover),
-        spikemode="across",
+        showspikes=True,
+        spikemode="across+toaxis",
+        spikecolor="#666",
         spikesnap="cursor",
         spikethickness=1,
         spikedash="dash"
     )
-    if measure_mode and not measure_hover:
-        # Clean measurement mode: hide all hover labels, event-marker tooltips,
-        # signal marker tooltips, and helper-trace hover boxes so nothing covers
-        # the exact chart point being measured.
-        fig.update_traces(hoverinfo="skip", hovertemplate=None)
+    fig.update_yaxes(showspikes=False)
+    if len(df) > 1:
+        candle_step = df['x'].iloc[-1] - df['x'].iloc[-2]
+        if candle_step.total_seconds() > 0:
+            right_padding_bars = max(20, min(120, int(len(df) * 0.25)))
+            fig.layout.meta["extended_xrange"] = [df['x'].iloc[0], df['x'].iloc[-1] + candle_step * right_padding_bars]
+    try:
+        fig.update_layout(hoversubplots="axis")
+    except ValueError:
+        pass
     return fig
 
 # =============================================================================
@@ -7264,8 +7514,8 @@ def build_dynamic_checkup_path(task):
     }
 
 
-def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules):
-    """Evaluate one preloaded path for a specific SL/DD/trailing-stop scenario."""
+def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=None, oscillator_exit_window=1):
+    """Evaluate one preloaded path for a specific SL/DD/trailing-stop/oscillator-close scenario."""
     result = {
         "valid": False,
         "level_reached": False,
@@ -7279,6 +7529,11 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         "max_move_pct": 0.0,
         "exit_return_pct": None,
         "exit_reason": "open",
+        "stop_return_pct": None,
+        "initial_stop_hit": False,
+        "moved_stop_hit": False,
+        "oscillator_exit_hit": False,
+        "oscillator_exit_idx": None,
     }
     if not path:
         return result
@@ -7296,8 +7551,10 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
     max_dd_price = None
     if max_dd_pct > 0:
         max_dd_price = entry_price * (1 - max_dd_pct / 100) if direction == "buy" else entry_price * (1 + max_dd_pct / 100)
+    selected_exit_specs = select_exit_specs_for_path(path, oscillator_exit_specs)
+    close_values = path.get("closes")
 
-    for high, low in zip(path["highs"], path["lows"]):
+    for idx, (high, low) in enumerate(zip(path["highs"], path["lows"])):
         if direction == "buy":
             # If max-DD is tighter than the initial/trailing stop, classify the
             # adverse exit as DD cap first. This keeps scenario-grid counts
@@ -7311,6 +7568,9 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if low <= stop_price:
                 result["stop_hit"] = True
                 result["exit_return_pct"] = current_stop_return_pct
+                result["stop_return_pct"] = current_stop_return_pct
+                result["initial_stop_hit"] = abs(current_stop_return_pct + stop_loss_pct) < 1e-12
+                result["moved_stop_hit"] = not result["initial_stop_hit"]
                 result["exit_reason"] = "stop"
                 break
             if max_dd_price is not None and low <= max_dd_price:
@@ -7331,6 +7591,9 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if high >= stop_price:
                 result["stop_hit"] = True
                 result["exit_return_pct"] = current_stop_return_pct
+                result["stop_return_pct"] = current_stop_return_pct
+                result["initial_stop_hit"] = abs(current_stop_return_pct + stop_loss_pct) < 1e-12
+                result["moved_stop_hit"] = not result["initial_stop_hit"]
                 result["exit_reason"] = "stop"
                 break
             if max_dd_price is not None and high >= max_dd_price:
@@ -7362,6 +7625,24 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
                     stop_price = candidate_stop
                     current_stop_return_pct = stop_profit_pct
                     result["stop_moves"].add(trigger_pct)
+
+        if selected_exit_specs and close_values is not None and idx > 0:
+            oscillator_ready = True
+            for spec in selected_exit_specs:
+                condition = normalize_oscillator_condition(spec.get("condition"))
+                if condition == "disabled":
+                    continue
+                column = spec.get("column")
+                if column not in path or not oscillator_condition_met_within_window(path[column], idx, spec["level"], condition, oscillator_exit_window, min_idx=0):
+                    oscillator_ready = False
+                    break
+            if oscillator_ready:
+                close_price = float(close_values[idx])
+                result["oscillator_exit_hit"] = True
+                result["oscillator_exit_idx"] = idx
+                result["exit_return_pct"] = ((close_price - entry_price) / entry_price * 100) if direction == "buy" else ((entry_price - close_price) / entry_price * 100)
+                result["exit_reason"] = "oscillator_close"
+                break
 
     result["stopped_before_level"] = bool((result["stop_hit"] or result["max_dd_hit"]) and not result["level_reached"])
     result["stop_after_tp"] = bool((result["stop_hit"] or result["max_dd_hit"]) and len(result["tp_hits"]) > 0)
@@ -7781,6 +8062,28 @@ def oscillator_condition_met(values, idx, level, condition):
     return False
 
 
+def oscillator_condition_met_within_window(values, idx, level, condition, window=1, min_idx=0):
+    """Return True when one oscillator condition matched within a recent past/current candle window."""
+    window = max(1, int(window or 1))
+    start_idx = max(int(min_idx or 0), idx - window + 1)
+    return any(oscillator_condition_met(values, check_idx, level, condition) for check_idx in range(start_idx, idx + 1))
+
+
+def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
+    """Require every enabled oscillator spec to have matched within the same past/current window."""
+    for spec in specs:
+        condition = normalize_oscillator_condition(spec.get("condition"))
+        if condition == "disabled":
+            continue
+        column = spec.get("column")
+        if column not in df:
+            return False
+        values = df[column].to_numpy(dtype=float)
+        if not oscillator_condition_met_within_window(values, idx, spec["level"], condition, window, min_idx=min_idx):
+            return False
+    return True
+
+
 def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
     """Build normalized oscillator condition specs from UI values."""
     return [
@@ -7799,6 +8102,34 @@ def build_oscillator_spec_groups(up_inputs, down_inputs):
     }
 
 
+def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, default_stoch_level):
+    """Build normalized stochastic-only exit specs using the same curve style as oscillator entries."""
+    return [
+        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+    ]
+
+
+def build_stochastic_exit_spec_groups(enabled_values, sell_inputs, buy_inputs):
+    """Build optional stochastic close specs for SELL and BUY oscillator-reversal positions."""
+    enabled = bool(enabled_values and "enabled" in enabled_values)
+    if not enabled:
+        return None
+    groups = {
+        "sell": build_stochastic_exit_specs(*sell_inputs, default_stoch_level=13.0),
+        "buy": build_stochastic_exit_specs(*buy_inputs, default_stoch_level=87.0),
+    }
+    has_active_condition = any(spec["condition"] != "disabled" for specs in groups.values() for spec in specs)
+    return groups if has_active_condition else None
+
+
+def select_exit_specs_for_path(path, exit_specs):
+    if not exit_specs or not path:
+        return []
+    return exit_specs.get(path.get("direction"), []) if isinstance(exit_specs, dict) else (exit_specs or [])
+
+
 def select_oscillator_specs_for_source(source, oscillator_specs):
     """Select oscillator group by reliable task/source direction: resistance=up, support=down."""
     if isinstance(oscillator_specs, dict):
@@ -7809,10 +8140,10 @@ def select_oscillator_specs_for_source(source, oscillator_specs):
 
 def format_oscillator_specs(specs):
     if isinstance(specs, dict):
-        return " | ".join([
-            f"UP-toward: {format_oscillator_specs(specs.get('up', []))}",
-            f"DOWN-toward: {format_oscillator_specs(specs.get('down', []))}",
-        ])
+        preferred_labels = [("up", "UP-toward"), ("down", "DOWN-toward"), ("sell", "SELL close"), ("buy", "BUY close")]
+        parts = [f"{label}: {format_oscillator_specs(specs.get(key, []))}" for key, label in preferred_labels if key in specs]
+        extra_parts = [f"{key}: {format_oscillator_specs(value)}" for key, value in specs.items() if key not in {item[0] for item in preferred_labels}]
+        return " | ".join(parts + extra_parts) if parts or extra_parts else "all oscillator filters disabled"
     parts = []
     for spec in specs:
         if spec["condition"] == "disabled":
@@ -7892,7 +8223,7 @@ def build_oscillator_reversal_source(task):
     return source
 
 
-def build_oscillator_reversal_path_from_source(source, oscillator_specs):
+def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_condition_window=1):
     """Build a reversal path after level cross and oscillator confirmation."""
     if not source:
         return None
@@ -7910,7 +8241,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
     selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
     oscillator_idx = None
     for idx in range(cross_idx, len(df)):
-        if all(oscillator_condition_met(df[spec["column"]].to_numpy(dtype=float), idx, spec["level"], spec["condition"]) for spec in selected_specs):
+        if oscillator_specs_met_within_window(df, selected_specs, idx, entry_condition_window, min_idx=cross_idx):
             oscillator_idx = idx
             break
     if oscillator_idx is None:
@@ -7919,21 +8250,51 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
     entry_price = float(df.iloc[oscillator_idx]["close"])
     if entry_price <= 0:
         return None
-    path_df = df.iloc[oscillator_idx:]
+    # The oscillator signal is only known after this candle closes, so the
+    # simulated trade enters at that close and begins exit/SL scanning on the
+    # next candle.  This avoids using the signal candle's high/low after-the-fact.
+    path_df = df.iloc[oscillator_idx + 1:]
+    if path_df.empty:
+        return None
     return {
         "direction": source["direction"],
         "entry_price": entry_price,
         "signal_price": signal_price,
         "highs": path_df["high"].to_numpy(dtype=float, copy=False),
         "lows": path_df["low"].to_numpy(dtype=float, copy=False),
+        "closes": path_df["close"].to_numpy(dtype=float, copy=False),
+        "stoch_k_14_1_3": path_df["stoch_k_14_1_3"].to_numpy(dtype=float, copy=False),
+        "stoch_k_40_1_4": path_df["stoch_k_40_1_4"].to_numpy(dtype=float, copy=False),
+        "stoch_k_60_1_10": path_df["stoch_k_60_1_10"].to_numpy(dtype=float, copy=False),
         "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
         "level_cross_idx": cross_idx,
         "oscillator_idx": oscillator_idx,
+        "entry_execution": "signal_candle_close_next_candle_path",
         "toward_direction": source.get("toward_direction"),
     }
 
 
-def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
+def bucket_stochastic_exit_return(return_pct):
+    """Bucket realized stochastic-close return for diagnostic summary rows."""
+    if return_pct is None:
+        return None
+    value = float(return_pct)
+    if value < 0:
+        return "Loss <0%"
+    if value < 0.5:
+        return "Profit 0-0.5%"
+    if value < 1:
+        return "Profit 0.5-1%"
+    if value < 2:
+        return "Profit 1-2%"
+    if value < 3:
+        return "Profit 2-3%"
+    if value < 4:
+        return "Profit 3-4%"
+    return "Profit 4%+"
+
+
+def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None, entry_condition_window=1, oscillator_exit_window=1):
     """Build a read-only diagnostic table for oscillator-confirmed reversal entries."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
     notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
@@ -7952,10 +8313,10 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
             crossed = bool((df["low"].to_numpy(dtype=float) <= signal_price).any())
         if crossed:
             level_cross_count += 1
-        path = build_oscillator_reversal_path_from_source(source, oscillator_specs)
+        path = build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_condition_window=entry_condition_window)
         if path:
             paths.append(path)
-    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in paths]
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs, oscillator_exit_window=oscillator_exit_window) for p in paths]
     valid_results = [r for r in results if r["valid"]]
     valid_total = len(valid_results)
 
@@ -7964,29 +8325,42 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
 
     def scenario_summary(label, scenario_results):
         scenario_total = len(scenario_results)
-        stop_events = sum(1 for r in scenario_results if r["stop_hit"])
+        original_sl_events = sum(1 for r in scenario_results if r.get("initial_stop_hit"))
+        moved_stop_events = sum(1 for r in scenario_results if r.get("moved_stop_hit"))
         max_dd_events = sum(1 for r in scenario_results if r["max_dd_hit"])
         tp05 = sum(1 for r in scenario_results if any(level >= 0.5 for level in r["tp_hits"]))
         tp1 = sum(1 for r in scenario_results if any(level >= 1.0 for level in r["tp_hits"]))
         stop_moved = sum(1 for r in scenario_results if r["stop_moves"])
+        oscillator_exits = sum(1 for r in scenario_results if r.get("oscillator_exit_hit"))
         scenario_net = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in scenario_results]
         scenario_net = [r for r in scenario_net if r is not None]
         avg_net = sum(scenario_net) / scenario_total if scenario_total else 0.0
         total_net_usd = sum(scenario_net) / 100 * notional_usd
         return html.Tr([html.Td(label, style=td_style), html.Td(
             f"entries {fmt_stat(scenario_total, len(eligible_tasks))} | TP0.5 {fmt_stat(tp05, scenario_total)} | TP1 {fmt_stat(tp1, scenario_total)} | "
-            f"SL {fmt_stat(stop_events, scenario_total)} | adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
-            f"stop moved {fmt_stat(stop_moved, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
+            f"original SL exit {fmt_stat(original_sl_events, scenario_total)} | moved-stop exit {fmt_stat(moved_stop_events, scenario_total)} | adverse DD cap {fmt_stat(max_dd_events, scenario_total)} | "
+            f"stop armed {fmt_stat(stop_moved, scenario_total)} | stochastic close {fmt_stat(oscillator_exits, scenario_total)} | avg net {avg_net:.3f}% | net P/L ${total_net_usd:,.2f}",
             style=td_style)])
 
     stop_events = sum(1 for r in valid_results if r["stop_hit"])
+    original_sl_events = sum(1 for r in valid_results if r.get("initial_stop_hit"))
+    moved_stop_events = sum(1 for r in valid_results if r.get("moved_stop_hit"))
     max_dd_events = sum(1 for r in valid_results if r["max_dd_hit"])
     stop_after_tp = sum(1 for r in valid_results if r["stop_after_tp"])
     stop_moved = sum(1 for r in valid_results if r["stop_moves"])
+    oscillator_exit_count = sum(1 for r in valid_results if r.get("oscillator_exit_hit"))
     up_sources = [s for s in sources if s.get("toward_direction") == "up"]
     down_sources = [s for s in sources if s.get("toward_direction") == "down"]
     up_paths = [p for p in paths if p.get("toward_direction") == "up"]
     down_paths = [p for p in paths if p.get("toward_direction") == "down"]
+    stochastic_exit_bucket_order = ["Loss <0%", "Profit 0-0.5%", "Profit 0.5-1%", "Profit 1-2%", "Profit 2-3%", "Profit 3-4%", "Profit 4%+"]
+    stochastic_exit_buckets = {label: 0 for label in stochastic_exit_bucket_order}
+    for result in valid_results:
+        if result.get("oscillator_exit_hit"):
+            bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
+            if bucket:
+                stochastic_exit_buckets[bucket] += 1
+    actual_tp_executions = 0
     rows = [
         html.Tr([html.Td("All tasks in snapshot", style=td_style), html.Td(str(total_tasks), style=td_style)]),
         html.Tr([html.Td("Completed tasks considered", style=td_style), html.Td(fmt_stat(len(eligible_tasks), total_tasks), style=td_style)]),
@@ -7998,27 +8372,235 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         html.Tr([html.Td("UP-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(up_paths), len(up_sources)), style=td_style)]),
         html.Tr([html.Td("DOWN-toward oscillator entries", style=td_style), html.Td(fmt_stat(len(down_paths), len(down_sources)), style=td_style)]),
         html.Tr([html.Td("Level crossed but oscillator did not trigger", style=td_style), html.Td(fmt_stat(max(level_cross_count - valid_total, 0), len(eligible_tasks)), style=td_style)]),
-        html.Tr([html.Td("Active oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
-        html.Tr([html.Td("Initial stop events", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
-        html.Tr([html.Td("Max adverse DD cap events", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
-        html.Tr([html.Td("Stop after at least one TP", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
-        html.Tr([html.Td("Dynamic stop moved", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+        html.Tr([html.Td("Active entry oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
+        html.Tr([html.Td("Active stochastic close filters", style=td_style), html.Td(format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else "disabled", style=td_style)]),
+        html.Tr([html.Td("Condition windows", style=td_style), html.Td(f"entry={int(entry_condition_window or 1)} candle(s), close={int(oscillator_exit_window or 1)} candle(s)", style=td_style)]),
+        html.Tr([html.Td(f"Original SL exits (menu SL {float(stop_loss_pct or 0):g}%)", style=td_style), html.Td(fmt_stat(original_sl_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Moved/trailing stop exits", style=td_style), html.Td(fmt_stat(moved_stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Any stop exit (original + moved)", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Max adverse DD cap exits", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
+        html.Tr([html.Td("Stop exit after at least one TP checkpoint", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
+        html.Tr([html.Td("Dynamic stop armed/moved at least once", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
+        html.Tr([html.Td("Actual TP orders executed", style=td_style), html.Td(f"{actual_tp_executions} / {valid_total} (TP levels are checkpoints only in this diagnostic)", style=td_style)]),
+        html.Tr([html.Td("Actual stochastic close exits", style=td_style), html.Td(fmt_stat(oscillator_exit_count, valid_total), style=td_style)]),
+        html.Tr([html.Td("Open/no actual exit fallback", style=td_style), html.Td(fmt_stat(sum(1 for r in valid_results if r.get("exit_return_pct") is None), valid_total), style=td_style)]),
     ]
     rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Oscillator reversal scenario"))
+    if oscillator_exit_specs:
+        rows.append(html.Tr([html.Td("— Stochastic close realized-return spread —", style=td_style), html.Td("Only trades actually closed by stochastic conditions", style=td_style)]))
+        for bucket_label in stochastic_exit_bucket_order:
+            rows.append(html.Tr([html.Td(bucket_label, style=td_style), html.Td(fmt_stat(stochastic_exit_buckets[bucket_label], oscillator_exit_count), style=td_style)]))
+    rows.append(html.Tr([html.Td("— TP checkpoint hits (not actual TP orders) —", style=td_style), html.Td("These count favorable price moves reached before the actual exit", style=td_style)]))
     for level in tp_levels:
         label = fmt_dynamic_level_label(level)
         tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
         rows.append(html.Tr([html.Td(f"TP {label} found after oscillator entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
     for trigger_pct, stop_profit_pct in stop_rules:
         moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
-        rows.append(html.Tr([html.Td(f"Stop moved at {fmt_dynamic_level_label(trigger_pct)} to {stop_profit_pct:g}% profit", style=td_style), html.Td(fmt_stat(moved, valid_total), style=td_style)]))
+        rows.append(html.Tr([html.Td(f"Dynamic stop armed: after +{fmt_dynamic_level_label(trigger_pct)} move stop to {stop_profit_pct:g}% return", style=td_style), html.Td(fmt_stat(moved, valid_total), style=td_style)]))
     sl_grid = sl_grid or []
     if sl_grid:
-        rows.append(html.Tr([html.Td("— SL grid scenarios —", style=td_style), html.Td("Same oscillator filters, TP levels, max adverse DD, and stop rules", style=td_style)]))
+        rows.append(html.Tr([html.Td("— Original SL grid scenarios —", style=td_style), html.Td("Each row reruns the same entries/exits with a different original stop-loss distance", style=td_style)]))
         for sl_pct in sl_grid:
-            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules) for p in paths]
-            rows.append(scenario_summary(f"Initial SL {fmt_dynamic_level_label(sl_pct)}", scenario_results))
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs, oscillator_exit_window=oscillator_exit_window) for p in paths]
+            rows.append(scenario_summary(f"Original SL set to {fmt_dynamic_level_label(sl_pct)}", scenario_results))
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+
+
+def parse_research_stop_rule_presets(text):
+    """Parse research stop-rule preset rows separated by |."""
+    if text is None or str(text).strip() == "":
+        return [parse_dynamic_stop_rules("1:0.35, 1.5:0.75, 2:1, 3:2, 4:3")]
+    presets = []
+    for raw_preset in str(text).split("|"):
+        preset_text = raw_preset.strip()
+        if preset_text:
+            presets.append(parse_dynamic_stop_rules(preset_text))
+    return presets or [[]]
+
+
+def clone_oscillator_specs_with_level_shift(specs, group_kind, level_shift):
+    """Clone specs and relax/stricten thresholds based on high/low group direction."""
+    cloned = []
+    high_extreme_group = group_kind in ("up", "buy")
+    for spec in specs or []:
+        new_spec = dict(spec)
+        condition = normalize_oscillator_condition(new_spec.get("condition"))
+        if condition != "disabled":
+            level = float(new_spec.get("level", 0.0))
+            # Positive level_shift means stricter. High-extreme groups need higher
+            # levels to be stricter; low-extreme groups need lower levels.
+            adjusted = level + level_shift if high_extreme_group else level - level_shift
+            new_spec["level"] = min(100.0, max(0.0, adjusted))
+        cloned.append(new_spec)
+    return cloned
+
+
+def build_oscillator_research_variants(oscillator_specs, oscillator_exit_specs):
+    """Build Base/Relaxed/Strict condition variants for research ranking."""
+    variant_defs = [
+        ("Base levels", 0.0),
+        ("Relaxed levels", -5.0),
+        ("Strict levels", 3.0),
+    ]
+    variants = []
+    for label, shift in variant_defs:
+        entry_variant = None
+        if isinstance(oscillator_specs, dict):
+            entry_variant = {
+                key: clone_oscillator_specs_with_level_shift(value, key, shift)
+                for key, value in oscillator_specs.items()
+            }
+        else:
+            entry_variant = clone_oscillator_specs_with_level_shift(oscillator_specs, "up", shift)
+        exit_variant = None
+        if oscillator_exit_specs:
+            exit_variant = {
+                key: clone_oscillator_specs_with_level_shift(value, key, shift)
+                for key, value in oscillator_exit_specs.items()
+            }
+        variants.append({"label": label, "entry_specs": entry_variant, "exit_specs": exit_variant})
+    return variants
+
+
+def summarize_research_result(label, entry_window, exit_window, stop_loss_pct, stop_rules, paths, results, eligible_total, notional_usd, round_trip_cost_pct, open_return_pct):
+    """Summarize one oscillator research combination into sortable metrics."""
+    valid_results = [r for r in results if r and r.get("valid")]
+    total = len(valid_results)
+    net_returns = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in valid_results]
+    net_returns = [r for r in net_returns if r is not None]
+    gross_returns = [float(r.get("exit_return_pct") if r.get("exit_return_pct") is not None else open_return_pct) for r in valid_results]
+    avg_net = sum(net_returns) / total if total else -999.0
+    total_net_usd = sum(net_returns) / 100 * notional_usd
+    gross_profit_pct = sum(r for r in gross_returns if r > 0)
+    gross_loss_pct = abs(sum(r for r in gross_returns if r < 0))
+    profit_factor = float("inf") if gross_loss_pct == 0 and gross_profit_pct > 0 else (gross_profit_pct / gross_loss_pct if gross_loss_pct else 0.0)
+    stochastic_exits = [r for r in valid_results if r.get("oscillator_exit_hit")]
+    stop_events = sum(1 for r in valid_results if r.get("stop_hit"))
+    original_sl_events = sum(1 for r in valid_results if r.get("initial_stop_hit"))
+    moved_stop_events = sum(1 for r in valid_results if r.get("moved_stop_hit"))
+    tp1 = sum(1 for r in valid_results if any(level >= 1.0 for level in r.get("tp_hits", set())))
+    tp2 = sum(1 for r in valid_results if any(level >= 2.0 for level in r.get("tp_hits", set())))
+    winners = sum(1 for r in net_returns if r > 0)
+    losers = sum(1 for r in net_returns if r < 0)
+    success_rate = winners / total * 100 if total else 0.0
+    stochastic_wins = sum(1 for r in stochastic_exits if get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) and get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) > 0)
+    stochastic_success_rate = stochastic_wins / len(stochastic_exits) * 100 if stochastic_exits else 0.0
+    original_sl_rate = original_sl_events / total * 100 if total else 0.0
+    tp1_rate = tp1 / total * 100 if total else 0.0
+    tp2_rate = tp2 / total * 100 if total else 0.0
+    bucket_order = ["Loss <0%", "Profit 0-0.5%", "Profit 0.5-1%", "Profit 1-2%", "Profit 2-3%", "Profit 3-4%", "Profit 4%+"]
+    buckets = {bucket: 0 for bucket in bucket_order}
+    for result in stochastic_exits:
+        bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
+        if bucket:
+            buckets[bucket] += 1
+    advice = []
+    if total < max(30, eligible_total * 0.03):
+        advice.append("too few entries")
+    if profit_factor < 1:
+        advice.append("PF<1 before costs")
+    if total and original_sl_events / total > 0.35:
+        advice.append("original SL hit rate high")
+    if total and len(stochastic_exits) / total < 0.20:
+        advice.append("few stochastic exits")
+    if total and success_rate < 45:
+        advice.append("low win rate")
+    if avg_net > 0 and profit_factor >= 1.1 and success_rate >= 45:
+        advice.append("candidate for validation")
+    return {
+        "label": label,
+        "entry_window": entry_window,
+        "exit_window": exit_window,
+        "stop_loss_pct": stop_loss_pct,
+        "stop_rules": stop_rules,
+        "entries": total,
+        "eligible_total": eligible_total,
+        "avg_net": avg_net,
+        "total_net_usd": total_net_usd,
+        "profit_factor": profit_factor,
+        "winners": winners,
+        "losers": losers,
+        "success_rate": success_rate,
+        "stochastic_success_rate": stochastic_success_rate,
+        "original_sl_rate": original_sl_rate,
+        "tp1_rate": tp1_rate,
+        "tp2_rate": tp2_rate,
+        "stop_events": stop_events,
+        "original_sl_events": original_sl_events,
+        "moved_stop_events": moved_stop_events,
+        "stochastic_exit_count": len(stochastic_exits),
+        "tp1": tp1,
+        "tp2": tp2,
+        "buckets": buckets,
+        "advice": "; ".join(advice) if advice else "neutral / compare out-of-sample",
+    }
+
+
+def build_oscillator_research_optimizer_table(tasks, oscillator_specs, oscillator_exit_specs, entry_windows, exit_windows, sl_grid, stop_rule_presets, notional_usd, round_trip_cost_pct, open_return_pct, max_combos=120, top_n=20):
+    """Rank oscillator condition/window/SL/stop-rule combinations for research."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd", "verticalAlign": "top"}
+    notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    sources = [build_oscillator_reversal_source(t) for t in eligible_tasks]
+    sources = [s for s in sources if s]
+    variants = build_oscillator_research_variants(oscillator_specs, oscillator_exit_specs)
+    combos = []
+    for variant in variants:
+        for entry_window in entry_windows:
+            for exit_window in exit_windows:
+                paths = [build_oscillator_reversal_path_from_source(source, variant["entry_specs"], entry_condition_window=entry_window) for source in sources]
+                paths = [p for p in paths if p]
+                for stop_loss_pct in sl_grid:
+                    for preset_idx, stop_rules in enumerate(stop_rule_presets, start=1):
+                        combos.append((variant, entry_window, exit_window, paths, stop_loss_pct, preset_idx, stop_rules))
+                        if len(combos) >= int(max_combos or 120):
+                            break
+                    if len(combos) >= int(max_combos or 120):
+                        break
+                if len(combos) >= int(max_combos or 120):
+                    break
+            if len(combos) >= int(max_combos or 120):
+                break
+        if len(combos) >= int(max_combos or 120):
+            break
+    summaries = []
+    for variant, entry_window, exit_window, paths, stop_loss_pct, preset_idx, stop_rules in combos:
+        results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, None, (0.7, 1.0, 2.0, 3.0, 4.0), stop_rules, oscillator_exit_specs=variant["exit_specs"], oscillator_exit_window=exit_window) for p in paths]
+        label = f"{variant['label']} | Stop preset {preset_idx}"
+        summaries.append(summarize_research_result(label, entry_window, exit_window, stop_loss_pct, stop_rules, paths, results, len(eligible_tasks), notional_usd, round_trip_cost_pct, open_return_pct))
+    summaries.sort(key=lambda item: (item["avg_net"], item["profit_factor"], item["entries"]), reverse=True)
+    top_n = max(1, int(top_n or 20))
+    top = summaries[:top_n]
+    header = html.Tr([html.Th(col, style=td_style) for col in ["Rank", "Variant / risk", "Entries", "Win %", "Avg net", "PF", "Stops", "Stoch exits", "TP success", "Stoch exit spread", "Advice"]])
+    rows = [header]
+    for rank, item in enumerate(top, start=1):
+        pf_text = "∞" if item["profit_factor"] == float("inf") else f"{item['profit_factor']:.2f}"
+        bucket_text = " | ".join(f"{k}:{v}" for k, v in item["buckets"].items() if v)
+        if not bucket_text:
+            bucket_text = "none"
+        rows.append(html.Tr([
+            html.Td(str(rank), style=td_style),
+            html.Td(f"{item['label']} | entry win {item['entry_window']} | close win {item['exit_window']} | SL {item['stop_loss_pct']:g}% | rules {format_dynamic_stop_rules_for_display(item['stop_rules'])}", style=td_style),
+            html.Td(f"{item['entries']} / {item['eligible_total']} ({item['entries'] / item['eligible_total'] * 100:.1f}%)" if item['eligible_total'] else "0 / 0", style=td_style),
+            html.Td(f"{item['success_rate']:.1f}% ({item['winners']}W/{item['losers']}L)", style=td_style),
+            html.Td(f"{item['avg_net']:.3f}% | ${item['total_net_usd']:,.0f}", style=td_style),
+            html.Td(pf_text, style=td_style),
+            html.Td(f"any {item['stop_events']} | original {item['original_sl_events']} ({item['original_sl_rate']:.1f}%) | moved {item['moved_stop_events']}", style=td_style),
+            html.Td(f"{item['stochastic_exit_count']} | win {item['stochastic_success_rate']:.1f}%", style=td_style),
+            html.Td(f"TP1 {item['tp1']} ({item['tp1_rate']:.1f}%) | TP2 {item['tp2']} ({item['tp2_rate']:.1f}%)", style=td_style),
+            html.Td(bucket_text, style=td_style),
+            html.Td(item["advice"], style=td_style),
+        ]))
+    explanation = html.Div([
+        html.P(f"Tested {len(summaries)} combinations across {len(sources)} usable sources. Sorted by average net return after costs, then profit factor.", style={"fontWeight": "bold"}),
+        html.P("Use this as research only: pick robust candidates with enough entries, PF above 1, positive average net after costs, acceptable original-SL %, strong win %, and then validate on a separate period.", style={"color": "#555"}),
+    ])
+    return html.Div([explanation, html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "12px"})])
+
+
+def format_dynamic_stop_rules_for_display(stop_rules):
+    return ", ".join(f"{trigger:g}:{target:g}" for trigger, target in (stop_rules or [])) or "none"
 
 def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, offset_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
     """Build a read-only diagnostic table for entering reversal at/after level."""
@@ -8251,17 +8833,34 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-reversal-tp-levels-input", "value"),
     State("osc-reversal-trail-rules-input", "value"),
     State("osc-reversal-sl-grid-input", "value"),
+    State("osc-entry-window-input", "value"),
+    State("osc-exit-window-input", "value"),
+    State("osc-exit-enabled-input", "value"),
+    State("osc-exit-sell-stoch-14-level-input", "value"),
+    State("osc-exit-sell-stoch-14-condition-input", "value"),
+    State("osc-exit-sell-stoch-40-level-input", "value"),
+    State("osc-exit-sell-stoch-40-condition-input", "value"),
+    State("osc-exit-sell-stoch-60-level-input", "value"),
+    State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-14-level-input", "value"),
+    State("osc-exit-buy-stoch-14-condition-input", "value"),
+    State("osc-exit-buy-stoch-40-level-input", "value"),
+    State("osc-exit-buy-stoch-40-condition-input", "value"),
+    State("osc-exit-buy-stoch-60-level-input", "value"),
+    State("osc-exit-buy-stoch-60-condition-input", "value"),
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update
     try:
+        entry_condition_window = max(1, int(entry_condition_window or 1))
+        oscillator_exit_window = max(1, int(oscillator_exit_window or 1))
         oscillator_specs = build_oscillator_spec_groups(
             (
                 stoch14_level, stoch14_condition,
@@ -8274,6 +8873,19 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
                 down_stoch40_level, down_stoch40_condition,
                 down_stoch60_level, down_stoch60_condition,
                 down_rsi_level, down_rsi_condition,
+            ),
+        )
+        oscillator_exit_specs = build_stochastic_exit_spec_groups(
+            exit_enabled,
+            (
+                exit_sell_stoch14_level, exit_sell_stoch14_condition,
+                exit_sell_stoch40_level, exit_sell_stoch40_condition,
+                exit_sell_stoch60_level, exit_sell_stoch60_condition,
+            ),
+            (
+                exit_buy_stoch14_level, exit_buy_stoch14_condition,
+                exit_buy_stoch40_level, exit_buy_stoch40_condition,
+                exit_buy_stoch60_level, exit_buy_stoch60_condition,
             ),
         )
         tp_levels = parse_dynamic_percent_levels(tp_text)
@@ -8292,11 +8904,14 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
             notional_usd=notional_usd,
             round_trip_cost_pct=round_trip_cost_pct,
             open_return_pct=open_return_pct,
+            oscillator_exit_specs=oscillator_exit_specs,
+            entry_condition_window=entry_condition_window,
+            oscillator_exit_window=oscillator_exit_window,
         )
         elapsed = time.time() - started
         status = (
             f"✅ Oscillator reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
-            f"filters={format_oscillator_specs(oscillator_specs)}; "
+            f"entry filters={format_oscillator_specs(oscillator_specs)}; close filters={format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else 'disabled'}; windows entry={entry_condition_window}, close={oscillator_exit_window}; "
             f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
             f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
@@ -8305,6 +8920,109 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     except Exception as exc:
         return f"❌ Oscillator reversal checkup failed: {exc}", no_update
 
+
+
+@app.callback(
+    Output("osc-research-status", "children"),
+    Output("osc-research-results", "children"),
+    Input("osc-research-run-btn", "n_clicks"),
+    State("osc-stoch-14-level-input", "value"),
+    State("osc-stoch-14-condition-input", "value"),
+    State("osc-stoch-40-level-input", "value"),
+    State("osc-stoch-40-condition-input", "value"),
+    State("osc-stoch-60-level-input", "value"),
+    State("osc-stoch-60-condition-input", "value"),
+    State("osc-rsi-level-input", "value"),
+    State("osc-rsi-condition-input", "value"),
+    State("osc-down-stoch-14-level-input", "value"),
+    State("osc-down-stoch-14-condition-input", "value"),
+    State("osc-down-stoch-40-level-input", "value"),
+    State("osc-down-stoch-40-condition-input", "value"),
+    State("osc-down-stoch-60-level-input", "value"),
+    State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-rsi-level-input", "value"),
+    State("osc-down-rsi-condition-input", "value"),
+    State("osc-exit-enabled-input", "value"),
+    State("osc-exit-sell-stoch-14-level-input", "value"),
+    State("osc-exit-sell-stoch-14-condition-input", "value"),
+    State("osc-exit-sell-stoch-40-level-input", "value"),
+    State("osc-exit-sell-stoch-40-condition-input", "value"),
+    State("osc-exit-sell-stoch-60-level-input", "value"),
+    State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-14-level-input", "value"),
+    State("osc-exit-buy-stoch-14-condition-input", "value"),
+    State("osc-exit-buy-stoch-40-level-input", "value"),
+    State("osc-exit-buy-stoch-40-condition-input", "value"),
+    State("osc-exit-buy-stoch-60-level-input", "value"),
+    State("osc-exit-buy-stoch-60-condition-input", "value"),
+    State("osc-research-entry-windows-input", "value"),
+    State("osc-research-exit-windows-input", "value"),
+    State("osc-research-sl-grid-input", "value"),
+    State("osc-research-stop-presets-input", "value"),
+    State("osc-research-max-combos-input", "value"),
+    State("osc-research-top-input", "value"),
+    State("osc-reversal-notional-input", "value"),
+    State("osc-reversal-cost-input", "value"),
+    State("osc-reversal-open-return-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+    """Research optimizer for oscillator settings, windows, SLs, and stop rules."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        oscillator_specs = build_oscillator_spec_groups(
+            (
+                stoch14_level, stoch14_condition,
+                stoch40_level, stoch40_condition,
+                stoch60_level, stoch60_condition,
+                rsi_level, rsi_condition,
+            ),
+            (
+                down_stoch14_level, down_stoch14_condition,
+                down_stoch40_level, down_stoch40_condition,
+                down_stoch60_level, down_stoch60_condition,
+                down_rsi_level, down_rsi_condition,
+            ),
+        )
+        oscillator_exit_specs = build_stochastic_exit_spec_groups(
+            exit_enabled,
+            (
+                exit_sell_stoch14_level, exit_sell_stoch14_condition,
+                exit_sell_stoch40_level, exit_sell_stoch40_condition,
+                exit_sell_stoch60_level, exit_sell_stoch60_condition,
+            ),
+            (
+                exit_buy_stoch14_level, exit_buy_stoch14_condition,
+                exit_buy_stoch40_level, exit_buy_stoch40_condition,
+                exit_buy_stoch60_level, exit_buy_stoch60_condition,
+            ),
+        )
+        entry_windows = [int(v) for v in parse_dynamic_percent_levels(entry_windows_text, default_levels=(1, 3, 5))]
+        exit_windows = [int(v) for v in parse_dynamic_percent_levels(exit_windows_text, default_levels=(1, 3, 5))]
+        sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=(1, 1.5, 2, 2.5, 3))
+        stop_presets = parse_research_stop_rule_presets(stop_presets_text)
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_oscillator_research_optimizer_table(
+            tasks,
+            oscillator_specs,
+            oscillator_exit_specs,
+            entry_windows,
+            exit_windows,
+            sl_grid,
+            stop_presets,
+            notional_usd,
+            round_trip_cost_pct,
+            open_return_pct,
+            max_combos=max_combos,
+            top_n=top_n,
+        )
+        elapsed = time.time() - started
+        return f"✅ Research optimizer run #{n_clicks} complete in {elapsed:.2f}s. Tested up to {int(max_combos or 120)} combinations; showing top {int(top_n or 20)}.", table
+    except Exception as exc:
+        return f"❌ Research optimizer failed: {exc}", no_update
 
 @app.callback(
     Output("impulse-task-selector", "options"),
