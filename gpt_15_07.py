@@ -794,6 +794,42 @@ last_rendered_stats = {} # Cache for summary tables to prevent disappearance
 OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 1500
 oscillator_reversal_source_cache = OrderedDict()
 
+STRATEGY_SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_settings")
+OSCILLATOR_SETTINGS_IDS = [
+    "osc-stoch-14-level-input", "osc-stoch-14-condition-input", "osc-stoch-40-level-input", "osc-stoch-40-condition-input",
+    "osc-stoch-60-level-input", "osc-stoch-60-condition-input", "osc-rsi-level-input", "osc-rsi-condition-input",
+    "osc-down-stoch-14-level-input", "osc-down-stoch-14-condition-input", "osc-down-stoch-40-level-input", "osc-down-stoch-40-condition-input",
+    "osc-down-stoch-60-level-input", "osc-down-stoch-60-condition-input", "osc-down-rsi-level-input", "osc-down-rsi-condition-input",
+    "osc-reversal-sl-input", "osc-reversal-max-dd-input", "osc-reversal-tp-levels-input", "osc-reversal-trail-rules-input",
+    "osc-reversal-sl-grid-input", "osc-entry-window-input", "osc-exit-window-input", "osc-exit-enabled-input",
+    "osc-exit-sell-stoch-14-level-input", "osc-exit-sell-stoch-14-condition-input", "osc-exit-sell-stoch-40-level-input", "osc-exit-sell-stoch-40-condition-input",
+    "osc-exit-sell-stoch-60-level-input", "osc-exit-sell-stoch-60-condition-input", "osc-exit-buy-stoch-14-level-input", "osc-exit-buy-stoch-14-condition-input",
+    "osc-exit-buy-stoch-40-level-input", "osc-exit-buy-stoch-40-condition-input", "osc-exit-buy-stoch-60-level-input", "osc-exit-buy-stoch-60-condition-input",
+    "osc-reversal-notional-input", "osc-reversal-cost-input", "osc-reversal-open-return-input",
+    "osc-research-entry-windows-input", "osc-research-exit-windows-input", "osc-research-sl-grid-input", "osc-research-stop-presets-input",
+    "osc-research-max-combos-input", "osc-research-top-input",
+]
+
+def _safe_strategy_settings_name(name):
+    cleaned = re.sub(r"[^A-Za-z0-9_. -]+", "_", str(name or "")).strip().strip(".")
+    return cleaned[:80] or None
+
+def list_strategy_setting_names():
+    os.makedirs(STRATEGY_SETTINGS_DIR, exist_ok=True)
+    names = []
+    for path in sorted(glob.glob(os.path.join(STRATEGY_SETTINGS_DIR, "*.json"))):
+        names.append(os.path.splitext(os.path.basename(path))[0])
+    return names
+
+def strategy_setting_options():
+    return [{"label": name, "value": name} for name in list_strategy_setting_names()]
+
+def strategy_setting_path(name):
+    safe_name = _safe_strategy_settings_name(name)
+    if not safe_name:
+        return None
+    return os.path.join(STRATEGY_SETTINGS_DIR, f"{safe_name}.json")
+
 # Global stats cache for ALL tasks (calculated once per data version)
 cached_signal_stats_html = None  # Full Signal Performance Summary table
 cached_toward_strategy_stats_html = None  # Separate toward-level strategy summary table
@@ -2934,6 +2970,24 @@ th {
 .strike-through {
     text-decoration: line-through !important;
 }
+.chart-button-strip {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+.chart-button-strip::-webkit-scrollbar {
+    display: none;
+}
+.chart-button-strip button {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    height: 32px;
+    line-height: 1.1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 </style>
 </head>
 <body>
@@ -3230,7 +3284,7 @@ def build_root_layout():
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
-    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": True}),
+    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
     dcc.Store(id="osc-event-groups-store", data={}),
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
@@ -3238,7 +3292,7 @@ def build_root_layout():
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
-    dcc.Store(id="measure-anchor-store", data=True),
+    dcc.Store(id="measure-anchor-store", data=False),
     dcc.Store(id="measure-hover-store", data=True),
     dcc.Store(id="chart-info-box-store", data=True),
     dcc.Store(id="chart-extend-x-store", data=False),
@@ -3249,7 +3303,7 @@ def build_root_layout():
     dcc.Store(id="details-click-store", data={}),   # deduplication for details button
     # --------------------------------
     dcc.Store(id="impulse-visible-store", data=True),
-    dcc.Store(id="events-visible-store", data=True),
+    dcc.Store(id="events-visible-store", data=False),
     dcc.Store(id="impulse-params-store", data={}),
     # 🔧 CRITICAL: Hidden dummy buttons for CustomEvent-triggered callbacks (using html.Button which supports n_clicks)
     html.Button(id="chart-event-dummy", style={"display": "none"}, n_clicks=0),
@@ -3290,13 +3344,15 @@ def build_root_layout():
                 children=[
                     # Button row (Toggle RSI + Toggle Strategy + Measure + Close)
                     html.Div(
+                        className="chart-button-strip",
                         style={
                             "position": "absolute",
                             "top": "10px",
                             "left": "10px",
                             "right": "10px",
                             "display": "flex",
-                            "justifyContent": "flex-end",
+                            "flexWrap": "nowrap",
+                            "justifyContent": "flex-start",
                             "gap": "6px",
                             "overflowX": "auto",
                             "overflowY": "hidden",
@@ -3375,10 +3431,10 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Snap: On", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
-                                "background": "#e8f5e9",
+                            html.Button("Snap: Off", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
+                                "background": "transparent",
                                 "color": "black",
-                                "border": "1px solid #2e7d32",
+                                "border": "1px solid #999",
                                 "padding": "6px 10px",
                                 "cursor": "pointer",
                                 "fontSize": "12px",
@@ -3435,10 +3491,10 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Event Marks: On", id="toggle-chart-event-marks-btn", title="Toggle research entry/exit markers", style={
-                                "background": "#e8f5e9",
+                            html.Button("Event Marks: Off", id="toggle-chart-event-marks-btn", title="Toggle research entry/exit markers", style={
+                                "background": "transparent",
                                 "color": "black",
-                                "border": "1px solid #2e7d32",
+                                "border": "1px solid #999",
                                 "padding": "6px 10px",
                                 "cursor": "pointer",
                                 "fontSize": "12px",
@@ -4112,6 +4168,15 @@ def render_tab(tab):
                         html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
                         html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
                     ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Settings name:", style={"width": "100px", "display": "inline-block"}),
+                        dcc.Input(id="osc-settings-name-input", type="text", placeholder="my stochastic setup", style={"width": "220px"}),
+                        html.Button("Save Settings", id="osc-settings-save-btn", n_clicks=0, style={"marginLeft": "8px"}),
+                        html.Label("Open:", style={"marginLeft": "16px", "marginRight": "6px"}),
+                        dcc.Dropdown(id="osc-settings-open-dropdown", options=strategy_setting_options(), value=None, placeholder="choose saved settings", clearable=False, style={"width": "260px", "display": "inline-block", "verticalAlign": "middle"}),
+                        html.Button("Open Settings", id="osc-settings-open-btn", n_clicks=0, style={"marginLeft": "8px"}),
+                        html.Div(id="osc-settings-status", style={"marginTop": "6px", "color": "#4a148c", "fontWeight": "bold"}),
+                    ], style={"marginBottom": "10px", "padding": "8px", "backgroundColor": "#f1e8ff", "border": "1px solid #ce93d8", "borderRadius": "4px"}),
                     html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
                     dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
                     html.Details([
@@ -8912,6 +8977,55 @@ def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, m
 
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
+
+@app.callback(
+    Output("osc-settings-status", "children"),
+    Output("osc-settings-open-dropdown", "options"),
+    Output("osc-settings-open-dropdown", "value"),
+    Input("osc-settings-save-btn", "n_clicks"),
+    State("osc-settings-name-input", "value"),
+    *[State(component_id, "value") for component_id in OSCILLATOR_SETTINGS_IDS],
+    prevent_initial_call=True,
+)
+def save_oscillator_strategy_settings(n_clicks, settings_name, *values):
+    """Persist oscillator/dynamic stochastic strategy menu values as JSON."""
+    safe_name = _safe_strategy_settings_name(settings_name)
+    if not safe_name:
+        return "❌ Enter a settings name before saving.", strategy_setting_options(), no_update
+    path = strategy_setting_path(safe_name)
+    payload = {
+        "schema_version": 1,
+        "strategy": "oscillator_level_reversal",
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "parameters": {component_id: value for component_id, value in zip(OSCILLATOR_SETTINGS_IDS, values)},
+    }
+    os.makedirs(STRATEGY_SETTINGS_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return f"✅ Saved strategy settings: {safe_name}", strategy_setting_options(), safe_name
+
+@app.callback(
+    Output("osc-settings-status", "children", allow_duplicate=True),
+    Output("osc-settings-open-dropdown", "options", allow_duplicate=True),
+    *[Output(component_id, "value") for component_id in OSCILLATOR_SETTINGS_IDS],
+    Input("osc-settings-open-btn", "n_clicks"),
+    State("osc-settings-open-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def open_oscillator_strategy_settings(n_clicks, settings_name):
+    """Load known oscillator/dynamic stochastic strategy fields from a JSON settings file."""
+    path = strategy_setting_path(settings_name)
+    if not path or not os.path.exists(path):
+        return ("❌ Choose an existing settings file to open.", strategy_setting_options(), *[no_update for _ in OSCILLATOR_SETTINGS_IDS])
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        parameters = payload.get("parameters", {}) if isinstance(payload, dict) else {}
+        values = [parameters.get(component_id, no_update) for component_id in OSCILLATOR_SETTINGS_IDS]
+        loaded_count = sum(1 for value in values if value is not no_update)
+        return (f"✅ Opened {settings_name}: loaded {loaded_count} matching parameters.", strategy_setting_options(), *values)
+    except Exception as exc:
+        return (f"❌ Could not open {settings_name}: {exc}", strategy_setting_options(), *[no_update for _ in OSCILLATOR_SETTINGS_IDS])
 
 @app.callback(
     Output("dynamic-check-status", "children"),
