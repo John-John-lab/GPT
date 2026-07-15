@@ -4001,6 +4001,7 @@ def render_tab(tab):
                                 html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
                                 html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
                                 html.Li("The optional stochastic close section reports whether the trade closed by the three stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
+                                html.Li("Condition windows broaden multi-oscillator checks: a window of 1 requires all enabled conditions on the same candle; a window of 3 allows each condition to occur within the current candle or previous 2 candles."),
                                 html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
                             ], style={"marginTop": 0}),
                         ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
@@ -4047,6 +4048,15 @@ def render_tab(tab):
                     html.Div([
                         html.Label("Stop rules:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
                         html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Entry condition window:", style={"width": "150px", "display": "inline-block"}),
+                        html.Span(" ⓘ", title="Number of candles where oscillator entry conditions may line up. 1 means all enabled conditions must be true on the same candle. 3 means each enabled condition may have occurred within the current candle or previous 2 candles.", style={"cursor": "help", "color": "#4a148c"}),
+                        dcc.Input(id="osc-entry-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
+                        html.Label("Close condition window:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
+                        dcc.Input(id="osc-exit-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
+                        html.Span("1 = same candle; 3 = current + previous 2 candles", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
                     html.Details([
                         html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
@@ -7474,7 +7484,7 @@ def build_dynamic_checkup_path(task):
     }
 
 
-def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=None):
+def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=None, oscillator_exit_window=1):
     """Evaluate one preloaded path for a specific SL/DD/trailing-stop/oscillator-close scenario."""
     result = {
         "valid": False,
@@ -7587,12 +7597,15 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
                     result["stop_moves"].add(trigger_pct)
 
         if selected_exit_specs and close_values is not None and idx > 0:
-            oscillator_ready = all(
-                spec.get("condition") == "disabled" or (
-                    spec.get("column") in path and oscillator_condition_met(path[spec["column"]], idx, spec["level"], spec["condition"])
-                )
-                for spec in selected_exit_specs
-            )
+            oscillator_ready = True
+            for spec in selected_exit_specs:
+                condition = normalize_oscillator_condition(spec.get("condition"))
+                if condition == "disabled":
+                    continue
+                column = spec.get("column")
+                if column not in path or not oscillator_condition_met_within_window(path[column], idx, spec["level"], condition, oscillator_exit_window):
+                    oscillator_ready = False
+                    break
             if oscillator_ready:
                 close_price = float(close_values[idx])
                 result["oscillator_exit_hit"] = True
@@ -8019,6 +8032,28 @@ def oscillator_condition_met(values, idx, level, condition):
     return False
 
 
+def oscillator_condition_met_within_window(values, idx, level, condition, window=1):
+    """Return True when one oscillator condition matched within a recent candle window."""
+    window = max(1, int(window or 1))
+    start_idx = max(0, idx - window + 1)
+    return any(oscillator_condition_met(values, check_idx, level, condition) for check_idx in range(start_idx, idx + 1))
+
+
+def oscillator_specs_met_within_window(df, specs, idx, window=1):
+    """Require every enabled oscillator spec to have matched within the same recent window."""
+    for spec in specs:
+        condition = normalize_oscillator_condition(spec.get("condition"))
+        if condition == "disabled":
+            continue
+        column = spec.get("column")
+        if column not in df:
+            return False
+        values = df[column].to_numpy(dtype=float)
+        if not oscillator_condition_met_within_window(values, idx, spec["level"], condition, window):
+            return False
+    return True
+
+
 def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
     """Build normalized oscillator condition specs from UI values."""
     return [
@@ -8158,7 +8193,7 @@ def build_oscillator_reversal_source(task):
     return source
 
 
-def build_oscillator_reversal_path_from_source(source, oscillator_specs):
+def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_condition_window=1):
     """Build a reversal path after level cross and oscillator confirmation."""
     if not source:
         return None
@@ -8176,7 +8211,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs):
     selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
     oscillator_idx = None
     for idx in range(cross_idx, len(df)):
-        if all(oscillator_condition_met(df[spec["column"]].to_numpy(dtype=float), idx, spec["level"], spec["condition"]) for spec in selected_specs):
+        if oscillator_specs_met_within_window(df, selected_specs, idx, entry_condition_window):
             oscillator_idx = idx
             break
     if oscillator_idx is None:
@@ -8223,7 +8258,7 @@ def bucket_stochastic_exit_return(return_pct):
     return "Profit 4%+"
 
 
-def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None):
+def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None, entry_condition_window=1, oscillator_exit_window=1):
     """Build a read-only diagnostic table for oscillator-confirmed reversal entries."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
     notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
@@ -8242,10 +8277,10 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
             crossed = bool((df["low"].to_numpy(dtype=float) <= signal_price).any())
         if crossed:
             level_cross_count += 1
-        path = build_oscillator_reversal_path_from_source(source, oscillator_specs)
+        path = build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_condition_window=entry_condition_window)
         if path:
             paths.append(path)
-    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs) for p in paths]
+    results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs, oscillator_exit_window=oscillator_exit_window) for p in paths]
     valid_results = [r for r in results if r["valid"]]
     valid_total = len(valid_results)
 
@@ -8303,6 +8338,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         html.Tr([html.Td("Level crossed but oscillator did not trigger", style=td_style), html.Td(fmt_stat(max(level_cross_count - valid_total, 0), len(eligible_tasks)), style=td_style)]),
         html.Tr([html.Td("Active entry oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
         html.Tr([html.Td("Active stochastic close filters", style=td_style), html.Td(format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else "disabled", style=td_style)]),
+        html.Tr([html.Td("Condition windows", style=td_style), html.Td(f"entry={int(entry_condition_window or 1)} candle(s), close={int(oscillator_exit_window or 1)} candle(s)", style=td_style)]),
         html.Tr([html.Td(f"Original SL exits (menu SL {float(stop_loss_pct or 0):g}%)", style=td_style), html.Td(fmt_stat(original_sl_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Moved/trailing stop exits", style=td_style), html.Td(fmt_stat(moved_stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Any stop exit (original + moved)", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
@@ -8330,7 +8366,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
     if sl_grid:
         rows.append(html.Tr([html.Td("— Original SL grid scenarios —", style=td_style), html.Td("Each row reruns the same entries/exits with a different original stop-loss distance", style=td_style)]))
         for sl_pct in sl_grid:
-            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs) for p in paths]
+            scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs, oscillator_exit_window=oscillator_exit_window) for p in paths]
             rows.append(scenario_summary(f"Original SL set to {fmt_dynamic_level_label(sl_pct)}", scenario_results))
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
@@ -8565,6 +8601,8 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-reversal-tp-levels-input", "value"),
     State("osc-reversal-trail-rules-input", "value"),
     State("osc-reversal-sl-grid-input", "value"),
+    State("osc-entry-window-input", "value"),
+    State("osc-exit-window-input", "value"),
     State("osc-exit-enabled-input", "value"),
     State("osc-exit-sell-stoch-14-level-input", "value"),
     State("osc-exit-sell-stoch-14-condition-input", "value"),
@@ -8584,11 +8622,13 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update
     try:
+        entry_condition_window = max(1, int(entry_condition_window or 1))
+        oscillator_exit_window = max(1, int(oscillator_exit_window or 1))
         oscillator_specs = build_oscillator_spec_groups(
             (
                 stoch14_level, stoch14_condition,
@@ -8633,11 +8673,13 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
             round_trip_cost_pct=round_trip_cost_pct,
             open_return_pct=open_return_pct,
             oscillator_exit_specs=oscillator_exit_specs,
+            entry_condition_window=entry_condition_window,
+            oscillator_exit_window=oscillator_exit_window,
         )
         elapsed = time.time() - started
         status = (
             f"✅ Oscillator reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
-            f"entry filters={format_oscillator_specs(oscillator_specs)}; close filters={format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else 'disabled'}; "
+            f"entry filters={format_oscillator_specs(oscillator_specs)}; close filters={format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else 'disabled'}; windows entry={entry_condition_window}, close={oscillator_exit_window}; "
             f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
             f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
