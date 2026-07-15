@@ -820,14 +820,14 @@ def read_chart_parquet_cached(fp):
 STRATEGY_SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_settings")
 OSCILLATOR_SETTINGS_IDS = [
     "osc-stoch-14-level-input", "osc-stoch-14-condition-input", "osc-stoch-40-level-input", "osc-stoch-40-condition-input",
-    "osc-stoch-60-level-input", "osc-stoch-60-condition-input", "osc-rsi-level-input", "osc-rsi-condition-input",
+    "osc-stoch-60-level-input", "osc-stoch-60-condition-input", "osc-stoch-300-level-input", "osc-stoch-300-condition-input", "osc-rsi-level-input", "osc-rsi-condition-input",
     "osc-down-stoch-14-level-input", "osc-down-stoch-14-condition-input", "osc-down-stoch-40-level-input", "osc-down-stoch-40-condition-input",
-    "osc-down-stoch-60-level-input", "osc-down-stoch-60-condition-input", "osc-down-rsi-level-input", "osc-down-rsi-condition-input",
+    "osc-down-stoch-60-level-input", "osc-down-stoch-60-condition-input", "osc-down-stoch-300-level-input", "osc-down-stoch-300-condition-input", "osc-down-rsi-level-input", "osc-down-rsi-condition-input",
     "osc-reversal-sl-input", "osc-reversal-max-dd-input", "osc-reversal-tp-levels-input", "osc-reversal-trail-rules-input",
     "osc-reversal-sl-grid-input", "osc-entry-window-input", "osc-exit-window-input", "osc-exit-enabled-input",
     "osc-exit-sell-stoch-14-level-input", "osc-exit-sell-stoch-14-condition-input", "osc-exit-sell-stoch-40-level-input", "osc-exit-sell-stoch-40-condition-input",
-    "osc-exit-sell-stoch-60-level-input", "osc-exit-sell-stoch-60-condition-input", "osc-exit-buy-stoch-14-level-input", "osc-exit-buy-stoch-14-condition-input",
-    "osc-exit-buy-stoch-40-level-input", "osc-exit-buy-stoch-40-condition-input", "osc-exit-buy-stoch-60-level-input", "osc-exit-buy-stoch-60-condition-input",
+    "osc-exit-sell-stoch-60-level-input", "osc-exit-sell-stoch-60-condition-input", "osc-exit-sell-stoch-300-level-input", "osc-exit-sell-stoch-300-condition-input", "osc-exit-buy-stoch-14-level-input", "osc-exit-buy-stoch-14-condition-input",
+    "osc-exit-buy-stoch-40-level-input", "osc-exit-buy-stoch-40-condition-input", "osc-exit-buy-stoch-60-level-input", "osc-exit-buy-stoch-60-condition-input", "osc-exit-buy-stoch-300-level-input", "osc-exit-buy-stoch-300-condition-input",
     "osc-reversal-notional-input", "osc-reversal-cost-input", "osc-reversal-open-return-input",
     "osc-research-entry-windows-input", "osc-research-exit-windows-input", "osc-research-sl-grid-input", "osc-research-stop-presets-input",
     "osc-research-max-combos-input", "osc-research-top-input",
@@ -4090,13 +4090,13 @@ def render_tab(tab):
                                 html.Li("Support means the toward move is DOWN to support; the DOWN-toward group is used and the test enters BUY after confirmation."),
                                 html.Li("Use the UP-toward group for upper-limit logic, e.g. Stoch crossing down from 87 after price reaches resistance."),
                                 html.Li("Use the DOWN-toward group for lower-limit logic, e.g. Stoch crossing up from 13 after price reaches support."),
-                                html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10."),
+                                html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10, K 300/1/10."),
                                 html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
                                 html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
                                 html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
                                 html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
                                 html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
-                                html.Li("The optional stochastic close section reports whether the trade closed by the three stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
+                                html.Li("The optional stochastic close section reports whether the trade closed by the four stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
                                 html.Li("Condition windows broaden multi-oscillator checks: a window of 1 requires all enabled conditions on the same candle; a window of 3 allows each condition to occur within the current candle or previous 2 candles."),
                                 html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
                             ], style={"marginTop": 0}),
@@ -4115,7 +4115,12 @@ def render_tab(tab):
                         html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     ], style={"marginBottom": "12px"}),
@@ -4132,7 +4137,12 @@ def render_tab(tab):
                         html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-down-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     ], style={"marginBottom": "10px"}),
@@ -4150,14 +4160,14 @@ def render_tab(tab):
                         html.Span(" ⓘ", title="Number of candles where oscillator entry conditions may line up. 1 means all enabled conditions must be true on the same candle. 3 means each enabled condition may have occurred within the current candle or previous 2 candles.", style={"cursor": "help", "color": "#4a148c"}),
                         dcc.Input(id="osc-entry-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
                         html.Label("Close condition window:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
+                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60/300 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
                         dcc.Input(id="osc-exit-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
                         html.Span("1 = same candle; 3 = current + previous 2 candles", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
                     html.Details([
                         html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
                         html.Div([
-                            html.P("When enabled, the simulated position waits for these three stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
+                            html.P("When enabled, the simulated position waits for these four stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
                             html.Div([
                                 dcc.Checklist(id="osc-exit-enabled-input", options=[{"label": "Enable stochastic close", "value": "enabled"}], value=[], style={"display": "inline-block", "marginRight": "20px"}),
                             ], style={"marginBottom": "8px"}),
@@ -4174,6 +4184,9 @@ def render_tab(tab):
                                 html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                                 dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
                                 dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-sell-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             ], style={"marginBottom": "10px"}),
                             html.Div([
                                 html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
@@ -4188,6 +4201,9 @@ def render_tab(tab):
                                 html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                                 dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
                                 dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-buy-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             ], style={"marginBottom": "4px"}),
                         ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
                     ], open=False, style={"marginBottom": "10px"}),
@@ -7338,6 +7354,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         df['stoch_k_14_1_3'], df['stoch_d_14_1_3'] = compute_stochastic(df['high'], df['low'], df['close'], 14, 1, 3)
         df['stoch_k_40_1_4'], df['stoch_d_40_1_4'] = compute_stochastic(df['high'], df['low'], df['close'], 40, 1, 4)
         df['stoch_k_60_1_10'], df['stoch_d_60_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 60, 1, 10)
+        df['stoch_k_300_1_10'], df['stoch_d_300_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 300, 10, 1)
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     else:
@@ -7352,6 +7369,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             ("stoch", ("stoch_k_14_1_3", "stoch_d_14_1_3", "Stoch 14/1/3", "#1565c0")),
             ("stoch", ("stoch_k_40_1_4", "stoch_d_40_1_4", "Stoch 40/1/4", "#ef6c00")),
             ("stoch", ("stoch_k_60_1_10", "stoch_d_60_1_10", "Stoch 60/1/10", "#2e7d32")),
+            ("stoch", ("stoch_k_300_1_10", "stoch_d_300_1_10", "Stoch 300/1/10", "#6a1b9a")),
         ])
     if volume_enabled:
         indicator_specs.append(("volume", None))
@@ -8346,12 +8364,13 @@ def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
     return True
 
 
-def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
+def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
     """Build normalized oscillator condition specs from UI values."""
     return [
         {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
         {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
         {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 300/1/10", "column": "stoch_k_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
         {"label": "RSI(14,14)", "column": "rsi_14_14", "level": float(rsi_level if rsi_level is not None else default_rsi_level), "condition": normalize_oscillator_condition(rsi_condition)},
     ]
 
@@ -8364,12 +8383,13 @@ def build_oscillator_spec_groups(up_inputs, down_inputs):
     }
 
 
-def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, default_stoch_level):
+def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, default_stoch_level):
     """Build normalized stochastic-only exit specs using the same curve style as oscillator entries."""
     return [
         {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
         {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
         {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 300/1/10", "column": "stoch_k_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
     ]
 
 
@@ -8417,6 +8437,7 @@ def format_oscillator_specs(specs):
 def make_oscillator_reversal_source_cache_key(task):
     """Return a stable cache key for oscillator source data derived from one task snapshot."""
     return (
+        "osc_source_v2_stoch300",
         getattr(task, "task_id", None),
         getattr(task, "signal_time", None),
         getattr(task, "signal_price", None),
@@ -8453,6 +8474,7 @@ def build_oscillator_reversal_source_uncached(task):
     df_sorted["stoch_k_14_1_3"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
     df_sorted["stoch_k_40_1_4"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
     df_sorted["stoch_k_60_1_10"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
+    df_sorted["stoch_k_300_1_10"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 10, 1)
     df_sorted["rsi_14_14"] = compute_dynamic_rsi_series(df_sorted["close"], 14).rolling(window=14, min_periods=1).mean()
 
     search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
@@ -9235,6 +9257,8 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-stoch-40-condition-input", "value"),
     State("osc-stoch-60-level-input", "value"),
     State("osc-stoch-60-condition-input", "value"),
+    State("osc-stoch-300-level-input", "value"),
+    State("osc-stoch-300-condition-input", "value"),
     State("osc-rsi-level-input", "value"),
     State("osc-rsi-condition-input", "value"),
     State("osc-down-stoch-14-level-input", "value"),
@@ -9243,6 +9267,8 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-down-stoch-40-condition-input", "value"),
     State("osc-down-stoch-60-level-input", "value"),
     State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-stoch-300-level-input", "value"),
+    State("osc-down-stoch-300-condition-input", "value"),
     State("osc-down-rsi-level-input", "value"),
     State("osc-down-rsi-condition-input", "value"),
     State("osc-reversal-sl-input", "value"),
@@ -9259,19 +9285,23 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-exit-sell-stoch-40-condition-input", "value"),
     State("osc-exit-sell-stoch-60-level-input", "value"),
     State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-sell-stoch-300-level-input", "value"),
+    State("osc-exit-sell-stoch-300-condition-input", "value"),
     State("osc-exit-buy-stoch-14-level-input", "value"),
     State("osc-exit-buy-stoch-14-condition-input", "value"),
     State("osc-exit-buy-stoch-40-level-input", "value"),
     State("osc-exit-buy-stoch-40-condition-input", "value"),
     State("osc-exit-buy-stoch-60-level-input", "value"),
     State("osc-exit-buy-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-300-level-input", "value"),
+    State("osc-exit-buy-stoch-300-condition-input", "value"),
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update, no_update
@@ -9283,12 +9313,14 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
                 stoch14_level, stoch14_condition,
                 stoch40_level, stoch40_condition,
                 stoch60_level, stoch60_condition,
+                stoch300_level, stoch300_condition,
                 rsi_level, rsi_condition,
             ),
             (
                 down_stoch14_level, down_stoch14_condition,
                 down_stoch40_level, down_stoch40_condition,
                 down_stoch60_level, down_stoch60_condition,
+                down_stoch300_level, down_stoch300_condition,
                 down_rsi_level, down_rsi_condition,
             ),
         )
@@ -9298,11 +9330,13 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
                 exit_sell_stoch14_level, exit_sell_stoch14_condition,
                 exit_sell_stoch40_level, exit_sell_stoch40_condition,
                 exit_sell_stoch60_level, exit_sell_stoch60_condition,
+                exit_sell_stoch300_level, exit_sell_stoch300_condition,
             ),
             (
                 exit_buy_stoch14_level, exit_buy_stoch14_condition,
                 exit_buy_stoch40_level, exit_buy_stoch40_condition,
                 exit_buy_stoch60_level, exit_buy_stoch60_condition,
+                exit_buy_stoch300_level, exit_buy_stoch300_condition,
             ),
         )
         tp_levels = parse_dynamic_percent_levels(tp_text)
@@ -9350,6 +9384,8 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-stoch-40-condition-input", "value"),
     State("osc-stoch-60-level-input", "value"),
     State("osc-stoch-60-condition-input", "value"),
+    State("osc-stoch-300-level-input", "value"),
+    State("osc-stoch-300-condition-input", "value"),
     State("osc-rsi-level-input", "value"),
     State("osc-rsi-condition-input", "value"),
     State("osc-down-stoch-14-level-input", "value"),
@@ -9358,6 +9394,8 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-down-stoch-40-condition-input", "value"),
     State("osc-down-stoch-60-level-input", "value"),
     State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-stoch-300-level-input", "value"),
+    State("osc-down-stoch-300-condition-input", "value"),
     State("osc-down-rsi-level-input", "value"),
     State("osc-down-rsi-condition-input", "value"),
     State("osc-exit-enabled-input", "value"),
@@ -9367,12 +9405,16 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-exit-sell-stoch-40-condition-input", "value"),
     State("osc-exit-sell-stoch-60-level-input", "value"),
     State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-sell-stoch-300-level-input", "value"),
+    State("osc-exit-sell-stoch-300-condition-input", "value"),
     State("osc-exit-buy-stoch-14-level-input", "value"),
     State("osc-exit-buy-stoch-14-condition-input", "value"),
     State("osc-exit-buy-stoch-40-level-input", "value"),
     State("osc-exit-buy-stoch-40-condition-input", "value"),
     State("osc-exit-buy-stoch-60-level-input", "value"),
     State("osc-exit-buy-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-300-level-input", "value"),
+    State("osc-exit-buy-stoch-300-condition-input", "value"),
     State("osc-research-entry-windows-input", "value"),
     State("osc-research-exit-windows-input", "value"),
     State("osc-research-sl-grid-input", "value"),
@@ -9385,7 +9427,7 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """Research optimizer for oscillator settings, windows, SLs, and stop rules."""
     if not n_clicks:
         return no_update, no_update
@@ -9395,12 +9437,14 @@ def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition
                 stoch14_level, stoch14_condition,
                 stoch40_level, stoch40_condition,
                 stoch60_level, stoch60_condition,
+                stoch300_level, stoch300_condition,
                 rsi_level, rsi_condition,
             ),
             (
                 down_stoch14_level, down_stoch14_condition,
                 down_stoch40_level, down_stoch40_condition,
                 down_stoch60_level, down_stoch60_condition,
+                down_stoch300_level, down_stoch300_condition,
                 down_rsi_level, down_rsi_condition,
             ),
         )
@@ -9410,11 +9454,13 @@ def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition
                 exit_sell_stoch14_level, exit_sell_stoch14_condition,
                 exit_sell_stoch40_level, exit_sell_stoch40_condition,
                 exit_sell_stoch60_level, exit_sell_stoch60_condition,
+                exit_sell_stoch300_level, exit_sell_stoch300_condition,
             ),
             (
                 exit_buy_stoch14_level, exit_buy_stoch14_condition,
                 exit_buy_stoch40_level, exit_buy_stoch40_condition,
                 exit_buy_stoch60_level, exit_buy_stoch60_condition,
+                exit_buy_stoch300_level, exit_buy_stoch300_condition,
             ),
         )
         entry_windows = [int(v) for v in parse_dynamic_percent_levels(entry_windows_text, default_levels=(1, 3, 5))]
