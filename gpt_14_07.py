@@ -4102,6 +4102,35 @@ def render_tab(tab):
                     ], style={"marginBottom": "10px"}),
                     html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
                     dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                    html.Details([
+                        html.Summary("🔎 Research optimizer – compare oscillator/SL/stop combinations", style={"fontWeight": "bold", "cursor": "pointer", "color": "#4a148c", "marginTop": "14px"}),
+                        html.Div([
+                            html.P("Research mode runs multiple what-if combinations over historical candles and ranks them by net expectancy. It is for discovery/optimization, not a no-lookahead trading signal. After finding a candidate, validate it on a separate date range.", style={"color": "#555", "margin": "6px 0"}),
+                            html.Details([html.Summary("ⓘ How research optimizer works", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}), html.Ul([
+                                html.Li("It reuses the oscillator settings above as the base condition set."),
+                                html.Li("Condition variants test Base, Relaxed, and Strict levels. Relaxed makes high-threshold groups easier and low-threshold groups easier; Strict does the opposite."),
+                                html.Li("Window grids test whether conditions should align on the same candle or within several candles."),
+                                html.Li("SL grid and stop-rule presets test risk management combinations side by side."),
+                                html.Li("The ranked table includes entries, stop exits, stochastic exits, TP checkpoint hits, profit buckets, net expectancy, profit factor, and a plain-language advice column."),
+                            ], style={"fontSize": "13px", "lineHeight": "1.4"})], open=False),
+                            html.Div([
+                                html.Label("Entry windows:", style={"width": "110px", "display": "inline-block"}), dcc.Input(id="osc-research-entry-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
+                                html.Label("Close windows:", style={"width": "110px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-exit-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
+                                html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-sl-grid-input", type="text", value="1, 1.5, 2, 2.5, 3", style={"width": "180px"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Stop-rule presets:", style={"width": "120px", "display": "inline-block"}),
+                                dcc.Textarea(id="osc-research-stop-presets-input", value="1:0.35, 1.5:0.75, 2:1, 3:2, 4:3 | 0.7:0.25, 1:0.5, 2:1, 3:2, 4:3 | 1:0.5, 2:1, 3:2, 4:3", style={"width": "640px", "height": "44px", "verticalAlign": "middle"}),
+                                html.Span("Separate presets with |", style={"marginLeft": "8px", "color": "#777"}),
+                            ], style={"marginBottom": "8px"}),
+                            html.Div([
+                                html.Label("Max combinations:", style={"width": "120px", "display": "inline-block"}), dcc.Input(id="osc-research-max-combos-input", type="number", value=120, min=1, max=500, step=1, style={"width": "90px"}),
+                                html.Label("Top rows:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-top-input", type="number", value=20, min=5, max=100, step=1, style={"width": "80px"}),
+                                html.Button("Run Research Optimizer", id="osc-research-run-btn", n_clicks=0, style={"fontWeight": "bold", "marginLeft": "15px"}),
+                            ], style={"marginBottom": "8px"}),
+                            dcc.Loading(type="circle", children=[html.Div(id="osc-research-status", style={"marginTop": "8px", "fontWeight": "bold"}), html.Div(id="osc-research-results", style={"marginTop": "10px", "maxHeight": "520px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                        ], style={"padding": "8px", "backgroundColor": "#f6edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "marginTop": "8px"}),
+                    ], open=False),
                 ], style={"padding": "10px", "backgroundColor": "#fbf3ff", "borderRadius": "5px", "border": "1px solid #ce93d8"})
             ], open=False, style={"marginBottom": "20px"}),
             # ----- Strategy Info Panel (collapsible) – Professional version -----
@@ -8376,6 +8405,188 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
             rows.append(scenario_summary(f"Original SL set to {fmt_dynamic_level_label(sl_pct)}", scenario_results))
     return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
 
+
+def parse_research_stop_rule_presets(text):
+    """Parse research stop-rule preset rows separated by |."""
+    if text is None or str(text).strip() == "":
+        return [parse_dynamic_stop_rules("1:0.35, 1.5:0.75, 2:1, 3:2, 4:3")]
+    presets = []
+    for raw_preset in str(text).split("|"):
+        preset_text = raw_preset.strip()
+        if preset_text:
+            presets.append(parse_dynamic_stop_rules(preset_text))
+    return presets or [[]]
+
+
+def clone_oscillator_specs_with_level_shift(specs, group_kind, level_shift):
+    """Clone specs and relax/stricten thresholds based on high/low group direction."""
+    cloned = []
+    high_extreme_group = group_kind in ("up", "buy")
+    for spec in specs or []:
+        new_spec = dict(spec)
+        condition = normalize_oscillator_condition(new_spec.get("condition"))
+        if condition != "disabled":
+            level = float(new_spec.get("level", 0.0))
+            # Positive level_shift means stricter. High-extreme groups need higher
+            # levels to be stricter; low-extreme groups need lower levels.
+            adjusted = level + level_shift if high_extreme_group else level - level_shift
+            new_spec["level"] = min(100.0, max(0.0, adjusted))
+        cloned.append(new_spec)
+    return cloned
+
+
+def build_oscillator_research_variants(oscillator_specs, oscillator_exit_specs):
+    """Build Base/Relaxed/Strict condition variants for research ranking."""
+    variant_defs = [
+        ("Base levels", 0.0),
+        ("Relaxed levels", -5.0),
+        ("Strict levels", 3.0),
+    ]
+    variants = []
+    for label, shift in variant_defs:
+        entry_variant = None
+        if isinstance(oscillator_specs, dict):
+            entry_variant = {
+                key: clone_oscillator_specs_with_level_shift(value, key, shift)
+                for key, value in oscillator_specs.items()
+            }
+        else:
+            entry_variant = clone_oscillator_specs_with_level_shift(oscillator_specs, "up", shift)
+        exit_variant = None
+        if oscillator_exit_specs:
+            exit_variant = {
+                key: clone_oscillator_specs_with_level_shift(value, key, shift)
+                for key, value in oscillator_exit_specs.items()
+            }
+        variants.append({"label": label, "entry_specs": entry_variant, "exit_specs": exit_variant})
+    return variants
+
+
+def summarize_research_result(label, entry_window, exit_window, stop_loss_pct, stop_rules, paths, results, eligible_total, notional_usd, round_trip_cost_pct, open_return_pct):
+    """Summarize one oscillator research combination into sortable metrics."""
+    valid_results = [r for r in results if r and r.get("valid")]
+    total = len(valid_results)
+    net_returns = [get_diagnostic_net_return_pct(r, round_trip_cost_pct, open_return_pct) for r in valid_results]
+    net_returns = [r for r in net_returns if r is not None]
+    gross_returns = [float(r.get("exit_return_pct") if r.get("exit_return_pct") is not None else open_return_pct) for r in valid_results]
+    avg_net = sum(net_returns) / total if total else -999.0
+    total_net_usd = sum(net_returns) / 100 * notional_usd
+    gross_profit_pct = sum(r for r in gross_returns if r > 0)
+    gross_loss_pct = abs(sum(r for r in gross_returns if r < 0))
+    profit_factor = float("inf") if gross_loss_pct == 0 and gross_profit_pct > 0 else (gross_profit_pct / gross_loss_pct if gross_loss_pct else 0.0)
+    stochastic_exits = [r for r in valid_results if r.get("oscillator_exit_hit")]
+    stop_events = sum(1 for r in valid_results if r.get("stop_hit"))
+    original_sl_events = sum(1 for r in valid_results if r.get("initial_stop_hit"))
+    moved_stop_events = sum(1 for r in valid_results if r.get("moved_stop_hit"))
+    tp1 = sum(1 for r in valid_results if any(level >= 1.0 for level in r.get("tp_hits", set())))
+    tp2 = sum(1 for r in valid_results if any(level >= 2.0 for level in r.get("tp_hits", set())))
+    winners = sum(1 for r in net_returns if r > 0)
+    losers = sum(1 for r in net_returns if r < 0)
+    bucket_order = ["Loss <0%", "Profit 0-0.5%", "Profit 0.5-1%", "Profit 1-2%", "Profit 2-3%", "Profit 3-4%", "Profit 4%+"]
+    buckets = {bucket: 0 for bucket in bucket_order}
+    for result in stochastic_exits:
+        bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
+        if bucket:
+            buckets[bucket] += 1
+    advice = []
+    if total < max(30, eligible_total * 0.03):
+        advice.append("too few entries")
+    if profit_factor < 1:
+        advice.append("PF<1 before costs")
+    if total and original_sl_events / total > 0.35:
+        advice.append("original SL hit rate high")
+    if total and len(stochastic_exits) / total < 0.20:
+        advice.append("few stochastic exits")
+    if avg_net > 0 and profit_factor >= 1.1:
+        advice.append("candidate for validation")
+    return {
+        "label": label,
+        "entry_window": entry_window,
+        "exit_window": exit_window,
+        "stop_loss_pct": stop_loss_pct,
+        "stop_rules": stop_rules,
+        "entries": total,
+        "eligible_total": eligible_total,
+        "avg_net": avg_net,
+        "total_net_usd": total_net_usd,
+        "profit_factor": profit_factor,
+        "winners": winners,
+        "losers": losers,
+        "stop_events": stop_events,
+        "original_sl_events": original_sl_events,
+        "moved_stop_events": moved_stop_events,
+        "stochastic_exit_count": len(stochastic_exits),
+        "tp1": tp1,
+        "tp2": tp2,
+        "buckets": buckets,
+        "advice": "; ".join(advice) if advice else "neutral / compare out-of-sample",
+    }
+
+
+def build_oscillator_research_optimizer_table(tasks, oscillator_specs, oscillator_exit_specs, entry_windows, exit_windows, sl_grid, stop_rule_presets, notional_usd, round_trip_cost_pct, open_return_pct, max_combos=120, top_n=20):
+    """Rank oscillator condition/window/SL/stop-rule combinations for research."""
+    td_style = {"padding": "4px 8px", "border": "1px solid #ddd", "verticalAlign": "top"}
+    notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
+    eligible_tasks = [t for t in tasks if is_task_eligible_for_dynamic_checkup(t)]
+    sources = [build_oscillator_reversal_source(t) for t in eligible_tasks]
+    sources = [s for s in sources if s]
+    variants = build_oscillator_research_variants(oscillator_specs, oscillator_exit_specs)
+    combos = []
+    for variant in variants:
+        for entry_window in entry_windows:
+            for exit_window in exit_windows:
+                paths = [build_oscillator_reversal_path_from_source(source, variant["entry_specs"], entry_condition_window=entry_window) for source in sources]
+                paths = [p for p in paths if p]
+                for stop_loss_pct in sl_grid:
+                    for preset_idx, stop_rules in enumerate(stop_rule_presets, start=1):
+                        combos.append((variant, entry_window, exit_window, paths, stop_loss_pct, preset_idx, stop_rules))
+                        if len(combos) >= int(max_combos or 120):
+                            break
+                    if len(combos) >= int(max_combos or 120):
+                        break
+                if len(combos) >= int(max_combos or 120):
+                    break
+            if len(combos) >= int(max_combos or 120):
+                break
+        if len(combos) >= int(max_combos or 120):
+            break
+    summaries = []
+    for variant, entry_window, exit_window, paths, stop_loss_pct, preset_idx, stop_rules in combos:
+        results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, None, (0.7, 1.0, 2.0, 3.0, 4.0), stop_rules, oscillator_exit_specs=variant["exit_specs"], oscillator_exit_window=exit_window) for p in paths]
+        label = f"{variant['label']} | Stop preset {preset_idx}"
+        summaries.append(summarize_research_result(label, entry_window, exit_window, stop_loss_pct, stop_rules, paths, results, len(eligible_tasks), notional_usd, round_trip_cost_pct, open_return_pct))
+    summaries.sort(key=lambda item: (item["avg_net"], item["profit_factor"], item["entries"]), reverse=True)
+    top_n = max(1, int(top_n or 20))
+    top = summaries[:top_n]
+    header = html.Tr([html.Th(col, style=td_style) for col in ["Rank", "Variant / risk", "Entries", "Avg net", "PF", "Stops", "Stoch exits", "TP hits", "Stoch exit spread", "Advice"]])
+    rows = [header]
+    for rank, item in enumerate(top, start=1):
+        pf_text = "∞" if item["profit_factor"] == float("inf") else f"{item['profit_factor']:.2f}"
+        bucket_text = " | ".join(f"{k}:{v}" for k, v in item["buckets"].items() if v)
+        if not bucket_text:
+            bucket_text = "none"
+        rows.append(html.Tr([
+            html.Td(str(rank), style=td_style),
+            html.Td(f"{item['label']} | entry win {item['entry_window']} | close win {item['exit_window']} | SL {item['stop_loss_pct']:g}% | rules {format_dynamic_stop_rules_for_display(item['stop_rules'])}", style=td_style),
+            html.Td(f"{item['entries']} / {item['eligible_total']} ({item['entries'] / item['eligible_total'] * 100:.1f}%)" if item['eligible_total'] else "0 / 0", style=td_style),
+            html.Td(f"{item['avg_net']:.3f}% | ${item['total_net_usd']:,.0f}", style=td_style),
+            html.Td(pf_text, style=td_style),
+            html.Td(f"any {item['stop_events']} | original {item['original_sl_events']} | moved {item['moved_stop_events']}", style=td_style),
+            html.Td(str(item["stochastic_exit_count"]), style=td_style),
+            html.Td(f"TP1 {item['tp1']} | TP2 {item['tp2']}", style=td_style),
+            html.Td(bucket_text, style=td_style),
+            html.Td(item["advice"], style=td_style),
+        ]))
+    explanation = html.Div([
+        html.P(f"Tested {len(summaries)} combinations across {len(sources)} usable sources. Sorted by average net return after costs, then profit factor.", style={"fontWeight": "bold"}),
+        html.P("Use this as research only: pick robust candidates with enough entries, PF above 1 after gross checks, positive average net after costs, and then validate on a separate period.", style={"color": "#555"}),
+    ])
+    return html.Div([explanation, html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "12px"})])
+
+
+def format_dynamic_stop_rules_for_display(stop_rules):
+    return ", ".join(f"{trigger:g}:{target:g}" for trigger, target in (stop_rules or [])) or "none"
+
 def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, offset_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0):
     """Build a read-only diagnostic table for entering reversal at/after level."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
@@ -8694,6 +8905,109 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     except Exception as exc:
         return f"❌ Oscillator reversal checkup failed: {exc}", no_update
 
+
+
+@app.callback(
+    Output("osc-research-status", "children"),
+    Output("osc-research-results", "children"),
+    Input("osc-research-run-btn", "n_clicks"),
+    State("osc-stoch-14-level-input", "value"),
+    State("osc-stoch-14-condition-input", "value"),
+    State("osc-stoch-40-level-input", "value"),
+    State("osc-stoch-40-condition-input", "value"),
+    State("osc-stoch-60-level-input", "value"),
+    State("osc-stoch-60-condition-input", "value"),
+    State("osc-rsi-level-input", "value"),
+    State("osc-rsi-condition-input", "value"),
+    State("osc-down-stoch-14-level-input", "value"),
+    State("osc-down-stoch-14-condition-input", "value"),
+    State("osc-down-stoch-40-level-input", "value"),
+    State("osc-down-stoch-40-condition-input", "value"),
+    State("osc-down-stoch-60-level-input", "value"),
+    State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-rsi-level-input", "value"),
+    State("osc-down-rsi-condition-input", "value"),
+    State("osc-exit-enabled-input", "value"),
+    State("osc-exit-sell-stoch-14-level-input", "value"),
+    State("osc-exit-sell-stoch-14-condition-input", "value"),
+    State("osc-exit-sell-stoch-40-level-input", "value"),
+    State("osc-exit-sell-stoch-40-condition-input", "value"),
+    State("osc-exit-sell-stoch-60-level-input", "value"),
+    State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-14-level-input", "value"),
+    State("osc-exit-buy-stoch-14-condition-input", "value"),
+    State("osc-exit-buy-stoch-40-level-input", "value"),
+    State("osc-exit-buy-stoch-40-condition-input", "value"),
+    State("osc-exit-buy-stoch-60-level-input", "value"),
+    State("osc-exit-buy-stoch-60-condition-input", "value"),
+    State("osc-research-entry-windows-input", "value"),
+    State("osc-research-exit-windows-input", "value"),
+    State("osc-research-sl-grid-input", "value"),
+    State("osc-research-stop-presets-input", "value"),
+    State("osc-research-max-combos-input", "value"),
+    State("osc-research-top-input", "value"),
+    State("osc-reversal-notional-input", "value"),
+    State("osc-reversal-cost-input", "value"),
+    State("osc-reversal-open-return-input", "value"),
+    State("golden-store-version", "data"),
+    prevent_initial_call=True,
+)
+def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+    """Research optimizer for oscillator settings, windows, SLs, and stop rules."""
+    if not n_clicks:
+        return no_update, no_update
+    try:
+        oscillator_specs = build_oscillator_spec_groups(
+            (
+                stoch14_level, stoch14_condition,
+                stoch40_level, stoch40_condition,
+                stoch60_level, stoch60_condition,
+                rsi_level, rsi_condition,
+            ),
+            (
+                down_stoch14_level, down_stoch14_condition,
+                down_stoch40_level, down_stoch40_condition,
+                down_stoch60_level, down_stoch60_condition,
+                down_rsi_level, down_rsi_condition,
+            ),
+        )
+        oscillator_exit_specs = build_stochastic_exit_spec_groups(
+            exit_enabled,
+            (
+                exit_sell_stoch14_level, exit_sell_stoch14_condition,
+                exit_sell_stoch40_level, exit_sell_stoch40_condition,
+                exit_sell_stoch60_level, exit_sell_stoch60_condition,
+            ),
+            (
+                exit_buy_stoch14_level, exit_buy_stoch14_condition,
+                exit_buy_stoch40_level, exit_buy_stoch40_condition,
+                exit_buy_stoch60_level, exit_buy_stoch60_condition,
+            ),
+        )
+        entry_windows = [int(v) for v in parse_dynamic_percent_levels(entry_windows_text, default_levels=(1, 3, 5))]
+        exit_windows = [int(v) for v in parse_dynamic_percent_levels(exit_windows_text, default_levels=(1, 3, 5))]
+        sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=(1, 1.5, 2, 2.5, 3))
+        stop_presets = parse_research_stop_rule_presets(stop_presets_text)
+        tasks = get_display_tasks_snapshot()
+        started = time.time()
+        table = build_oscillator_research_optimizer_table(
+            tasks,
+            oscillator_specs,
+            oscillator_exit_specs,
+            entry_windows,
+            exit_windows,
+            sl_grid,
+            stop_presets,
+            notional_usd,
+            round_trip_cost_pct,
+            open_return_pct,
+            max_combos=max_combos,
+            top_n=top_n,
+        )
+        elapsed = time.time() - started
+        return f"✅ Research optimizer run #{n_clicks} complete in {elapsed:.2f}s. Tested up to {int(max_combos or 120)} combinations; showing top {int(top_n or 20)}.", table
+    except Exception as exc:
+        return f"❌ Research optimizer failed: {exc}", no_update
 
 @app.callback(
     Output("impulse-task-selector", "options"),
