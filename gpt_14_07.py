@@ -8220,7 +8220,12 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
     entry_price = float(df.iloc[oscillator_idx]["close"])
     if entry_price <= 0:
         return None
-    path_df = df.iloc[oscillator_idx:]
+    # The oscillator signal is only known after this candle closes, so the
+    # simulated trade enters at that close and begins exit/SL scanning on the
+    # next candle.  This avoids using the signal candle's high/low after-the-fact.
+    path_df = df.iloc[oscillator_idx + 1:]
+    if path_df.empty:
+        return None
     return {
         "direction": source["direction"],
         "entry_price": entry_price,
@@ -8234,6 +8239,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
         "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
         "level_cross_idx": cross_idx,
         "oscillator_idx": oscillator_idx,
+        "entry_execution": "signal_candle_close_next_candle_path",
         "toward_direction": source.get("toward_direction"),
     }
 
