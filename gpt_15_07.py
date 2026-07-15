@@ -3313,6 +3313,7 @@ def build_root_layout():
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
     dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
+    dcc.Store(id="chart-dragmode-enforcer-store", data=None),  # keeps Measure draw-rectangle mode synced with Plotly modebar
     dcc.Store(id="osc-event-groups-store", data={}),
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
@@ -6814,6 +6815,15 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     }
     const fig = JSON.parse(JSON.stringify(figure));
     fig.layout = fig.layout || {};
+    function forceGraphDragmode(mode) {
+        window.setTimeout(function() {
+            const root = document.getElementById('task-chart');
+            const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+            if (plot && window.Plotly && mode) {
+                window.Plotly.relayout(plot, {dragmode: mode});
+            }
+        }, 0);
+    }
     function applyStoredRanges(targetFig, storedView, skipX) {
         if (!storedView || String(storedView.task_id || '') !== String(chartTaskId || '')) return;
         const axes = storedView && storedView.axes ? storedView.axes : {};
@@ -6832,6 +6842,7 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
         });
     }
     fig.layout.dragmode = measureMode ? 'drawrect' : 'pan';
+    forceGraphDragmode(fig.layout.dragmode);
     const showHover = (!measureMode || measureHover);
     fig.layout.hovermode = showHover ? 'x' : false;
 
@@ -6894,6 +6905,28 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     State("chart-view-state-store", "data"),
     State("chart-task-id", "data"),
     prevent_initial_call=True
+)
+
+clientside_callback(
+    """
+function(relayoutData, measureMode) {
+    if (!measureMode || !relayoutData || !relayoutData.dragmode || relayoutData.dragmode === 'drawrect') {
+        return window.dash_clientside.no_update;
+    }
+    window.setTimeout(function() {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (plot && window.Plotly) {
+            window.Plotly.relayout(plot, {dragmode: 'drawrect'});
+        }
+    }, 0);
+    return {ts: Date.now(), forced: 'drawrect', previous: relayoutData.dragmode};
+}
+""",
+    Output("chart-dragmode-enforcer-store", "data"),
+    Input("task-chart", "relayoutData"),
+    State("measure-mode-store", "data"),
+    prevent_initial_call=True,
 )
 
 clientside_callback(
