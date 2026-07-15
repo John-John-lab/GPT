@@ -3230,6 +3230,8 @@ def build_root_layout():
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
+    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": True}),
+    dcc.Store(id="osc-event-groups-store", data={}),
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
     dcc.Store(id="volume-visible-store", data=False),  # default: Volume hidden
@@ -3431,6 +3433,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Event Marks: On", id="toggle-chart-event-marks-btn", title="Toggle research entry/exit markers", style={
+                                "background": "#e8f5e9",
+                                "color": "black",
+                                "border": "1px solid #2e7d32",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "108px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Events", id="toggle-events-btn", style={
@@ -6254,9 +6266,14 @@ def page_for_task(task_id, tasks):
     Output("next-chart-btn", "disabled"),
     Input("chart-task-id", "data"),
     Input("golden-store-version", "data"),
+    Input("chart-event-context-store", "data"),
     prevent_initial_call=False
 )
-def update_chart_nav_buttons(task_id, version):
+def update_chart_nav_buttons(task_id, version, event_context):
+    if isinstance(event_context, dict) and event_context.get("events"):
+        idx = int(event_context.get("index") or 0)
+        total = len(event_context.get("events") or [])
+        return idx <= 0, idx >= total - 1
     if not task_id:
         return True, True
     _, chartable = get_chartable_tasks_for_navigation()
@@ -6270,29 +6287,44 @@ def update_chart_nav_buttons(task_id, version):
     Output("chart-task-id", "data", allow_duplicate=True),
     Output("task-page-store", "data", allow_duplicate=True),
     Output("chart-click-store", "data", allow_duplicate=True),
+    Output("chart-event-context-store", "data", allow_duplicate=True),
     Input("prev-chart-btn", "n_clicks"),
     Input("next-chart-btn", "n_clicks"),
     State("chart-task-id", "data"),
+    State("chart-event-context-store", "data"),
     prevent_initial_call=True
 )
-def navigate_chart_task(prev_clicks, next_clicks, current_task_id):
+def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context):
     triggered = ctx.triggered_id
     if triggered not in ("prev-chart-btn", "next-chart-btn") or not current_task_id:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
+
+    if isinstance(event_context, dict) and event_context.get("events"):
+        events = event_context.get("events") or []
+        current_idx = int(event_context.get("index") or 0)
+        next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
+        if next_idx < 0 or next_idx >= len(events):
+            return no_update, no_update, no_update, no_update
+        target_id = str(events[next_idx].get("task_id") or "")
+        if not target_id:
+            return no_update, no_update, no_update, no_update
+        all_tasks, _ = get_chartable_tasks_for_navigation()
+        updated_context = dict(event_context, index=next_idx)
+        return target_id, page_for_task(target_id, all_tasks), {f"{target_id}_chart": time.time()}, updated_context
 
     all_tasks, chartable = get_chartable_tasks_for_navigation()
     chart_ids = [str(t.task_id) for t in chartable]
     if current_task_id not in chart_ids:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
 
     current_idx = chart_ids.index(current_task_id)
     next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
     if next_idx < 0 or next_idx >= len(chartable):
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
 
     target_id = str(chartable[next_idx].task_id)
     target_page = page_for_task(target_id, all_tasks)
-    return target_id, target_page, {f"{target_id}_chart": time.time()}
+    return target_id, target_page, {f"{target_id}_chart": time.time()}, no_update
 
 clientside_callback(
     """
@@ -6331,19 +6363,20 @@ def auto_throttle_updates(_):
 @app.callback(
     Output("chart-task-id", "data"),
     Output("chart-click-store", "data"),
+    Output("chart-event-context-store", "data"),
     Input("chart-button-trigger", "data"),  # Hidden trigger set by JS
     State("chart-click-store", "data"),
     prevent_initial_call=True
 )
 def set_chart_task_id(trigger_data, click_store):
     if not trigger_data:
-        return no_update, no_update
+        return no_update, no_update, no_update
     
     task_id = trigger_data.get("task_id")
     action = trigger_data.get("action")
     
     if not task_id or action != "chart":
-        return no_update, no_update
+        return no_update, no_update, no_update
 
     if click_store is None:
         click_store = {}
@@ -6355,10 +6388,10 @@ def set_chart_task_id(trigger_data, click_store):
     
     # Only process if this is a new click (within 0.5 seconds)
     if current_time - old_time < 0.5:
-        return no_update, no_update
+        return no_update, no_update, no_update
     
     click_store[key] = current_time
-    return task_id, click_store
+    return task_id, click_store, {"events": [], "index": 0, "overlay": True}
 
 # ----- Modal display callback -----
 @app.callback(
@@ -6380,12 +6413,13 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
     Output("chart-task-id", "data", allow_duplicate=True),
     Output("chart-button-trigger", "data", allow_duplicate=True),
     Output("chart-click-store", "data", allow_duplicate=True),
+    Output("chart-event-context-store", "data", allow_duplicate=True),
     Input("close-chart-modal", "n_clicks"),
     prevent_initial_call=True
 )
 def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
-    return None, None, {}
+    return None, None, {}, {"events": [], "index": 0, "overlay": True}
 
 @app.callback(
     Output("rsi-visible-store", "data"),
@@ -6404,6 +6438,57 @@ def toggle_rsi(n_clicks, current):
 )
 def toggle_stochastic(n_clicks, current):
     return not current
+
+
+@app.callback(
+    Output("chart-task-id", "data", allow_duplicate=True),
+    Output("chart-click-store", "data", allow_duplicate=True),
+    Output("chart-event-context-store", "data", allow_duplicate=True),
+    Output("rsi-visible-store", "data", allow_duplicate=True),
+    Output("stochastic-visible-store", "data", allow_duplicate=True),
+    Input({"type": "osc-event-chart", "category": ALL}, "n_clicks"),
+    State("osc-event-groups-store", "data"),
+    prevent_initial_call=True,
+)
+def open_oscillator_event_chart(_clicks, event_groups):
+    """Open the chart on a diagnostic event group and enable oscillator panes."""
+    triggered = ctx.triggered_id
+    if not isinstance(triggered, dict):
+        return no_update, no_update, no_update, no_update, no_update
+    category = triggered.get("category")
+    events = (event_groups or {}).get(category) or []
+    if not events:
+        return no_update, no_update, no_update, no_update, no_update
+    task_id = str(events[0].get("task_id") or "")
+    if not task_id:
+        return no_update, no_update, no_update, no_update, no_update
+    context = {"category": category, "events": events, "index": 0, "overlay": True}
+    return task_id, {f"{task_id}_chart": time.time()}, context, True, True
+
+@app.callback(
+    Output("chart-event-context-store", "data", allow_duplicate=True),
+    Input("toggle-chart-event-marks-btn", "n_clicks"),
+    State("chart-event-context-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_chart_event_marks(_clicks, event_context):
+    event_context = dict(event_context or {"events": [], "index": 0, "overlay": True})
+    event_context["overlay"] = not bool(event_context.get("overlay", True))
+    return event_context
+
+@app.callback(
+    Output("toggle-chart-event-marks-btn", "children"),
+    Output("toggle-chart-event-marks-btn", "style"),
+    Input("chart-event-context-store", "data"),
+    prevent_initial_call=False,
+)
+def update_chart_event_marks_button(event_context):
+    enabled = bool((event_context or {}).get("overlay", True))
+    style = {
+        "padding": "6px 10px", "backgroundColor": "#1976d2" if enabled else "#6c757d",
+        "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer", "fontSize": "12px"
+    }
+    return ("Event Marks: On" if enabled else "Event Marks: Off"), style
 
 @app.callback(
     Output("volume-visible-store", "data"),
@@ -7020,9 +7105,10 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("measure-anchor-store", "data"),
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
+    Input("chart-event-context-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -7235,6 +7321,48 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         marker=dict(size=10, color='white', symbol='diamond', line=dict(width=1, color='yellow')),
         name='Signal Time Marker', showlegend=False, hoverinfo='skip'
     ), row=1, col=1)
+    # Dynamic-strategy research event overlay: non-anchored entry/exit marks for
+    # the currently selected summary-table event group.
+    if isinstance(chart_event_context, dict) and chart_event_context.get("overlay", True):
+        events = chart_event_context.get("events") or []
+        event_index = int(chart_event_context.get("index") or 0)
+        if 0 <= event_index < len(events):
+            active_event = events[event_index] or {}
+            if str(active_event.get("task_id")) == str(task_id):
+                entry_time = active_event.get("entry_time")
+                exit_time = active_event.get("exit_time")
+                entry_price = active_event.get("entry_price")
+                exit_price = active_event.get("exit_price")
+                event_label = active_event.get("label") or active_event.get("category") or "Dynamic strategy event"
+                nav_label = f"{event_index + 1}/{len(events)}"
+                if entry_time is not None and entry_price is not None:
+                    entry_dt = ms_to_utc_datetime(float(entry_time))
+                    fig.add_trace(go.Scatter(
+                        x=[entry_dt], y=[float(entry_price)], mode='markers+text',
+                        text=[f"ENTRY {nav_label}"], textposition='top center',
+                        marker=dict(size=14, color='#00c853', symbol='triangle-up', line=dict(width=2, color='white')),
+                        name='Dynamic strategy entry', showlegend=False,
+                        hovertemplate=f"{event_label}<br>Entry: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                    ), row=1, col=1)
+                    fig.add_trace(go.Scatter(
+                        x=[entry_dt, entry_dt], y=[y_min, y_max], mode='lines',
+                        line=dict(color='#00c853', width=1, dash='dot'),
+                        name='Entry time', showlegend=False, hoverinfo='skip'
+                    ), row=1, col=1)
+                if exit_time is not None and exit_price is not None:
+                    exit_dt = ms_to_utc_datetime(float(exit_time))
+                    fig.add_trace(go.Scatter(
+                        x=[exit_dt], y=[float(exit_price)], mode='markers+text',
+                        text=["EXIT"], textposition='bottom center',
+                        marker=dict(size=14, color='#d50000', symbol='x', line=dict(width=2, color='white')),
+                        name='Dynamic strategy exit', showlegend=False,
+                        hovertemplate=f"{event_label}<br>Exit: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                    ), row=1, col=1)
+                    fig.add_trace(go.Scatter(
+                        x=[exit_dt, exit_dt], y=[y_min, y_max], mode='lines',
+                        line=dict(color='#d50000', width=1, dash='dot'),
+                        name='Exit time', showlegend=False, hoverinfo='skip'
+                    ), row=1, col=1)
     # ----- Strategy markers (separate: impulse vs other) -----
     if hasattr(task, 'strategy_signals') and task.strategy_signals:
         # Non‑impulse signals (bounce, retest, momentum) – only if strategy_visible is True
@@ -7340,7 +7468,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
         },
-        uirevision=f"{task_id}-{start_ms}-{end_ms}"
+        uirevision="task-chart-preserve-view"
     )
     # X-axis tick format and native Plotly spike lines.
     # showspikes + spikemode="across" keeps the thin dashed hover line synced
@@ -7524,6 +7652,7 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         "stopped_before_level": False,
         "stop_after_tp": False,
         "tp_hits": set(),
+        "tp_hit_indices": {},
         "stop_moves": set(),
         "entry_level_distance_pct": None,
         "max_move_pct": 0.0,
@@ -7534,6 +7663,8 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         "moved_stop_hit": False,
         "oscillator_exit_hit": False,
         "oscillator_exit_idx": None,
+        "exit_idx": None,
+        "exit_price": None,
     }
     if not path:
         return result
@@ -7563,11 +7694,15 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if max_dd_is_tighter and low <= max_dd_price:
                 result["max_dd_hit"] = True
                 result["exit_return_pct"] = -max_dd_pct
+                result["exit_idx"] = idx
+                result["exit_price"] = max_dd_price
                 result["exit_reason"] = "max_adverse_dd"
                 break
             if low <= stop_price:
                 result["stop_hit"] = True
                 result["exit_return_pct"] = current_stop_return_pct
+                result["exit_idx"] = idx
+                result["exit_price"] = stop_price
                 result["stop_return_pct"] = current_stop_return_pct
                 result["initial_stop_hit"] = abs(current_stop_return_pct + stop_loss_pct) < 1e-12
                 result["moved_stop_hit"] = not result["initial_stop_hit"]
@@ -7576,6 +7711,8 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if max_dd_price is not None and low <= max_dd_price:
                 result["max_dd_hit"] = True
                 result["exit_return_pct"] = -max_dd_pct
+                result["exit_idx"] = idx
+                result["exit_price"] = max_dd_price
                 result["exit_reason"] = "max_adverse_dd"
                 break
             move_pct = (high - entry_price) / entry_price * 100
@@ -7586,11 +7723,15 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if max_dd_is_tighter and high >= max_dd_price:
                 result["max_dd_hit"] = True
                 result["exit_return_pct"] = -max_dd_pct
+                result["exit_idx"] = idx
+                result["exit_price"] = max_dd_price
                 result["exit_reason"] = "max_adverse_dd"
                 break
             if high >= stop_price:
                 result["stop_hit"] = True
                 result["exit_return_pct"] = current_stop_return_pct
+                result["exit_idx"] = idx
+                result["exit_price"] = stop_price
                 result["stop_return_pct"] = current_stop_return_pct
                 result["initial_stop_hit"] = abs(current_stop_return_pct + stop_loss_pct) < 1e-12
                 result["moved_stop_hit"] = not result["initial_stop_hit"]
@@ -7599,6 +7740,8 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
             if max_dd_price is not None and high >= max_dd_price:
                 result["max_dd_hit"] = True
                 result["exit_return_pct"] = -max_dd_pct
+                result["exit_idx"] = idx
+                result["exit_price"] = max_dd_price
                 result["exit_reason"] = "max_adverse_dd"
                 break
             move_pct = (entry_price - low) / entry_price * 100
@@ -7609,6 +7752,7 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
         for level in tp_levels:
             if move_pct >= level:
                 result["tp_hits"].add(level)
+                result["tp_hit_indices"].setdefault(level, idx)
 
         for trigger_pct, stop_profit_pct in stop_rules:
             if move_pct < trigger_pct:
@@ -7640,6 +7784,8 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
                 close_price = float(close_values[idx])
                 result["oscillator_exit_hit"] = True
                 result["oscillator_exit_idx"] = idx
+                result["exit_idx"] = idx
+                result["exit_price"] = close_price
                 result["exit_return_pct"] = ((close_price - entry_price) / entry_price * 100) if direction == "buy" else ((entry_price - close_price) / entry_price * 100)
                 result["exit_reason"] = "oscillator_close"
                 break
@@ -8201,6 +8347,7 @@ def build_oscillator_reversal_source_uncached(task):
         return None
 
     return {
+        "task_id": str(getattr(task, "task_id", "")),
         "level_kind": task.signal_direction,
         "toward_direction": "up" if task.signal_direction == "resistance" else "down",
         "direction": "sell" if task.signal_direction == "resistance" else "buy",
@@ -8260,9 +8407,12 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
         "direction": source["direction"],
         "entry_price": entry_price,
         "signal_price": signal_price,
+        "task_id": source.get("task_id"),
+        "entry_time": float(df.iloc[oscillator_idx]["timestamp"]),
         "highs": path_df["high"].to_numpy(dtype=float, copy=False),
         "lows": path_df["low"].to_numpy(dtype=float, copy=False),
         "closes": path_df["close"].to_numpy(dtype=float, copy=False),
+        "timestamps": path_df["timestamp"].to_numpy(dtype=float, copy=False),
         "stoch_k_14_1_3": path_df["stoch_k_14_1_3"].to_numpy(dtype=float, copy=False),
         "stoch_k_40_1_4": path_df["stoch_k_40_1_4"].to_numpy(dtype=float, copy=False),
         "stoch_k_60_1_10": path_df["stoch_k_60_1_10"].to_numpy(dtype=float, copy=False),
@@ -8294,7 +8444,51 @@ def bucket_stochastic_exit_return(return_pct):
     return "Profit 4%+"
 
 
-def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None, entry_condition_window=1, oscillator_exit_window=1):
+def build_chart_event_record(path, result, category, label):
+    """Build a chart navigation event for oscillator research result rows."""
+    if not path or not result or not path.get("task_id"):
+        return None
+    exit_idx = result.get("exit_idx")
+    exit_price = result.get("exit_price")
+    if str(category).startswith("tp_"):
+        try:
+            tp_level = float(str(category)[3:])
+            exit_idx = result.get("tp_hit_indices", {}).get(tp_level, exit_idx)
+            if exit_price is None:
+                direction = path.get("direction")
+                entry_price = float(path.get("entry_price"))
+                exit_price = entry_price * (1 + tp_level / 100) if direction == "buy" else entry_price * (1 - tp_level / 100)
+        except Exception:
+            pass
+    timestamps = path.get("timestamps")
+    exit_time = None
+    if exit_idx is not None and timestamps is not None and 0 <= int(exit_idx) < len(timestamps):
+        exit_time = float(timestamps[int(exit_idx)])
+    return {
+        "task_id": path.get("task_id"),
+        "category": category,
+        "label": label,
+        "entry_time": path.get("entry_time"),
+        "entry_price": path.get("entry_price"),
+        "exit_time": exit_time,
+        "exit_price": exit_price,
+        "exit_reason": result.get("exit_reason"),
+        "return_pct": result.get("exit_return_pct"),
+    }
+
+
+def chart_event_button(label, category, count):
+    """Render a summary-row button that opens chart navigation for one event group."""
+    return html.Button(
+        f"📈 {label} ({count})",
+        id={"type": "osc-event-chart", "category": category},
+        n_clicks=0,
+        title="Open chart and navigate this specific result group",
+        style={"fontSize": "11px", "padding": "2px 6px", "cursor": "pointer"},
+    )
+
+
+def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None, entry_condition_window=1, oscillator_exit_window=1, return_event_groups=False):
     """Build a read-only diagnostic table for oscillator-confirmed reversal entries."""
     td_style = {"padding": "4px 8px", "border": "1px solid #ddd"}
     notional_usd, round_trip_cost_pct, open_return_pct = normalize_expectancy_inputs(notional_usd, round_trip_cost_pct, open_return_pct)
@@ -8319,6 +8513,28 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
     results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs, oscillator_exit_window=oscillator_exit_window) for p in paths]
     valid_results = [r for r in results if r["valid"]]
     valid_total = len(valid_results)
+    event_groups = {"original_sl": [], "stochastic_close": []}
+    for level in tp_levels:
+        event_groups[f"tp_{level:g}"] = []
+    for path, result in zip(paths, results):
+        if not result or not result.get("valid"):
+            continue
+        if result.get("initial_stop_hit"):
+            event = build_chart_event_record(path, result, "original_sl", "Original SL exit")
+            if event:
+                event_groups["original_sl"].append(event)
+        if result.get("oscillator_exit_hit"):
+            event = build_chart_event_record(path, result, "stochastic_close", "Stochastic close")
+            if event:
+                event_groups["stochastic_close"].append(event)
+                bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
+                if bucket:
+                    event_groups.setdefault(f"stoch_bucket_{bucket}", []).append(dict(event, category=f"stoch_bucket_{bucket}", label=bucket))
+        for level in tp_levels:
+            if level in result.get("tp_hits", set()):
+                event = build_chart_event_record(path, result, f"tp_{level:g}", f"TP {fmt_dynamic_level_label(level)} checkpoint")
+                if event:
+                    event_groups[f"tp_{level:g}"].append(event)
 
     def fmt_stat(count, total):
         return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
@@ -8375,26 +8591,26 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         html.Tr([html.Td("Active entry oscillator filters", style=td_style), html.Td(format_oscillator_specs(oscillator_specs), style=td_style)]),
         html.Tr([html.Td("Active stochastic close filters", style=td_style), html.Td(format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else "disabled", style=td_style)]),
         html.Tr([html.Td("Condition windows", style=td_style), html.Td(f"entry={int(entry_condition_window or 1)} candle(s), close={int(oscillator_exit_window or 1)} candle(s)", style=td_style)]),
-        html.Tr([html.Td(f"Original SL exits (menu SL {float(stop_loss_pct or 0):g}%)", style=td_style), html.Td(fmt_stat(original_sl_events, valid_total), style=td_style)]),
+        html.Tr([html.Td(f"Original SL exits (menu SL {float(stop_loss_pct or 0):g}%)", style=td_style), html.Td([fmt_stat(original_sl_events, valid_total), " ", chart_event_button("Chart original SL exits", "original_sl", original_sl_events)], style=td_style)]),
         html.Tr([html.Td("Moved/trailing stop exits", style=td_style), html.Td(fmt_stat(moved_stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Any stop exit (original + moved)", style=td_style), html.Td(fmt_stat(stop_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Max adverse DD cap exits", style=td_style), html.Td(fmt_stat(max_dd_events, valid_total), style=td_style)]),
         html.Tr([html.Td("Stop exit after at least one TP checkpoint", style=td_style), html.Td(fmt_stat(stop_after_tp, valid_total), style=td_style)]),
         html.Tr([html.Td("Dynamic stop armed/moved at least once", style=td_style), html.Td(fmt_stat(stop_moved, valid_total), style=td_style)]),
         html.Tr([html.Td("Actual TP orders executed", style=td_style), html.Td(f"{actual_tp_executions} / {valid_total} (TP levels are checkpoints only in this diagnostic)", style=td_style)]),
-        html.Tr([html.Td("Actual stochastic close exits", style=td_style), html.Td(fmt_stat(oscillator_exit_count, valid_total), style=td_style)]),
+        html.Tr([html.Td("Actual stochastic close exits", style=td_style), html.Td([fmt_stat(oscillator_exit_count, valid_total), " ", chart_event_button("Chart stochastic exits", "stochastic_close", oscillator_exit_count)], style=td_style)]),
         html.Tr([html.Td("Open/no actual exit fallback", style=td_style), html.Td(fmt_stat(sum(1 for r in valid_results if r.get("exit_return_pct") is None), valid_total), style=td_style)]),
     ]
     rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Oscillator reversal scenario"))
     if oscillator_exit_specs:
         rows.append(html.Tr([html.Td("— Stochastic close realized-return spread —", style=td_style), html.Td("Only trades actually closed by stochastic conditions", style=td_style)]))
         for bucket_label in stochastic_exit_bucket_order:
-            rows.append(html.Tr([html.Td(bucket_label, style=td_style), html.Td(fmt_stat(stochastic_exit_buckets[bucket_label], oscillator_exit_count), style=td_style)]))
+            rows.append(html.Tr([html.Td(bucket_label, style=td_style), html.Td([fmt_stat(stochastic_exit_buckets[bucket_label], oscillator_exit_count), " ", chart_event_button("Chart " + bucket_label, "stoch_bucket_" + bucket_label, stochastic_exit_buckets[bucket_label])], style=td_style)]))
     rows.append(html.Tr([html.Td("— TP checkpoint hits (not actual TP orders) —", style=td_style), html.Td("These count favorable price moves reached before the actual exit", style=td_style)]))
     for level in tp_levels:
         label = fmt_dynamic_level_label(level)
         tp_found = sum(1 for r in valid_results if level in r["tp_hits"])
-        rows.append(html.Tr([html.Td(f"TP {label} found after oscillator entry", style=td_style), html.Td(fmt_stat(tp_found, valid_total), style=td_style)]))
+        rows.append(html.Tr([html.Td(f"TP {label} found after oscillator entry", style=td_style), html.Td([fmt_stat(tp_found, valid_total), " ", chart_event_button("Chart TP " + label, f"tp_{level:g}", tp_found)], style=td_style)]))
     for trigger_pct, stop_profit_pct in stop_rules:
         moved = sum(1 for r in valid_results if trigger_pct in r["stop_moves"])
         rows.append(html.Tr([html.Td(f"Dynamic stop armed: after +{fmt_dynamic_level_label(trigger_pct)} move stop to {stop_profit_pct:g}% return", style=td_style), html.Td(fmt_stat(moved, valid_total), style=td_style)]))
@@ -8404,7 +8620,8 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         for sl_pct in sl_grid:
             scenario_results = [evaluate_dynamic_checkup_path(p, sl_pct, max_dd_pct, tp_levels, stop_rules, oscillator_exit_specs=oscillator_exit_specs, oscillator_exit_window=oscillator_exit_window) for p in paths]
             rows.append(scenario_summary(f"Original SL set to {fmt_dynamic_level_label(sl_pct)}", scenario_results))
-    return html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+    table = html.Table(rows, style={"borderCollapse": "collapse", "width": "100%", "fontSize": "13px"})
+    return (table, event_groups) if return_event_groups else table
 
 
 def parse_research_stop_rule_presets(text):
@@ -8615,7 +8832,6 @@ def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, m
     results = [evaluate_dynamic_checkup_path(p, stop_loss_pct, max_dd_pct, tp_levels, stop_rules) for p in valid_paths]
     valid_results = [r for r in results if r["valid"]]
     valid_total = len(valid_results)
-
     def fmt_stat(count, total):
         return f"{count} / {total} ({count / total * 100:.1f}%)" if total else "0 / 0"
 
@@ -8811,6 +9027,7 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
 @app.callback(
     Output("osc-reversal-status", "children"),
     Output("osc-reversal-results", "children"),
+    Output("osc-event-groups-store", "data"),
     Input("osc-reversal-run-btn", "n_clicks"),
     State("osc-stoch-14-level-input", "value"),
     State("osc-stoch-14-condition-input", "value"),
@@ -8857,7 +9074,7 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
 def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
-        return no_update, no_update
+        return no_update, no_update, no_update
     try:
         entry_condition_window = max(1, int(entry_condition_window or 1))
         oscillator_exit_window = max(1, int(oscillator_exit_window or 1))
@@ -8893,7 +9110,7 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
         sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
         tasks = get_display_tasks_snapshot()
         started = time.time()
-        table = build_oscillator_reversal_summary_table(
+        table, event_groups = build_oscillator_reversal_summary_table(
             tasks,
             oscillator_specs,
             stop_loss_pct,
@@ -8907,6 +9124,7 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
             oscillator_exit_specs=oscillator_exit_specs,
             entry_condition_window=entry_condition_window,
             oscillator_exit_window=oscillator_exit_window,
+            return_event_groups=True,
         )
         elapsed = time.time() - started
         status = (
@@ -8916,9 +9134,9 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
             f"notional=${float(notional_usd or 0):,.0f}, costs={float(round_trip_cost_pct or 0):g}%."
         )
-        return status, table
+        return status, table, event_groups
     except Exception as exc:
-        return f"❌ Oscillator reversal checkup failed: {exc}", no_update
+        return f"❌ Oscillator reversal checkup failed: {exc}", no_update, no_update
 
 
 
