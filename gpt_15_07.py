@@ -3312,6 +3312,7 @@ def build_root_layout():
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
+    dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
     dcc.Store(id="osc-event-groups-store", data={}),
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
@@ -6807,12 +6808,29 @@ def update_chart_extend_x_button(extend_enabled):
 
 clientside_callback(
     """
-function(measureMode, measureHover, infoBox, extendX, figure) {
+function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
     const fig = JSON.parse(JSON.stringify(figure));
     fig.layout = fig.layout || {};
+    function applyStoredRanges(targetFig, storedView, skipX) {
+        if (!storedView || String(storedView.task_id || '') !== String(chartTaskId || '')) return;
+        const axes = storedView && storedView.axes ? storedView.axes : {};
+        Object.keys(axes).forEach(function(axisName) {
+            const axisState = axes[axisName] || {};
+            if (skipX && /^xaxis[0-9]*$/.test(axisName)) return;
+            const targetAxis = targetFig.layout[axisName];
+            if (!targetAxis) return;
+            if (axisState.range && axisState.range.length === 2) {
+                targetAxis.range = axisState.range.slice();
+                targetAxis.autorange = false;
+            } else if (axisState.autorange) {
+                delete targetAxis.range;
+                targetAxis.autorange = true;
+            }
+        });
+    }
     fig.layout.dragmode = measureMode ? 'drawrect' : 'pan';
     const showHover = (!measureMode || measureHover);
     fig.layout.hovermode = showHover ? 'x' : false;
@@ -6862,6 +6880,7 @@ function(measureMode, measureHover, infoBox, extendX, figure) {
             trace.hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
         }
     });
+    applyStoredRanges(fig, viewState, Boolean(extendX));
     fig.layout.uirevision = fig.layout.uirevision || 'chart';
     return fig;
 }
@@ -6872,7 +6891,67 @@ function(measureMode, measureHover, infoBox, extendX, figure) {
     Input("chart-info-box-store", "data"),
     Input("chart-extend-x-store", "data"),
     State("task-chart", "figure"),
+    State("chart-view-state-store", "data"),
+    State("chart-task-id", "data"),
     prevent_initial_call=True
+)
+
+clientside_callback(
+    """
+function(relayoutData, taskId, currentView) {
+    if (!relayoutData || !taskId) {
+        return window.dash_clientside.no_update;
+    }
+    const axes = {};
+    function ensureAxis(axisName) {
+        if (!axes[axisName]) axes[axisName] = {};
+        return axes[axisName];
+    }
+    Object.keys(relayoutData).forEach(function(key) {
+        let match = key.match(/^(xaxis[0-9]*|yaxis[0-9]*)\\.range\\[(0|1)\\]$/);
+        if (match) {
+            const axis = ensureAxis(match[1]);
+            axis.range = axis.range || [null, null];
+            axis.range[Number(match[2])] = relayoutData[key];
+            return;
+        }
+        match = key.match(/^(xaxis[0-9]*|yaxis[0-9]*)\\.range$/);
+        if (match && Array.isArray(relayoutData[key]) && relayoutData[key].length === 2) {
+            ensureAxis(match[1]).range = relayoutData[key].slice();
+            return;
+        }
+        match = key.match(/^(xaxis[0-9]*|yaxis[0-9]*)\\.autorange$/);
+        if (match && relayoutData[key]) {
+            ensureAxis(match[1]).autorange = true;
+            delete ensureAxis(match[1]).range;
+        }
+    });
+    Object.keys(axes).forEach(function(axisName) {
+        const axis = axes[axisName];
+        if (axis.range && (axis.range[0] === null || axis.range[1] === null)) {
+            delete axis.range;
+        }
+    });
+    if (!Object.keys(axes).length) {
+        return window.dash_clientside.no_update;
+    }
+    const nextView = Object.assign({}, currentView || {});
+    const canMergeCurrent = currentView && String(currentView.task_id || '') === String(taskId || '');
+    const mergedAxes = Object.assign({}, canMergeCurrent ? (currentView.axes || {}) : {});
+    Object.keys(axes).forEach(function(axisName) {
+        mergedAxes[axisName] = Object.assign({}, mergedAxes[axisName] || {}, axes[axisName]);
+    });
+    nextView.task_id = taskId;
+    nextView.axes = mergedAxes;
+    nextView.ts = Date.now();
+    return nextView;
+}
+""",
+    Output("chart-view-state-store", "data"),
+    Input("task-chart", "relayoutData"),
+    State("chart-task-id", "data"),
+    State("chart-view-state-store", "data"),
+    prevent_initial_call=True,
 )
 
 def _extract_measure_point(click_data, anchor_enabled=True):
@@ -7214,6 +7293,36 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     title = f"Strategy Signals – {task.symbols[0]} ({task.timeframe})"
     return {"display": "flex"}, title, content
 
+def apply_chart_view_state_to_figure(fig, view_state, task_id):
+    """Reapply the user's current Plotly zoom/pan ranges after a figure rebuild."""
+    if not isinstance(view_state, dict) or str(view_state.get("task_id")) != str(task_id):
+        return fig
+    axes = view_state.get("axes") or {}
+    for axis_name, axis_state in axes.items():
+        if not isinstance(axis_state, dict):
+            continue
+        axis_range = axis_state.get("range")
+        if axis_range and len(axis_range) == 2:
+            try:
+                if re.match(r"^xaxis[0-9]*$", axis_name):
+                    # Shared x-axes should move together when the main x-axis is restored.
+                    if axis_name == "xaxis":
+                        fig.update_xaxes(range=list(axis_range), autorange=False)
+                    else:
+                        fig.layout[axis_name].range = list(axis_range)
+                        fig.layout[axis_name].autorange = False
+                elif re.match(r"^yaxis[0-9]*$", axis_name):
+                    fig.layout[axis_name].range = list(axis_range)
+                    fig.layout[axis_name].autorange = False
+            except Exception:
+                continue
+        elif axis_state.get("autorange"):
+            try:
+                fig.layout[axis_name].autorange = True
+            except Exception:
+                continue
+    return fig
+
 # ----- Chart figure callback (light theme) -----
 @app.callback(
     Output("task-chart", "figure"),
@@ -7228,9 +7337,10 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     Input("chart-event-context-store", "data"),
+    State("chart-view-state-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -7628,6 +7738,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         fig.update_layout(hoversubplots="axis")
     except ValueError:
         pass
+    apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
     return fig
 
 # =============================================================================
