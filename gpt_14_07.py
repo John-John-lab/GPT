@@ -7603,7 +7603,7 @@ def evaluate_dynamic_checkup_path(path, stop_loss_pct, max_dd_pct, tp_levels, st
                 if condition == "disabled":
                     continue
                 column = spec.get("column")
-                if column not in path or not oscillator_condition_met_within_window(path[column], idx, spec["level"], condition, oscillator_exit_window):
+                if column not in path or not oscillator_condition_met_within_window(path[column], idx, spec["level"], condition, oscillator_exit_window, min_idx=0):
                     oscillator_ready = False
                     break
             if oscillator_ready:
@@ -8032,15 +8032,15 @@ def oscillator_condition_met(values, idx, level, condition):
     return False
 
 
-def oscillator_condition_met_within_window(values, idx, level, condition, window=1):
-    """Return True when one oscillator condition matched within a recent candle window."""
+def oscillator_condition_met_within_window(values, idx, level, condition, window=1, min_idx=0):
+    """Return True when one oscillator condition matched within a recent past/current candle window."""
     window = max(1, int(window or 1))
-    start_idx = max(0, idx - window + 1)
+    start_idx = max(int(min_idx or 0), idx - window + 1)
     return any(oscillator_condition_met(values, check_idx, level, condition) for check_idx in range(start_idx, idx + 1))
 
 
-def oscillator_specs_met_within_window(df, specs, idx, window=1):
-    """Require every enabled oscillator spec to have matched within the same recent window."""
+def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
+    """Require every enabled oscillator spec to have matched within the same past/current window."""
     for spec in specs:
         condition = normalize_oscillator_condition(spec.get("condition"))
         if condition == "disabled":
@@ -8049,7 +8049,7 @@ def oscillator_specs_met_within_window(df, specs, idx, window=1):
         if column not in df:
             return False
         values = df[column].to_numpy(dtype=float)
-        if not oscillator_condition_met_within_window(values, idx, spec["level"], condition, window):
+        if not oscillator_condition_met_within_window(values, idx, spec["level"], condition, window, min_idx=min_idx):
             return False
     return True
 
@@ -8211,7 +8211,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
     selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
     oscillator_idx = None
     for idx in range(cross_idx, len(df)):
-        if oscillator_specs_met_within_window(df, selected_specs, idx, entry_condition_window):
+        if oscillator_specs_met_within_window(df, selected_specs, idx, entry_condition_window, min_idx=cross_idx):
             oscillator_idx = idx
             break
     if oscillator_idx is None:
