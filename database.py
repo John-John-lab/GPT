@@ -685,7 +685,7 @@ def _build_extension_status_panel():
     return html.Div([
         html.H4("Safe left-side period extension"),
         html.P("Enter extra minutes beside any existing period and click Extend. The downloader only appends candles before the current start, rejects overlaps, validates OHLCV data, writes through a temporary file, and keeps a timestamped backup."),
-        html.Progress(id="extend-progress", value=0, max=100, style={"width": "100%", "height": "18px"}),
+        html.Progress(id="extend-progress", value="0", max="100", style={"width": "100%", "height": "18px"}),
         html.Div(id="extend-status", style={"marginTop": "8px", "fontWeight": "bold", "color": "#0b63b6"}),
         html.Pre(id="extend-log", style={"height": "140px", "overflowY": "scroll", "border": "1px solid #ccc", "padding": "5px", "marginTop": "8px"}),
     ], style={"border": "1px solid #d9e8ff", "backgroundColor": "#f7fbff", "padding": "10px", "margin": "10px 0"})
@@ -714,6 +714,10 @@ def create_data_analysis_tab():
     
     return html.Div([
         html.H3("Data Statistics"),
+        # Keep task-tab callback outputs addressable while this dynamic tab is
+        # mounted. Dash requires callback Output components to exist in the
+        # current layout even if the task-only status is visually hidden here.
+        html.Div(id="bulk-rerun-status", style={"display": "none"}),
         html.P(f"Total symbols: {total_symbols}"),
         html.P(f"Total candles: {total_candles:,}"),
         html.P(f"Total database size: {total_size_mb:.2f} MB"),
@@ -824,7 +828,7 @@ def register_database_callbacks(app):
     )
     def update_left_extension_status(_):
         _running, progress, status, log = em.get_state()
-        return progress, status, log
+        return str(progress), status, log
     
     # Verification control callback
     @app.callback(
