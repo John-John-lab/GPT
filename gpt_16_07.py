@@ -1039,6 +1039,19 @@ def load_task_data_cached(task) -> pd.DataFrame:
 def clear_parquet_cache():
     _load_parquet_cached.cache_clear()
 
+
+def task_pre_signal_start_ms(task):
+    """Return the requested history start without changing the task's end window."""
+    runtime_start = getattr(task, "_load_chart_start_ms", None)
+    if runtime_start is not None:
+        return max(0, int(runtime_start))
+    signal_time = getattr(task, "signal_time", None)
+    if signal_time is not None:
+        minutes = max(0, int(getattr(task, "pre_buffer_minutes", 0) or 0))
+        return max(0, int(float(signal_time)) - minutes * 60_000)
+    start_date = getattr(task, "start_date", None)
+    return int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if start_date else 0
+
 # ---------- Database Helpers ----------
 # symbol_timeframe_path is now imported from database module
 # get_database_info is now imported from database module
@@ -3977,7 +3990,7 @@ def build_tasks_tab_layout():
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
             html.Div(
-                "This safety-first operation may download missing candles using validated backup + atomic-write logic. It updates only tasks loaded from JSON and never overwrites the selected source file. Wait for Finished, optionally recalculate results, then choose a new filename and press Save Tasks.",
+                "This safety-first operation may download missing candles using validated backup + atomic-write logic. It updates only tasks loaded from JSON and never overwrites the selected source file. After Finished, rerun Events, Strategy and Impulse so saved derived results use the new history; then choose a new filename and press Save Tasks.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
             ),
             html.Div(id="update-json-pre-signal-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "8px"}),
@@ -7615,13 +7628,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         return go.Figure()
     # Resolve the task's inclusive period before touching candle data so the
     # parquet reader can avoid loading years of unrelated history.
-    runtime_chart_start = getattr(task, "_load_chart_start_ms", None)
-    start_ms = (
-        int(runtime_chart_start)
-        if runtime_chart_start is not None
-        else int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-        if task.start_date else 0
-    )
+    start_ms = task_pre_signal_start_ms(task)
     if task.end_date:
         end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
     else:
@@ -8942,6 +8949,8 @@ def make_oscillator_reversal_source_cache_key(task):
         getattr(task, "signal_direction", None),
         getattr(task, "start_date", None),
         getattr(task, "end_date", None),
+        getattr(task, "pre_buffer_minutes", None),
+        getattr(task, "_load_chart_start_ms", None),
         getattr(task, "status", None),
     )
 
@@ -11061,14 +11070,12 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
 
         # Recheck every task after all downloads before changing task metadata.
         coverage_cache = {}
-        starts = {}
         for task in tasks:
             available, detail = check_pre_signal_database_coverage(
                 _task_coverage_dict(task), minutes, coverage_cache
             )
             if not available:
                 raise RuntimeError(f"{str(task.task_id)[:8]} final verification failed: {detail}")
-            starts[str(task.task_id)] = int(detail)
             deep_valid, deep_detail = validate_stored_candle_range(
                 task.symbols[0], str(task.timeframe), detail, task.signal_time
             )
@@ -11077,12 +11084,6 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                     f"{str(task.task_id)[:8]} final OHLCV verification failed: {deep_detail}"
                 )
 
-        prepared_starts = {
-            str(task.task_id): datetime.fromtimestamp(
-                starts[str(task.task_id)] / 1000.0, tz=timezone.utc
-            )
-            for task in tasks
-        }
         with tm.lock:
             stale = [
                 str(task.task_id)[:8] for task in tasks
@@ -11095,7 +11096,6 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                 )
             for task in tasks:
                 task.pre_buffer_minutes = minutes
-                task.start_date = prepared_starts[str(task.task_id)]
                 task._prepared_for_new_json = True
                 for attr in (
                     "_load_pre_signal_override_minutes", "_load_chart_start_ms",
@@ -11109,7 +11109,8 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
         publish_golden_task_snapshot(snapshot, reason="json_period_update")
         _set_json_period_update_state(
             f"✅ Finished. Updated {len(tasks)} loaded tasks to {minutes} minutes before signal. "
-            "Database coverage is continuous and verified. Enter a new filename and press Save Tasks.",
+            "Database coverage is continuous and verified. The chart now uses the new start. "
+            "Before saving, rerun Events, Strategy and Impulse so derived results use the new history.",
             100,
         )
     except Exception as exc:
@@ -11336,7 +11337,9 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
     if override_minutes is not None:
         msg += (
             f" with one-time {override_minutes}-minute pre-signal override "
-            "(RAM only; JSON unchanged; database coverage verified)"
+            "(RAM only; JSON unchanged; database coverage and OHLCV verified). "
+            "Chart history uses it immediately; rerun Events, Strategy and Impulse "
+            "before relying on derived results"
         )
     if skipped > 0:
         skip_parts = []
