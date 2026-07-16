@@ -7937,7 +7937,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         xaxis_rangeslider_visible=False,
         template="plotly_white",
         hovermode="x",
-        hoverdistance=-1,
+        # Keep hover labels tied to nearby data points; the browser-side
+        # crosshair overlay provides the always-visible vertical guide.
+        hoverdistance=24,
         spikedistance=-1,
         clickmode="event+select",
         dragmode="pan",
