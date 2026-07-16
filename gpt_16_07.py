@@ -3606,14 +3606,14 @@ def build_root_layout():
                             }),
                         ]
                     ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="task-chart",
-                            style={"flex": "1", "minHeight": "0"},
-                            config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect", "eraseshape"]}
-                        ),
-                        type="circle",
+                    # Keep the existing chart visible while controls update.
+                    # A Loading wrapper replaces its child with a spinner for
+                    # every figure/relayout callback, which made Measure hide
+                    # the chart precisely when the user needed to select it.
+                    dcc.Graph(
+                        id="task-chart",
                         style={"flex": "1", "minHeight": "0"},
+                        config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect", "eraseshape"]}
                     ),
                     html.Div(id="measure-hint", style={"color": "#333", "fontSize": "12px", "textAlign": "center", "marginTop": "5px"}),
                     html.Div(id="measure-result", style={"color": "black", "marginTop": "10px", "textAlign": "center", "fontSize": "14px"})
