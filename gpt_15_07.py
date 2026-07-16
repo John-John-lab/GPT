@@ -6903,7 +6903,7 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
     Object.keys(fig.layout).forEach(function(key) {
         if (/^xaxis[0-9]*$/.test(key)) {
-            fig.layout[key].showspikes = showHover;
+            fig.layout[key].showspikes = false;
             fig.layout[key].spikemode = 'across+toaxis';
             fig.layout[key].spikecolor = '#666';
             fig.layout[key].spikethickness = 1;
@@ -7020,6 +7020,63 @@ function(figure) {
     }
     function hideLine() {
         line.style.display = 'none';
+        if (window.Plotly && window.Plotly.Fx) {
+            try { window.Plotly.Fx.unhover(plot); } catch (e) {}
+        }
+    }
+    function toMillis(value) {
+        if (value instanceof Date) return value.getTime();
+        if (typeof value === 'number') return value;
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    function findNearestPointIndex(xValues, targetMs) {
+        if (!xValues || !xValues.length || targetMs === null) return null;
+        let bestIndex = 0;
+        let bestDistance = Infinity;
+        for (let i = 0; i < xValues.length; i += 1) {
+            const ms = toMillis(xValues[i]);
+            if (ms === null) continue;
+            const distance = Math.abs(ms - targetMs);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+            if (ms > targetMs && distance > bestDistance) break;
+        }
+        return Number.isFinite(bestDistance) ? bestIndex : null;
+    }
+    function syncedHoverAt(event, rect) {
+        if (!window.Plotly || !window.Plotly.Fx || !plot._fullLayout || !plot.data || !plot.data.length) return;
+        const xaxis = plot._fullLayout.xaxis || {};
+        const range = xaxis.range || [];
+        if (range.length !== 2) return;
+        const rangeStart = toMillis(range[0]);
+        const rangeEnd = toMillis(range[1]);
+        if (rangeStart === null || rangeEnd === null || rangeEnd === rangeStart) return;
+        const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.right - rect.left)));
+        const targetMs = rangeStart + (rangeEnd - rangeStart) * ratio;
+        let xValues = null;
+        for (let i = 0; i < plot.data.length; i += 1) {
+            const trace = plot.data[i] || {};
+            if (trace.x && trace.x.length) {
+                xValues = trace.x;
+                break;
+            }
+        }
+        const pointIndex = findNearestPointIndex(xValues, targetMs);
+        if (pointIndex === null) return;
+        const hoverPoints = [];
+        plot.data.forEach(function(trace, curveNumber) {
+            const traceName = trace && trace.name ? String(trace.name) : '';
+            if (!trace || !trace.x || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
+            if (traceName.startsWith('_') || traceName === 'Signal Time') return;
+            if (trace.mode === 'markers' && trace.showlegend === false) return;
+            hoverPoints.push({curveNumber: curveNumber, pointNumber: pointIndex});
+        });
+        if (hoverPoints.length) {
+            try { window.Plotly.Fx.hover(plot, hoverPoints); } catch (e) {}
+        }
     }
     function moveLine(event) {
         const rect = getPlotAreaRect();
@@ -7031,6 +7088,7 @@ function(figure) {
         line.style.top = rect.top + 'px';
         line.style.height = Math.max(0, rect.height) + 'px';
         line.style.display = 'block';
+        syncedHoverAt(event, rect);
     }
     plot.addEventListener('mousemove', moveLine);
     plot.addEventListener('mouseleave', hideLine);
@@ -7956,14 +8014,13 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         # own default view.
         uirevision=f"task-chart-preserve-view-{task_id}"
     )
-    # X-axis tick format and native Plotly spike lines.
-    # showspikes + spikemode="across" keeps the thin dashed hover line synced
-    # across price, RSI, and volume panes without Python callbacks or custom JS.
+    # X-axis tick format. Native Plotly spikes are disabled because the
+    # browser-side crosshair overlay supplies the single full-pane dashed line.
     fig.update_xaxes(
         tickformat="%H:%M",
         ticklabelmode="period",
         ticks="outside",
-        showspikes=True,
+        showspikes=False,
         spikemode="across+toaxis",
         spikecolor="#666",
         spikesnap="cursor",
