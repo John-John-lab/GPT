@@ -3314,6 +3314,7 @@ def build_root_layout():
     dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
     dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
     dcc.Store(id="chart-dragmode-enforcer-store", data=None),  # keeps Measure draw-rectangle mode synced with Plotly modebar
+    dcc.Store(id="chart-crosshair-listener-store", data=None),  # installs browser-side full-height chart crosshair overlay
     dcc.Store(id="osc-event-groups-store", data={}),
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
@@ -6969,6 +6970,74 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     prevent_initial_call=True
 )
 
+
+clientside_callback(
+    """
+function(figure) {
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (!plot) {
+        return window.dash_clientside.no_update;
+    }
+    if (plot.__dashFullPaneCrosshairInstalled) {
+        return {installed: true, ts: Date.now()};
+    }
+    plot.__dashFullPaneCrosshairInstalled = true;
+    let line = document.getElementById('task-chart-full-pane-crosshair');
+    if (!line) {
+        line = document.createElement('div');
+        line.id = 'task-chart-full-pane-crosshair';
+        line.style.position = 'fixed';
+        line.style.width = '0px';
+        line.style.borderLeft = '1px dashed #666';
+        line.style.pointerEvents = 'none';
+        line.style.display = 'none';
+        line.style.zIndex = '10050';
+        document.body.appendChild(line);
+    }
+    function getPlotAreaRect() {
+        const svg = plot.querySelector('.main-svg');
+        const plotBgs = Array.from(plot.querySelectorAll('.bglayer .bg'));
+        if (svg && plotBgs.length) {
+            const svgRect = svg.getBoundingClientRect();
+            const rects = plotBgs.map(function(bg) { return bg.getBoundingClientRect(); })
+                .filter(function(rect) { return rect && rect.width > 0 && rect.height > 0; });
+            if (rects.length) {
+                const left = Math.min.apply(null, rects.map(function(rect) { return rect.left; }));
+                const right = Math.max.apply(null, rects.map(function(rect) { return rect.right; }));
+                const top = Math.min.apply(null, rects.map(function(rect) { return rect.top; }));
+                const bottom = Math.max.apply(null, rects.map(function(rect) { return rect.bottom; }));
+                return {left: left || svgRect.left, right: right || svgRect.right, top: top || svgRect.top, bottom: bottom || svgRect.bottom, height: bottom - top};
+            }
+        }
+        return plot.getBoundingClientRect();
+    }
+    function hideLine() {
+        line.style.display = 'none';
+    }
+    function moveLine(event) {
+        const rect = getPlotAreaRect();
+        if (!rect || event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+            hideLine();
+            return;
+        }
+        line.style.left = event.clientX + 'px';
+        line.style.top = rect.top + 'px';
+        line.style.height = Math.max(0, rect.height) + 'px';
+        line.style.display = 'block';
+    }
+    plot.addEventListener('mousemove', moveLine);
+    plot.addEventListener('mouseleave', hideLine);
+    window.addEventListener('scroll', hideLine, true);
+    window.addEventListener('resize', hideLine);
+    return {installed: true, ts: Date.now()};
+}
+""",
+    Output("chart-crosshair-listener-store", "data"),
+    Input("task-chart", "figure"),
+    prevent_initial_call=True,
+)
+
 clientside_callback(
     """
 function(relayoutData, measureMode) {
@@ -7690,9 +7759,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     y_min -= y_padding
     y_max += y_padding
 
-    # Full-height transparent hover target on the main chart keeps the vertical
-    # dashed x-spike active anywhere in the candle pane, not only near candles.
-    add_hover_spike_bar(fig, 1, y_min, y_max, '_spike_hover_main')
+    # Do not place a transparent hover trace over the candle pane: it can steal
+    # the OHLC hover label from candles. A browser-side crosshair overlay below
+    # provides the always-visible vertical guide across the full chart instead.
     # Signal level
     signal_price = task.signal_price
     fig.add_hline(y=signal_price, line_dash="dash", line_color="yellow",
