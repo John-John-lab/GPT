@@ -632,6 +632,7 @@ RUNTIME_TASK_FIELDS = {
     "stop_event", "pause_event", "state_lock", "raw_batches",
     "_chart_cache", "symbol_ranges", "_load_pre_signal_override_minutes",
     "_load_chart_start_ms", "_load_original_pre_buffer_minutes",
+    "_loaded_from_json", "_loaded_source_json", "_prepared_for_new_json",
 }
 
 TASK_DATETIME_FIELDS = {
@@ -3952,10 +3953,13 @@ def build_tasks_tab_layout():
                 html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
                 html.Button("⚡ Recalc Table Flags", id="recalc-table-flags-btn", n_clicks=0, style={"marginRight": "10px"}),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "marginTop": "10px"}),
-            html.Div(
-                "Optional load override is used only in RAM for this load. Before applying it, every task is checked for a continuous candle range from the requested start through its signal.",
+            html.Div([
+                html.Strong("Temporary load override: "),
+                "the field beside Load Selected changes calculations/chart history only in RAM. It never downloads candles and refuses the load unless every requested range already exists continuously in the database.",
+            ],
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "8px"},
             ),
+            html.H5("Prepare persistent period values for a NEW JSON", style={"margin": "10px 0 5px"}),
             html.Div([
                 dcc.Input(
                     id="update-json-pre-signal-minutes",
@@ -3973,7 +3977,7 @@ def build_tasks_tab_layout():
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
             html.Div(
-                "This does not overwrite the selected JSON. When finished, choose a new filename and press Save Tasks.",
+                "This safety-first operation may download missing candles using validated backup + atomic-write logic. It updates only tasks loaded from JSON and never overwrites the selected source file. Wait for Finished, optionally recalculate results, then choose a new filename and press Save Tasks.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
             ),
             html.Div(id="update-json-pre-signal-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "8px"}),
@@ -10869,10 +10873,22 @@ def save_tasks_to_json(n, filename):
     # Ensure the task_logs directory exists
     os.makedirs(LOGS_DIR, exist_ok=True)
     
-    filepath = os.path.join(LOGS_DIR, filename)
+    filepath = os.path.abspath(os.path.join(LOGS_DIR, filename))
     
     # Get live tasks from RAM (Source of Truth)
     tasks = tm.get_all_tasks()
+    protected_sources = {
+        os.path.abspath(task._loaded_source_json)
+        for task in tasks
+        if getattr(task, "_prepared_for_new_json", False)
+        and getattr(task, "_loaded_source_json", None)
+    }
+    if filepath in protected_sources:
+        return (
+            "❌ Refusing to overwrite the source JSON after changing its period values. "
+            "Enter a new filename and save again.",
+            filename,
+        )
     report_unclassified_task_fields(tasks, reason="save_tasks_to_json")
     
     # Build reconstructed data list
@@ -11061,12 +11077,26 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                     f"{str(task.task_id)[:8]} final OHLCV verification failed: {deep_detail}"
                 )
 
+        prepared_starts = {
+            str(task.task_id): datetime.fromtimestamp(
+                starts[str(task.task_id)] / 1000.0, tz=timezone.utc
+            )
+            for task in tasks
+        }
         with tm.lock:
+            stale = [
+                str(task.task_id)[:8] for task in tasks
+                if tm.tasks.get(task.task_id) is not task
+            ]
+            if stale:
+                raise RuntimeError(
+                    "loaded task set changed while download was running; refusing metadata update "
+                    f"({', '.join(stale[:5])})"
+                )
             for task in tasks:
                 task.pre_buffer_minutes = minutes
-                task.start_date = datetime.fromtimestamp(
-                    starts[str(task.task_id)] / 1000.0, tz=timezone.utc
-                )
+                task.start_date = prepared_starts[str(task.task_id)]
+                task._prepared_for_new_json = True
                 for attr in (
                     "_load_pre_signal_override_minutes", "_load_chart_start_ms",
                     "_load_original_pre_buffer_minutes",
@@ -11106,9 +11136,9 @@ def start_json_period_update(_clicks, minutes_value):
         return "❌ Enter a whole number of minutes before signal."
     if minutes < 0:
         return "❌ Minutes cannot be negative."
-    tasks = tm.get_all_tasks()
+    tasks = [task for task in tm.get_all_tasks() if getattr(task, "_loaded_from_json", False)]
     if not tasks:
-        return "⚠️ Load tasks before preparing a new JSON."
+        return "⚠️ No JSON-loaded tasks are present. Load a JSON before preparing a new one."
     with json_period_update_state["lock"]:
         if json_period_update_state["running"]:
             return "⚠️ JSON period update is already running."
@@ -11197,7 +11227,18 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
             if not available:
                 unavailable.append(f"{str(item.get('task_id'))[:8]}: {detail}")
             else:
-                override_starts[str(item.get("task_id"))] = int(detail)
+                deep_valid, deep_detail = validate_stored_candle_range(
+                    (item.get("symbols") or [None])[0],
+                    str(item.get("timeframe")),
+                    detail,
+                    item.get("signal_time"),
+                )
+                if not deep_valid:
+                    unavailable.append(
+                        f"{str(item.get('task_id'))[:8]}: OHLCV validation failed ({deep_detail})"
+                    )
+                else:
+                    override_starts[str(item.get("task_id"))] = int(detail)
         if unavailable:
             shown = "; ".join(unavailable[:5])
             suffix = f"; and {len(unavailable) - 5} more" if len(unavailable) > 5 else ""
@@ -11248,6 +11289,8 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
                     init_kwargs[k] = _parse_timestamp(init_kwargs[k])
 
             task = DownloadTask(**init_kwargs)
+            task._loaded_from_json = True
+            task._loaded_source_json = os.path.abspath(filepath)
             if override_minutes is not None:
                 task._load_original_pre_buffer_minutes = task.pre_buffer_minutes
                 task.pre_buffer_minutes = override_minutes
