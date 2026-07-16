@@ -3076,6 +3076,51 @@ function pushDashStore(storeId, payload, fallbackEventName) {
     const event = new CustomEvent(fallbackEventName, {detail: eventPayload});
     document.dispatchEvent(event);
 }
+const chartToggleStores = {
+    'toggle-rsi-btn': ['rsi-visible-store', false],
+    'toggle-stochastic-btn': ['stochastic-visible-store', false],
+    'toggle-volume-btn': ['volume-visible-store', false],
+    'toggle-adx-btn': ['adx-visible-store', false],
+    'toggle-macd-btn': ['macd-visible-store', false],
+    'toggle-disparity-btn': ['disparity-visible-store', false],
+    'toggle-strategy-btn': ['strategy-visible-store', false],
+    'toggle-chart-info-box-btn': ['chart-info-box-store', true],
+    'toggle-chart-extend-x-btn': ['chart-extend-x-store', false],
+    'toggle-measure-anchor-btn': ['measure-anchor-store', false],
+    'toggle-measure-hover-btn': ['measure-hover-store', true],
+    'toggle-impulses-btn': ['impulse-visible-store', true],
+    'toggle-events-btn': ['events-visible-store', false],
+    'toggle-measure-btn': ['measure-mode-store', false]
+};
+const chartToggleState = {};
+Object.keys(chartToggleStores).forEach(function(buttonId) {
+    chartToggleState[buttonId] = chartToggleStores[buttonId][1];
+});
+function applyChartToggleImmediately(button) {
+    const config = chartToggleStores[button.id];
+    if (!config || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') {
+        return false;
+    }
+    const label = String(button.textContent || '');
+    if (button.id === 'toggle-measure-btn') chartToggleState[button.id] = label.indexOf('Measuring') >= 0;
+    if (button.id === 'toggle-measure-anchor-btn') chartToggleState[button.id] = label.indexOf('Snap: On') >= 0;
+    if (button.id === 'toggle-measure-hover-btn') chartToggleState[button.id] = label.indexOf('Hover: On') >= 0;
+    if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Info Box: On') >= 0;
+    if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
+    const active = !Boolean(chartToggleState[button.id]);
+    chartToggleState[button.id] = active;
+    window.dash_clientside.set_props(config[0], {data: active});
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    const warm = button.id === 'toggle-chart-info-box-btn' || button.id === 'toggle-measure-hover-btn';
+    const green = button.id === 'toggle-measure-anchor-btn';
+    button.style.background = active ? (warm ? '#fff8e1' : (green ? '#e8f5e9' : '#e3f2fd')) : 'transparent';
+    button.style.borderWidth = active ? '2px' : '1px';
+    if (button.id === 'toggle-measure-btn') {
+        button.textContent = active ? '📏 Measuring' : 'Measure';
+        button.style.fontWeight = active ? 'bold' : 'normal';
+    }
+    return true;
+}
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
@@ -3089,6 +3134,11 @@ document.addEventListener('click', function(e) {
     }
     
     if (!button) return;
+
+    // These are pure UI Store toggles. Updating through set_props avoids a
+    // registered clientside callback lookup, which older Dash renderers can
+    // fail with "undefined (reading apply)" after hot reloads/cache changes.
+    if (applyChartToggleImmediately(button)) return;
 
     if (button.id === 'close-chart-modal') {
         applyChartRowHighlight(null);
@@ -6564,23 +6614,7 @@ def auto_throttle_updates(_):
 
 # ----- NEW: Callback for chart button using data-action pattern -----
 # This callback listens to the hidden trigger that JS sets when chart button is clicked
-clientside_callback(
-    """
-function(triggerData, clickStore) {
-    if (!triggerData || !triggerData.task_id || triggerData.action !== 'chart') {
-        return [window.dash_clientside.no_update, window.dash_clientside.no_update, window.dash_clientside.no_update];
-    }
-    const taskId = String(triggerData.task_id);
-    const store = Object.assign({}, clickStore || {});
-    const key = taskId + '_chart';
-    const nowSeconds = Date.now() / 1000;
-    if (nowSeconds - Number(store[key] || 0) < 0.5) {
-        return [window.dash_clientside.no_update, window.dash_clientside.no_update, window.dash_clientside.no_update];
-    }
-    store[key] = nowSeconds;
-    return [taskId, store, {events: [], index: 0, overlay: false}];
-}
-""",
+@app.callback(
     Output("chart-task-id", "data"),
     Output("chart-click-store", "data"),
     Output("chart-event-context-store", "data"),
@@ -6588,6 +6622,19 @@ function(triggerData, clickStore) {
     State("chart-click-store", "data"),
     prevent_initial_call=True,
 )
+def set_chart_task_id(trigger_data, click_store):
+    if not trigger_data or trigger_data.get("action") != "chart":
+        return no_update, no_update, no_update
+    task_id = trigger_data.get("task_id")
+    if not task_id:
+        return no_update, no_update, no_update
+    click_store = dict(click_store or {})
+    key = f"{task_id}_chart"
+    current_time = time.time()
+    if current_time - float(click_store.get(key, 0) or 0) < 0.5:
+        return no_update, no_update, no_update
+    click_store[key] = current_time
+    return str(task_id), click_store, {"events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
 @app.callback(
@@ -6616,94 +6663,6 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
     return None, None, {}, {"events": [], "index": 0, "overlay": False}
-
-# Plotly's modebar is natively clientside. Keep the top chart controls on the
-# same immediate path. A single statically registered callback is used instead
-# of generating callback functions dynamically; this keeps Dash's clientside
-# function registry deterministic across Dash/browser versions.
-clientside_callback(
-    """
-function(rsiClick, stochClick, volumeClick, adxClick, macdClick, dixClick,
-         strategyClick, infoClick, extendClick, anchorClick, hoverClick,
-         impulsesClick, eventsClick,
-         rsi, stoch, volume, adx, macd, dix, strategy, info, extend,
-         anchor, hover, impulses, events) {
-    const ids = [
-        'toggle-rsi-btn', 'toggle-stochastic-btn', 'toggle-volume-btn',
-        'toggle-adx-btn', 'toggle-macd-btn', 'toggle-disparity-btn',
-        'toggle-strategy-btn', 'toggle-chart-info-box-btn',
-        'toggle-chart-extend-x-btn', 'toggle-measure-anchor-btn',
-        'toggle-measure-hover-btn', 'toggle-impulses-btn', 'toggle-events-btn'
-    ];
-    const current = [rsi, stoch, volume, adx, macd, dix, strategy, info,
-                     extend, anchor, hover, impulses, events];
-    const callbackContext = window.dash_clientside.callback_context;
-    const triggered = callbackContext && callbackContext.triggered_id
-        ? callbackContext.triggered_id
-        : (callbackContext && callbackContext.triggered && callbackContext.triggered.length
-            ? callbackContext.triggered[0].prop_id.split('.')[0]
-            : null);
-    const index = ids.indexOf(triggered);
-    if (index < 0) {
-        return ids.map(function() { return window.dash_clientside.no_update; });
-    }
-    const active = !Boolean(current[index]);
-    const button = document.getElementById(triggered);
-    if (button) {
-        const warm = triggered === 'toggle-chart-info-box-btn' ||
-                     triggered === 'toggle-measure-hover-btn';
-        const green = triggered === 'toggle-measure-anchor-btn';
-        button.setAttribute('aria-pressed', active ? 'true' : 'false');
-        button.style.background = active ? (warm ? '#fff8e1' : (green ? '#e8f5e9' : '#e3f2fd')) : 'transparent';
-        button.style.borderWidth = active ? '2px' : '1px';
-    }
-    return ids.map(function(_, itemIndex) {
-        return itemIndex === index ? active : window.dash_clientside.no_update;
-    });
-}
-""",
-    Output("rsi-visible-store", "data"),
-    Output("stochastic-visible-store", "data"),
-    Output("volume-visible-store", "data"),
-    Output("adx-visible-store", "data"),
-    Output("macd-visible-store", "data"),
-    Output("disparity-visible-store", "data"),
-    Output("strategy-visible-store", "data"),
-    Output("chart-info-box-store", "data"),
-    Output("chart-extend-x-store", "data"),
-    Output("measure-anchor-store", "data"),
-    Output("measure-hover-store", "data"),
-    Output("impulse-visible-store", "data"),
-    Output("events-visible-store", "data"),
-    Input("toggle-rsi-btn", "n_clicks"),
-    Input("toggle-stochastic-btn", "n_clicks"),
-    Input("toggle-volume-btn", "n_clicks"),
-    Input("toggle-adx-btn", "n_clicks"),
-    Input("toggle-macd-btn", "n_clicks"),
-    Input("toggle-disparity-btn", "n_clicks"),
-    Input("toggle-strategy-btn", "n_clicks"),
-    Input("toggle-chart-info-box-btn", "n_clicks"),
-    Input("toggle-chart-extend-x-btn", "n_clicks"),
-    Input("toggle-measure-anchor-btn", "n_clicks"),
-    Input("toggle-measure-hover-btn", "n_clicks"),
-    Input("toggle-impulses-btn", "n_clicks"),
-    Input("toggle-events-btn", "n_clicks"),
-    State("rsi-visible-store", "data"),
-    State("stochastic-visible-store", "data"),
-    State("volume-visible-store", "data"),
-    State("adx-visible-store", "data"),
-    State("macd-visible-store", "data"),
-    State("disparity-visible-store", "data"),
-    State("strategy-visible-store", "data"),
-    State("chart-info-box-store", "data"),
-    State("chart-extend-x-store", "data"),
-    State("measure-anchor-store", "data"),
-    State("measure-hover-store", "data"),
-    State("impulse-visible-store", "data"),
-    State("events-visible-store", "data"),
-    prevent_initial_call=True,
-)
-
 
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
@@ -6744,25 +6703,16 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     context = {"category": category, "events": events, "index": event_index, "overlay": True}
     return task_id, {f"{task_id}_chart": time.time()}, context, True, True
 
-clientside_callback(
-    """
-function(nClicks, eventContext) {
-    if (!nClicks) return window.dash_clientside.no_update;
-    const context = Object.assign({events: [], index: 0, overlay: true}, eventContext || {});
-    context.overlay = !Boolean(context.overlay);
-    const button = document.getElementById('toggle-chart-event-marks-btn');
-    if (button) {
-        button.textContent = context.overlay ? 'Event Marks: On' : 'Event Marks: Off';
-        button.style.background = context.overlay ? '#1976d2' : '#6c757d';
-    }
-    return context;
-}
-""",
+@app.callback(
     Output("chart-event-context-store", "data", allow_duplicate=True),
     Input("toggle-chart-event-marks-btn", "n_clicks"),
     State("chart-event-context-store", "data"),
     prevent_initial_call=True,
 )
+def toggle_chart_event_marks(_clicks, event_context):
+    event_context = dict(event_context or {"events": [], "index": 0, "overlay": True})
+    event_context["overlay"] = not bool(event_context.get("overlay", True))
+    return event_context
 
 @app.callback(
     Output("toggle-chart-event-marks-btn", "children"),
@@ -6779,29 +6729,6 @@ def update_chart_event_marks_button(event_context):
     return ("Event Marks: On" if enabled else "Event Marks: Off"), style
 
 # ----- Measurement tool callbacks -----
-clientside_callback(
-    """
-function(nClicks, current) {
-    if (!nClicks) return window.dash_clientside.no_update;
-    const active = !Boolean(current);
-    // Give immediate visual feedback even if unrelated server callbacks are
-    // busy rendering the task table or an indicator figure.
-    const button = document.getElementById('toggle-measure-btn');
-    if (button) {
-        button.textContent = active ? '📏 Measuring' : 'Measure';
-        button.style.background = active ? '#e3f2fd' : 'transparent';
-        button.style.border = active ? '2px solid #1976d2' : '1px solid black';
-        button.style.fontWeight = active ? 'bold' : 'normal';
-    }
-    return active;
-}
-""",
-    Output("measure-mode-store", "data"),
-    Input("toggle-measure-btn", "n_clicks"),
-    State("measure-mode-store", "data"),
-    prevent_initial_call=True,
-)
-
 @app.callback(
     Output("measure-mode-store", "data", allow_duplicate=True),
     Output("measure-points-store", "data", allow_duplicate=True),
