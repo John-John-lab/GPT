@@ -53,6 +53,9 @@ INTERVAL_MS = {
     "D": 86400000, "W": 604800000
 }
 
+DATABASE_INFO_CACHE_SECONDS = 2.0
+_DATABASE_INFO_CACHE = {"signature": None, "created": 0.0, "info": None}
+
 # =============================================================================
 # DATABASE HELPER FUNCTIONS
 # =============================================================================
@@ -62,38 +65,71 @@ def symbol_timeframe_path(symbol, timeframe):
     return os.path.join(MARKET_DATA_DIR, symbol.replace("/", "_"), timeframe)
 
 
-def get_database_info():
-    """
-    Walk the market_data folder and collect metadata about each Parquet file.
-    Safely skips corrupted files and prints their paths for manual cleanup.
-    """
-    details, total_size, symbols = [], 0, set()
-    corrupted_files = []
+def _database_file_signature():
+    """Fast change detector for market-data metadata caching."""
+    signature = []
     for root, _, files in os.walk(MARKET_DATA_DIR):
         for f in files:
             if f == "data.parquet":
                 fp = os.path.join(root, f)
-                rel = os.path.relpath(root, MARKET_DATA_DIR).split(os.sep)
-                if len(rel) == 2:
-                    sym, tf = rel
-                    symbols.add(sym)
                 try:
-                    total_size += os.path.getsize(fp)
-                    df = pd.read_parquet(fp)
-                    if not df.empty:
-                        start = df["timestamp"].min()
-                        end = df["timestamp"].max()
-                        details.append({
-                            "symbol": sym,
-                            "timeframe": tf,
-                            "start": pd.to_datetime(start, unit='ms'),
-                            "end": pd.to_datetime(end, unit='ms'),
-                            "candles": len(df),
-                            "size": os.path.getsize(fp)
-                        })
-                except Exception as e:
-                    corrupted_files.append(fp)
-                    print(f"⚠️ Skipping corrupted file: {fp} ({e})")
+                    stat = os.stat(fp)
+                    signature.append((fp, stat.st_size, stat.st_mtime_ns))
+                except OSError:
+                    continue
+    return tuple(sorted(signature))
+
+
+def _read_parquet_summary(fp):
+    """Read only the timestamp column to keep tab switching fast."""
+    ts = pd.read_parquet(fp, columns=["timestamp"])["timestamp"]
+    if ts.empty:
+        return None
+    size = os.path.getsize(fp)
+    return {
+        "start": pd.to_datetime(ts.min(), unit="ms"),
+        "end": pd.to_datetime(ts.max(), unit="ms"),
+        "candles": len(ts),
+        "size": size,
+    }
+
+
+def get_database_info(force_refresh=False):
+    """
+    Walk the market_data folder and collect metadata about each Parquet file.
+    Safely skips corrupted files and prints their paths for manual cleanup.
+    """
+    signature = _database_file_signature()
+    now = time.time()
+    cached = _DATABASE_INFO_CACHE
+    if (
+        not force_refresh and
+        cached["info"] is not None and
+        cached["signature"] == signature and
+        now - cached["created"] < DATABASE_INFO_CACHE_SECONDS
+    ):
+        return cached["info"]
+
+    details, total_size, symbols = [], 0, set()
+    corrupted_files = []
+    for fp, file_size, _ in signature:
+        rel = os.path.relpath(os.path.dirname(fp), MARKET_DATA_DIR).split(os.sep)
+        if len(rel) != 2:
+            continue
+        sym, tf = rel
+        symbols.add(sym)
+        total_size += file_size
+        try:
+            summary = _read_parquet_summary(fp)
+            if summary:
+                details.append({
+                    "symbol": sym,
+                    "timeframe": tf,
+                    **summary,
+                })
+        except Exception as e:
+            corrupted_files.append(fp)
+            print(f"⚠️ Skipping corrupted file: {fp} ({e})")
                     
     if corrupted_files:
         print("\n" + "="*60)
@@ -104,7 +140,9 @@ def get_database_info():
             print(f"  🗑️ rm -rf '{folder}'")
         print("="*60 + "\n")
         
-    return {"size": total_size, "symbols": len(symbols), "details": details}
+    info = {"size": total_size, "symbols": len(symbols), "details": details}
+    _DATABASE_INFO_CACHE.update({"signature": signature, "created": now, "info": info})
+    return info
 
 
 # =============================================================================
@@ -365,21 +403,262 @@ class VerificationManager:
 # Global instance
 vm = VerificationManager()
 
+# =============================================================================
+# SAFE LEFT-SIDE PERIOD EXTENSION
+# =============================================================================
+# Kept in database.py by request. This section is intentionally isolated from
+# layout builders and verification code so it can be moved later if desired.
+
+BYBIT_BASE_URL = "https://api.bybit.com"
+RATE_LIMIT_SECONDS = 0.05
+
+
+def _symbol_timeframe_path(market_data_dir, symbol, timeframe):
+    return os.path.join(market_data_dir, symbol.replace("/", "_"), str(timeframe))
+
+
+def _safe_int_timestamp(value):
+    """Convert stored timestamp values to integer milliseconds without changing source data."""
+    return int(pd.to_numeric(value))
+
+
+def _validate_ohlcv_frame(df):
+    """Return a list of data-quality issues for a candle DataFrame."""
+    issues = []
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        issues.append(f"missing columns: {', '.join(sorted(missing))}")
+        return issues
+    if df.empty:
+        issues.append("empty frame")
+        return issues
+    if df["timestamp"].isna().any():
+        issues.append("null timestamps")
+    if df["timestamp"].duplicated().any():
+        issues.append("duplicate timestamps")
+    invalid = df[
+        (df["high"] < df["low"]) |
+        (df["high"] < df["open"]) |
+        (df["high"] < df["close"]) |
+        (df["low"] > df["open"]) |
+        (df["low"] > df["close"]) |
+        (df["volume"] < 0)
+    ]
+    if not invalid.empty:
+        issues.append(f"{len(invalid)} OHLCV inconsistencies")
+    return issues
+
+
+def fetch_klines_for_extension(symbol, interval, start, end, limit=200, max_retries=3):
+    """Fetch Bybit candles for safe database extension (newest first, matching Bybit v5)."""
+    import requests
+
+    url = f"{BYBIT_BASE_URL}/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": interval,
+        "start": int(start),
+        "end": int(end),
+        "limit": limit,
+    }
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("retCode") != 0:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Bybit API error: {data}")
+            rows = []
+            for k in data.get("result", {}).get("list", []):
+                rows.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])])
+            return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
+class ExtensionManager:
+    """Safely extends existing Parquet periods to the left without replacing old candles."""
+
+    def __init__(self, market_data_dir, interval_ms):
+        self.market_data_dir = market_data_dir
+        self.interval_ms = interval_ms
+        self.thread = None
+        self.running = False
+        self.progress = 0.0
+        self.status = "Idle."
+        self.log = []
+        self.lock = threading.Lock()
+
+    def _set_state(self, status=None, progress=None):
+        with self.lock:
+            if status is not None:
+                self.status = status
+                self.log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
+            if progress is not None:
+                self.progress = float(progress)
+
+    def get_state(self):
+        with self.lock:
+            return self.running, self.progress, self.status, "\n".join(self.log[-200:])
+
+    def start(self, symbol, timeframe, minutes):
+        if self.running:
+            return False, "⚠️ Another extension is already running. Please wait."
+        try:
+            minutes = int(minutes)
+        except Exception:
+            return False, "❌ Enter a whole number of minutes."
+        if minutes <= 0:
+            return False, "❌ Minutes must be greater than zero."
+        self.running = True
+        with self.lock:
+            self.progress = 0.0
+            self.status = "Starting safe extension..."
+            self.log = []
+        self.thread = threading.Thread(target=self._run, args=(symbol, timeframe, minutes), daemon=True)
+        self.thread.start()
+        return True, f"▶️ Started safe extension for {symbol} {timeframe} by {minutes} minutes."
+
+    def _run(self, symbol, timeframe, minutes):
+        try:
+            self._extend_left(symbol, timeframe, minutes)
+            self._set_state("✅ Extension completed safely.", 100)
+        except Exception as e:
+            self._set_state(f"❌ Extension stopped: {e}", self.progress)
+        finally:
+            self.running = False
+
+    def _extend_left(self, symbol, timeframe, minutes):
+        interval_ms = self.interval_ms.get(str(timeframe), 60000)
+        path = _symbol_timeframe_path(self.market_data_dir, symbol, timeframe)
+        file_path = os.path.join(path, "data.parquet")
+        if not os.path.exists(file_path):
+            raise RuntimeError(f"data.parquet not found for {symbol} {timeframe}")
+
+        self._set_state("Reading existing file and validating current data...", 2)
+        existing = pd.read_parquet(file_path)
+        issues = _validate_ohlcv_frame(existing)
+        if issues:
+            raise RuntimeError("existing file failed safety validation: " + "; ".join(issues))
+        existing = existing.sort_values("timestamp").reset_index(drop=True)
+        existing_start = _safe_int_timestamp(existing["timestamp"].min())
+        target_start = max(0, existing_start - int(minutes) * 60_000)
+        target_end = existing_start - interval_ms
+        if target_start > target_end:
+            self._set_state("Requested extension is shorter than one candle; nothing to download.", 100)
+            return
+
+        expected = max(1, ((target_end - target_start) // interval_ms) + 1)
+        self._set_state(
+            f"Downloading only missing left-side candles: {pd.to_datetime(target_start, unit='ms')} to {pd.to_datetime(target_end, unit='ms')} (~{expected}).",
+            5,
+        )
+        batches, cur_end, downloaded = [], target_end, 0
+        while cur_end >= target_start:
+            time.sleep(RATE_LIMIT_SECONDS)
+            df = fetch_klines_for_extension(symbol, timeframe, target_start, cur_end, limit=200)
+            if df.empty:
+                break
+            if not (df["timestamp"] % interval_ms == 0).all():
+                raise RuntimeError("downloaded batch contains timestamps not aligned to timeframe")
+            if df["timestamp"].max() >= existing_start:
+                df = df[df["timestamp"] < existing_start]
+            df = df[(df["timestamp"] >= target_start) & (df["timestamp"] <= target_end)]
+            if df.empty:
+                break
+            issues = _validate_ohlcv_frame(df)
+            if issues:
+                raise RuntimeError("downloaded batch failed safety validation: " + "; ".join(issues))
+            batches.append(df)
+            downloaded += len(df)
+            oldest = int(df["timestamp"].min())
+            cur_end = oldest - interval_ms
+            self._set_state(
+                f"Downloaded {downloaded} raw candles; checking for overlaps and gaps...",
+                min(90, 5 + downloaded / expected * 80),
+            )
+
+        if not batches:
+            self._set_state("No earlier candles returned by Bybit; existing file was not changed.", 100)
+            return
+
+        new_data = pd.concat(batches, ignore_index=True).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+        new_data = new_data[new_data["timestamp"] < existing_start]
+        if new_data.empty:
+            self._set_state("Downloaded data overlapped existing period only; existing file was not changed.", 100)
+            return
+
+        overlap = set(new_data["timestamp"].astype(int)).intersection(set(existing["timestamp"].astype(int)))
+        if overlap:
+            raise RuntimeError(f"overlap safety check failed for {len(overlap)} timestamps")
+
+        self._set_state("Merging with existing data using existing rows as immutable source of truth...", 92)
+        combined = pd.concat([new_data, existing], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        combined = combined.drop_duplicates("timestamp", keep="last")
+        combined_issues = _validate_ohlcv_frame(combined)
+        if combined_issues:
+            raise RuntimeError("combined file failed safety validation: " + "; ".join(combined_issues))
+
+        preserved = combined[combined["timestamp"].isin(existing["timestamp"])]
+        if len(preserved) != len(existing):
+            raise RuntimeError("preservation check failed: existing timestamp count changed")
+
+        backup_path = f"{file_path}.bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        temp_path = f"{file_path}.tmp_{uuid.uuid4().hex}"
+        self._set_state("Writing atomically with backup; original file remains until final replace...", 96)
+        shutil.copy2(file_path, backup_path)
+        combined.to_parquet(temp_path, compression="zstd")
+        reread = pd.read_parquet(temp_path)
+        reread_issues = _validate_ohlcv_frame(reread)
+        if reread_issues:
+            os.remove(temp_path)
+            raise RuntimeError("new parquet failed reread validation: " + "; ".join(reread_issues))
+        os.replace(temp_path, file_path)
+        self._set_state(f"Saved {len(new_data)} new candles. Backup kept at {backup_path}.", 99)
+
+
+em = ExtensionManager(MARKET_DATA_DIR, INTERVAL_MS)
+
 
 # =============================================================================
 # DATA ANALYSIS TAB UI
 # =============================================================================
 
-def create_data_analysis_tab():
-    """Create the Data Analysis tab UI layout."""
-    info = get_database_info()
-    total_candles = sum(d["candles"] for d in info["details"])
-    total_size_mb = info["size"] / 1e6
-    total_symbols = info["symbols"]
-    
+def _build_extend_cell(detail):
+    """Build the compact left-side extension controls for one data period."""
+    return html.Td(html.Div([
+        dcc.Input(
+            id={"type": "extend-minutes-input", "symbol": detail["symbol"], "timeframe": detail["timeframe"]},
+            type="number",
+            min=1,
+            step=1,
+            placeholder="extra min",
+            style={"width": "95px", "marginRight": "4px"},
+        ),
+        html.Button(
+            "⬅️ Extend",
+            id={"type": "extend-left-btn", "symbol": detail["symbol"], "timeframe": detail["timeframe"]},
+            n_clicks=0,
+            title="Safely download this many extra minutes before the current start time.",
+        ),
+    ]))
+
+
+def _build_details_table(details):
+    """Build the database-period table without embedding download logic."""
     rows = []
-    for d in info["details"]:
+    for d in details:
         rows.append(html.Tr([
+            _build_extend_cell(d),
             html.Td(d["symbol"]),
             html.Td(d["timeframe"]),
             html.Td(d["start"].strftime("%Y-%m-%d %H:%M")),
@@ -387,18 +666,48 @@ def create_data_analysis_tab():
             html.Td(f"{d['candles']:,}"),
             html.Td(f"{d['size']/1e6:.2f} MB")
         ]))
-    
-    table = html.Table([
-        html.Thead(html.Tr([html.Th("Symbol"), html.Th("TF"), html.Th("Start"), html.Th("End"), html.Th("Candles"), html.Th("Size")])),
+    return html.Table([
+        html.Thead(html.Tr([
+            html.Th("Extend left"),
+            html.Th("Symbol"),
+            html.Th("TF"),
+            html.Th("Start"),
+            html.Th("End"),
+            html.Th("Candles"),
+            html.Th("Size"),
+        ])),
         html.Tbody(rows)
     ], style={"width": "100%", "border": "1px solid black", "borderCollapse": "collapse"})
-    
-    if info["details"]:
-        df = pd.DataFrame(info["details"])
+
+
+def _build_extension_status_panel():
+    """Build progress/status/log widgets for safe period extension."""
+    return html.Div([
+        html.H4("Safe left-side period extension"),
+        html.P("Enter extra minutes beside any existing period and click Extend. The downloader only appends candles before the current start, rejects overlaps, validates OHLCV data, writes through a temporary file, and keeps a timestamped backup."),
+        html.Progress(id="extend-progress", value=0, max=100, style={"width": "100%", "height": "18px"}),
+        html.Div(id="extend-status", style={"marginTop": "8px", "fontWeight": "bold", "color": "#0b63b6"}),
+        html.Pre(id="extend-log", style={"height": "140px", "overflowY": "scroll", "border": "1px solid #ccc", "padding": "5px", "marginTop": "8px"}),
+    ], style={"border": "1px solid #d9e8ff", "backgroundColor": "#f7fbff", "padding": "10px", "margin": "10px 0"})
+
+
+def _build_candles_per_symbol_figure(details):
+    """Build a lightweight summary figure from already collected metadata."""
+    if details:
+        df = pd.DataFrame(details)
         df_grouped = df.groupby("symbol")["candles"].sum().reset_index()
-        fig = px.bar(df_grouped, x="symbol", y="candles", title="Total Candles per Symbol")
-    else:
-        fig = px.bar(title="No data downloaded yet")
+        return px.bar(df_grouped, x="symbol", y="candles", title="Total Candles per Symbol")
+    return px.bar(title="No data downloaded yet")
+
+
+def create_data_analysis_tab():
+    """Create the Data Analysis tab UI layout."""
+    info = get_database_info()
+    total_candles = sum(d["candles"] for d in info["details"])
+    total_size_mb = info["size"] / 1e6
+    total_symbols = info["symbols"]
+    table = _build_details_table(info["details"])
+    fig = _build_candles_per_symbol_figure(info["details"])
     
     # Build symbol/timeframe dropdown options
     symbol_options = [{"label": s, "value": s} for s in sorted(set(d["symbol"] for d in info["details"]))] if info["details"] else []
@@ -410,6 +719,7 @@ def create_data_analysis_tab():
         html.P(f"Total database size: {total_size_mb:.2f} MB"),
         html.Button("Download Backup", id="download-db-btn"),
         dcc.Download(id="download-db"),
+        _build_extension_status_panel(),
         html.H4("Detailed Table"),
         table,
         html.H4("Candles per Symbol"),
@@ -483,6 +793,38 @@ def create_data_analysis_tab():
 
 def register_database_callbacks(app):
     """Register all database-related callbacks with the Dash app."""
+
+    @app.callback(
+        Output("extend-status", "children"),
+        Input({"type": "extend-left-btn", "symbol": ALL, "timeframe": ALL}, "n_clicks"),
+        State({"type": "extend-minutes-input", "symbol": ALL, "timeframe": ALL}, "value"),
+        State({"type": "extend-minutes-input", "symbol": ALL, "timeframe": ALL}, "id"),
+        prevent_initial_call=True
+    )
+    def start_left_extension(_clicks, minute_values, input_ids):
+        triggered = ctx.triggered_id
+        if not isinstance(triggered, dict):
+            return no_update
+        symbol = triggered.get("symbol")
+        timeframe = triggered.get("timeframe")
+        minutes = None
+        for value, input_id in zip(minute_values or [], input_ids or []):
+            if input_id.get("symbol") == symbol and input_id.get("timeframe") == timeframe:
+                minutes = value
+                break
+        _, message = em.start(symbol, timeframe, minutes)
+        return message
+
+    @app.callback(
+        Output("extend-progress", "value"),
+        Output("extend-status", "children", allow_duplicate=True),
+        Output("extend-log", "children"),
+        Input("verify-interval", "n_intervals"),
+        prevent_initial_call=True
+    )
+    def update_left_extension_status(_):
+        _running, progress, status, log = em.get_state()
+        return progress, status, log
     
     # Verification control callback
     @app.callback(
