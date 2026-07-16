@@ -3674,676 +3674,689 @@ def build_root_layout():
 
 app.layout = build_root_layout()
 
+
+
+def build_tasks_tab_layout():
+    """Build the Tasks tab layout.
+
+    This is intentionally a layout-only extraction from render_tab so the main
+    tab dispatcher stays small. Do not add parsing, download, event detection,
+    or analysis math here; those flows remain in their dedicated callback and
+    task sections below.
+    """
+    return html.Div([
+        html.H3("Create Tasks from Signal File"),
+        # Active Download Monitor
+        html.Div(
+            id="active-download-monitor",
+            style={
+                "backgroundColor": "#f8f9fa",
+                "border": "1px solid #ccc",
+                "borderRadius": "6px",
+                "padding": "12px",
+                "marginBottom": "15px",
+                "display": "flex",
+                "alignItems": "center",
+                "gap": "15px"
+            },
+            children=[
+                html.Div("📡 Active Download:", style={"fontWeight": "bold", "minWidth": "140px"}),
+                html.Div(id="monitor-task-info", children="Idle", style={"flex": "1", "fontSize": "13px"}),
+                html.Progress(id="monitor-progress", value="0", max=100, style={"width": "150px"}),
+                html.Button("⏸ Pause", id="monitor-pause-btn", style={"fontSize": "12px", "padding": "4px 8px"}, disabled=True),
+                html.Button("⏹ Stop", id="monitor-stop-btn", style={"fontSize": "12px", "padding": "4px 8px", "backgroundColor": "#ffcccc"}, disabled=True),
+            ]
+        ),
+        # File upload
+        html.Div([
+            dcc.Upload(
+                id="upload-signals",
+                children=html.Button("Upload Signals File (TXT)"),
+                multiple=False
+            ),
+            html.Div(id="upload-status"),
+        ]),
+        html.Br(),
+        html.H4("Or paste signals below:"),
+        dcc.Textarea(
+            id="signal-paste-input",
+            placeholder="Paste your signal text here...",
+            style={"width": "100%", "height": "200px"}
+        ),
+        html.Button("Parse Pasted Signals", id="parse-paste-btn", n_clicks=0),
+        html.Div(id="paste-status"),
+        html.Br(),
+        # Period type selection
+        html.Div([
+            dcc.RadioItems(
+                id="period-type",
+                options=[
+                    {'label': 'Date Range', 'value': 'date'},
+                    {'label': 'Hours from Signal', 'value': 'hours'}
+                ],
+                value='hours'
+            ),
+        ]),
+        # Date range picker (shown when period-type = 'date')
+        html.Div(
+            id="date-range-container",
+            children=[
+                dcc.DatePickerRange(
+                    id="date-range-picker",
+                    start_date=datetime.now()-timedelta(days=30),
+                    end_date=datetime.now()
+                ),
+            ]
+        ),
+        # Hours input (shown when period-type = 'hours')
+        html.Div(
+            id="hours-container",
+            style={'display': 'none'},
+            children=[
+                dcc.Input(id="hours-input", type="number", min=1, value=20, step=1, style={"width": "100px"}),
+                html.Span(" hours from signal time (with 5 min buffer before)"),
+            ]
+        ),
+        # Pre‑buffer minutes input (how much history before signal time)
+        html.Div([
+            dcc.Input(id="pre-buffer-input", type="number", min=10, max=480, step=10, value=120, style={"width": "100px"}),
+            html.Span("minutes of history BEFORE signal time (for ATR/volume calculation)", style={"marginLeft": "10px"}),
+        ], style={"marginBottom": "10px"}),
+        html.Br(),
+        # Common settings
+        html.Div([
+            html.Label("Timeframe:", style={"marginRight": "10px", "display": "inline-block"}),
+            dcc.Dropdown(
+                id="timeframe-dropdown",
+                options=[{"label": k, "value": v} for k, v in TIMEFRAMES.items()],
+                value="1",
+                clearable=False,
+                style={"width": "200px", "display": "inline-block"}
+            ),
+        ], style={"marginBottom": "10px"}),
+        html.Div([
+            dcc.Checklist(
+                id="overwrite-checkbox",
+                options=[{"label": "Overwrite existing data", "value": "overwrite"}]
+            ),
+        ]),
+        html.Br(),
+        # Toggle for analysis beyond period
+        html.Div([
+            dcc.Checklist(
+                id="analyze-beyond",
+                options=[{"label": "Analyze beyond selected period (may produce long logs)", "value": "beyond"}],
+                value=[]
+            ),
+        ]),
+        html.Br(),
+        html.Div([
+            html.Div([
+                dcc.Checklist(id="disable-strategy", options=[{"label": "Disable strategy detection", "value": "disable"}], value=["disable"]),
+                html.Button("🔄 Strategy", id="bulk-rerun-strategy", n_clicks=0, style={"marginLeft": "10px", "fontSize": "12px"})
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
+            html.Div([
+                dcc.Checklist(id="disable-impulse", options=[{"label": "Disable impulse detection", "value": "disable"}], value=["disable"]),
+                html.Button("🔄 Impulse", id="bulk-rerun-impulse", n_clicks=0, style={"marginLeft": "10px", "fontSize": "12px"})
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
+            html.Div([
+                dcc.Checklist(id="enable-event-logs", options=[{"label": "Disable event logs", "value": "disable"}], value=["disable"]),
+                html.Button("🔄 Events", id="bulk-rerun-events", n_clicks=0, style={"marginLeft": "10px", "fontSize": "12px"})
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
+            # NEW: Hide logs checkbox (checked by default for performance)
+            html.Div([
+                dcc.Checklist(
+                    id="hide-logs-checkbox",
+                    options=[{"label": "Hide detailed logs in task table (faster)", "value": "hide"}],
+                    value=["hide"]  # Default: checked
+                ),
+            ], style={"marginBottom": "10px"}),
+            html.Div([
+                html.Label("Main table view:", style={"fontWeight": "bold", "marginRight": "10px"}),
+                dcc.RadioItems(
+                    id="table-view-mode",
+                    options=[
+                        {"label": "Compact key columns (faster)", "value": "compact"},
+                        {"label": "Full table", "value": "full"},
+                    ],
+                    value="compact",
+                    inline=True,
+                ),
+            ], style={"marginBottom": "10px"}),
+            html.Div([
+                html.Label("Main table order:", style={"fontWeight": "bold", "marginRight": "10px"}),
+                dcc.RadioItems(
+                    id="table-sort-mode",
+                    options=[
+                        {"label": "Newest signal first", "value": "newest"},
+                        {"label": "Original task order", "value": "original"},
+                    ],
+                    value="newest",
+                    inline=True,
+                ),
+                html.Span(" UI-only; JSON and calculations are unchanged.", style={"fontSize": "12px", "color": "#666", "marginLeft": "8px"}),
+            ], style={"marginBottom": "10px"}),
+        ], style={"marginBottom": "10px"}),
+                html.Button("Create Tasks from Signals", id="create-signal-tasks-btn", n_clicks=0),
+                html.Div([
+                    dcc.Checklist(
+                        id="autoclear-checkbox",
+                        options=[{"label": "🗑️ Auto-clear previous tasks before creating new", "value": "autoclear"}],
+                        value=["autoclear"],  # Checked by default
+                        style={"marginTop": "5px", "marginBottom": "5px"}
+                    )
+                ]),
+                html.Button("🗑️ Clear All Tasks Now", id="clear-all-tasks-btn", n_clicks=0, style={"backgroundColor": "#ffebee", "color": "#c62828", "marginLeft": "10px"}),
+                # --- NEW: Save/Load Controls ---
+            # --- NEW: Save/Load Controls ---
+            html.Div([
+                dcc.Input(id="save-filename-input", value="tasks_export", placeholder="Enter filename (e.g., my_tasks)",
+                          style={"marginRight": "10px", "width": "200px"}),
+                html.Button("💾 Save Tasks", id="save-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
+                dcc.Dropdown(id="json-file-select", options=[], placeholder="Select saved file to load...",
+                             style={"width": "280px", "marginRight": "10px"}),
+                html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
+                html.Button("⚡ Recalc Table Flags", id="recalc-table-flags-btn", n_clicks=0, style={"marginRight": "10px"}),
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "marginTop": "10px"}),
+            html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
+        html.Div(id="bulk-rerun-status", style={"marginBottom": "10px", "color": "#1565c0", "fontFamily": "monospace", "minHeight": "20px"}),
+        html.Div(id="recalc-status-bar", style={"marginBottom": "10px", "color": "#d84315", "fontFamily": "monospace", "minHeight": "20px", "fontWeight": "bold"}),
+        # ----- Impulse Parameters Panel (collapsible) -----
+        html.Details([
+            html.Summary("⚡ Impulse Parameters (click to expand)", style={"fontWeight": "bold", "cursor": "pointer", "marginTop": "20px"}),
+            html.Div([
+                html.Label("Select completed task:"),
+                dcc.Dropdown(id="impulse-task-selector", placeholder="Choose task", style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Div([
+                        html.Label("ATR multiplier (body):", style={"width": "200px", "display": "inline-block"}),
+                        dcc.Slider(id="impulse-range-mult", min=0.5, max=3.0, step=0.1, value=2.0, marks=None),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Volume multiplier:", style={"width": "200px", "display": "inline-block"}),
+                        dcc.Slider(id="impulse-vol-mult", min=1.0, max=3.0, step=0.1, value=1.5, marks=None),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Body/range ratio:", style={"width": "200px", "display": "inline-block"}),
+                        dcc.Slider(id="impulse-body-ratio", min=0.3, max=0.9, step=0.05, value=0.6, marks=None),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Wick/range ratio:", style={"width": "200px", "display": "inline-block"}),
+                        dcc.Slider(id="impulse-wick-ratio", min=0.3, max=0.8, step=0.05, value=0.5, marks=None),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        dcc.Checklist(id="impulse-next-confirm", options=[{"label": "Require next candle confirmation", "value": "confirm"}], value=["confirm"]),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        dcc.Checklist(id="impulse-rsi-divergence", options=[{"label": "Use RSI divergence", "value": "div"}], value=[]),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("RSI extreme threshold:", style={"width": "200px", "display": "inline-block"}),
+                        dcc.Slider(id="impulse-rsi-extreme", min=60, max=90, step=5, value=80, marks=None),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        dcc.Checklist(id="impulse-base-candle", options=[{"label": "Require base candle before impulse", "value": "base"}], value=[]),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        dcc.Checklist(id="impulse-vol-accel", options=[{"label": "Require volume acceleration", "value": "accel"}], value=[]),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        dcc.Checklist(
+                            id="impulse-use-retracement",
+                            options=[{"label": "✨ Use retracement entry (wait for pullback – higher win rate)", "value": "retrace"}],
+                            value=["retrace"]
+                        ),
+                    ], style={"marginBottom": "10px"}),
+                    html.Button("Apply to Selected Task", id="apply-impulse-params", n_clicks=0),
+                    html.Button("Apply to All Completed Tasks", id="apply-impulse-all", n_clicks=0, style={"marginLeft": "10px"}),
+                    html.Button("Run Grid Search", id="run-grid-search", n_clicks=0, style={"margin": "5px"}),
+                    html.Button("Run Walk-Forward", id="run-walk-forward", n_clicks=0, style={"margin": "5px"}),
+                    html.Div(id="impulse-apply-status", style={"marginTop": "10px"}),
+                    html.Div(id="impulse-apply-all-status", style={"marginTop": "10px", "color": "blue"}),
+                    html.Hr(),
+                    html.H4("Impulse Backtest Results"),
+                    html.Div(id="impulse-results", style={"fontFamily": "monospace", "whiteSpace": "pre-wrap"}),
+                ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px"})
+            ], style={"marginBottom": "20px"})
+        ]),
+        # ----- Dynamic Toward-Level Strategy Checkup (on-demand diagnostics) -----
+        html.Details([
+            html.Summary("🧪 Dynamic Toward-Level Checkup – variable SL / TP / trailing stop", style={"fontWeight": "bold", "cursor": "pointer"}),
+            html.Div([
+                html.P(
+                    "Runs an on-demand diagnostic over raw candle data without changing saved task fields. "
+                    "Entry uses the first candle after signal time, buy toward resistance and sell toward support.",
+                    style={"marginTop": "10px", "color": "#555"}
+                ),
+                html.Details([
+                    html.Summary("ⓘ How to use SL grid, BE grid, TP levels, and dynamic stop rules", style={"cursor": "pointer", "color": "#0b63b6", "fontWeight": "bold"}),
+                    html.Div([
+                        html.P("Think of the controls as separate layers:", style={"marginBottom": "6px"}),
+                        html.Ul([
+                            html.Li("Initial stop loss % = where the first protective stop starts from entry; Initial stop events count trades closed by that stop before another exit type."),
+                            html.Li("SL grid % = extra initial-stop values to test side by side, for example 0.12 / 0.25 / 0.5."),
+                            html.Li("Take profit levels % = favorable-move checkpoints to count, such as 0.5 / 1 / 2 / 4."),
+                            html.Li("Dynamic stop rules = not take-profit orders; they move the stop after price moves in your favor."),
+                            html.Li("BE arm grid % = quick tests for moving the stop to entry after +0.25%, +0.5%, +1%, etc."),
+                            html.Li("Max adverse DD grid % = optional adverse-move caps from entry tested side by side."),
+                            html.Li("Net expectancy uses the simulated exit return minus your round-trip costs for every trade."),
+                            html.Li("Money estimate multiplies each net return by your notional per trade, for example 1000 USD."),
+                        ], style={"marginTop": 0}),
+                        html.P("Dynamic stop rule format: trigger%:move-stop-to-profit%.", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                        html.Ul([
+                            html.Li("0.5:0 means: after price moves +0.5% in your favor, move stop to breakeven / entry."),
+                            html.Li("1:0.3 means: after price moves +1%, move stop to lock about +0.3% profit."),
+                            html.Li("2:1.5 means: after price moves +2%, move stop to lock about +1.5% profit."),
+                            html.Li("4:3 means: after price moves +4%, move stop to lock about +3% profit."),
+                        ], style={"marginTop": 0}),
+                        html.P(
+                            "The dynamic summary table shows the selected scenario plus grid rows: SL grid scenarios, BE-after rows, "
+                            "max adverse DD cap rows, TP hit rows, stop events, stop-after-TP, and dynamic-stop-moved counts.",
+                            style={"marginBottom": 0}
+                        ),
+                    ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#eef7ff", "border": "1px solid #cfe8ff", "borderRadius": "4px", "margin": "8px 0"})
+                ], open=False),
+                html.Div([
+                    html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Loss distance from the simulated entry. Example: 0.12 means close if price moves 0.12% against the entry before a tighter dynamic stop is active.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-sl-input", type="number", value=0.12, min=0, step=0.01, style={"width": "90px"}),
+                    html.Label("Max adverse DD from entry % (positive):", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Optional adverse-move cap measured from entry, always entered as a positive percent. It is an exit reason only if this cap is hit before the normal stop/trailing stop.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Take profit levels %:", style={"width": "180px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Favorable move checkpoints from entry. Example: 0.5, 1, 2, 4 counts candles that move at least those percentages in the trade direction.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
+                    html.Span("Example: 0.5, 1, 2, 4", style={"marginLeft": "10px", "color": "#777"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Dynamic stop rules:", style={"width": "180px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Comma-separated trigger:stop-profit pairs. Example 0.5:0 means: after price moves +0.5% in your favor, move the stop to breakeven. 1:0.3 means after +1%, lock +0.3% profit.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                    html.Span("trigger%:move-stop-to-profit% pairs", style={"marginLeft": "10px", "color": "#777"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("SL grid %:", style={"width": "180px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Extra stop-loss values to test side-by-side in the summary. They reuse the same raw candle paths for faster comparison.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-sl-grid-input", type="text", value="0.12, 0.15, 0.25, 0.35, 0.5", style={"width": "260px"}),
+                    html.Label("BE arm grid %:", style={"width": "130px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Breakeven-arm tests add a rule that moves stop to entry after this favorable move. Example 0.5 tests BE after +0.5%.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-be-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Max adverse DD grid %:", style={"width": "180px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Extra adverse drawdown caps from entry to test side-by-side. A cap only counts when it becomes the actual exit before another stop.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-dd-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
+                    html.Span("Grid rows reuse raw candle paths built once per task for faster comparison.", style={"marginLeft": "10px", "color": "#777"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Notional per trade USD:", style={"width": "180px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Diagnostic position size used only for estimated P/L. Example: 1000 means each simulated trade is counted as a 1000 USD notional trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
+                    html.Label("Round-trip costs %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Estimated total entry+exit cost as percent of notional, including fees, spread, slippage, and funding if applicable. It is subtracted from every simulated trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
+                    html.Label("Open/no-exit return %:", style={"width": "165px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Fallback return for diagnostic paths that never hit SL, DD cap, or moved stop. Use 0 for conservative flat close, or another value if you have a forced end-of-window exit rule.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="dynamic-check-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Button("Run Dynamic Checkup", id="dynamic-check-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                dcc.Loading(
+                    type="circle",
+                    children=[
+                        html.Div(id="dynamic-check-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                        html.Div(
+                            id="dynamic-check-results",
+                            style={
+                                "marginTop": "10px",
+                                "maxHeight": "420px",
+                                "overflowY": "auto",
+                                "border": "1px solid #ddd",
+                                "borderRadius": "4px",
+                                "padding": "8px",
+                                "backgroundColor": "#fff",
+                            }
+                        ),
+                    ],
+                ),
+            ], style={"padding": "10px", "backgroundColor": "#f7fbff", "borderRadius": "5px", "border": "1px solid #cfe8ff"})
+        ], open=False, style={"marginBottom": "20px"}),
+        # ----- Level-Reversal Strategy Checkup (on-demand diagnostics) -----
+        html.Details([
+            html.Summary("🧪 Level-Reversal Checkup – enter after signal level touch/overshoot", style={"fontWeight": "bold", "cursor": "pointer"}),
+            html.Div([
+                html.P(
+                    "Tests the opposite idea: wait until price reaches the signal level (or overshoots it by a chosen percent), "
+                    "then enter the reversal direction. Resistance becomes SELL; support becomes BUY. This is read-only and does not change saved task fields.",
+                    style={"marginTop": "10px", "color": "#555"}
+                ),
+                html.Details([
+                    html.Summary("ⓘ How the level-reversal checkup works", style={"cursor": "pointer", "color": "#9a5a00", "fontWeight": "bold"}),
+                    html.Div([
+                        html.P("This box tests a different entry idea from the first dynamic box:", style={"marginBottom": "6px"}),
+                        html.Ul([
+                            html.Li("Resistance signal: wait for price to touch/overshoot the resistance level, then simulate a SELL reversal."),
+                            html.Li("Support signal: wait for price to touch/overshoot the support level, then simulate a BUY reversal."),
+                            html.Li("Entry offset beyond level % = 0 means enter at the level; 0.25 waits for 0.25% overshoot beyond the level."),
+                            html.Li("SL, TP levels, max adverse DD, and dynamic stop rules work the same way as the main dynamic checkup, but from this reversal entry."),
+                            html.Li("Initial stop events count reversal entries that were closed by the initial or moved stop; they do not mean the task is bad/corrupted."),
+                            html.Li("The summary is intentionally unified: it treats support/resistance as one concept — move toward the level, reject, then go back — instead of showing separate BUY/SELL cases."),
+                            html.Li("Entry offset grid % tests how many tasks still trigger if you require extra overshoot before reversal entry."),
+                            html.Li("Net expectancy and USD P/L rows use the same simulated exits, costs, and notional as the first dynamic box."),
+                        ], style={"marginTop": 0}),
+                        html.P("Examples:", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                        html.Ul([
+                            html.Li("Offset 0%: enter reversal as soon as the signal level is touched."),
+                            html.Li("Offset 0.25% on resistance: wait until high reaches resistance +0.25%, then test SELL reversal."),
+                            html.Li("Offset 0.25% on support: wait until low reaches support -0.25%, then test BUY reversal."),
+                            html.Li("Dynamic stop rule 1:0.3 still means: after +1% favorable reversal move, move stop to lock +0.3%."),
+                        ], style={"marginTop": 0}),
+                        html.P(
+                            "The level-reversal summary table shows triggered entries, not-triggered entries, TP hit rows, SL events, "
+                            "adverse-DD events, stop-after-TP, dynamic-stop-moved rows, SL grid rows, and entry-offset grid rows as one unified level-rejection strategy.",
+                            style={"marginBottom": 0}
+                        ),
+                    ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#fff4de", "border": "1px solid #f4d19b", "borderRadius": "4px", "margin": "8px 0"})
+                ], open=False),
+                html.Div([
+                    html.Label("Entry offset beyond level %:", style={"width": "210px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="0 means enter at the signal level. 0.2 means wait for 0.2% beyond resistance/support before entering the reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="level-reversal-offset-input", type="number", value=0, min=0, step=0.05, style={"width": "90px"}),
+                    html.Label("Initial stop loss %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Loss distance from reversal entry. Resistance reversal is SELL, support reversal is BUY.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="level-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
+                    html.Label("Max adverse DD %:", style={"width": "140px", "display": "inline-block", "marginLeft": "20px"}),
+                    dcc.Input(id="level-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Take profit levels %:", style={"width": "210px", "display": "inline-block"}),
+                    dcc.Input(id="level-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
+                    html.Label("Dynamic stop rules:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                    dcc.Input(id="level-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("SL grid %:", style={"width": "210px", "display": "inline-block"}),
+                    dcc.Input(id="level-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
+                    html.Label("Entry offset grid %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                    dcc.Input(id="level-reversal-offset-grid-input", type="text", value="0, 0.1, 0.25, 0.5", style={"width": "220px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Notional per trade USD:", style={"width": "210px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Diagnostic position size used only for estimated P/L. Example: 1000 means each triggered reversal entry is counted as a 1000 USD notional trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="level-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
+                    html.Label("Round-trip costs %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Estimated total entry+exit cost as percent of notional, including fees, spread, slippage, and funding if applicable. It is subtracted from every triggered reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="level-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
+                    html.Label("Open/no-exit return %:", style={"width": "165px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Fallback return for diagnostic paths that never hit SL, DD cap, or moved stop. Use 0 for conservative flat close unless you define a forced end-of-window exit rule.", style={"cursor": "help", "color": "#0b63b6"}),
+                    dcc.Input(id="level-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Button("Run Level-Reversal Checkup", id="level-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                dcc.Loading(
+                    type="circle",
+                    children=[
+                        html.Div(id="level-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}),
+                        html.Div(
+                            id="level-reversal-results",
+                            style={
+                                "marginTop": "10px",
+                                "maxHeight": "420px",
+                                "overflowY": "auto",
+                                "border": "1px solid #ddd",
+                                "borderRadius": "4px",
+                                "padding": "8px",
+                                "backgroundColor": "#fff",
+                            }
+                        ),
+                    ],
+                ),
+            ], style={"padding": "10px", "backgroundColor": "#fffaf2", "borderRadius": "5px", "border": "1px solid #f4d19b"})
+        ], open=False, style={"marginBottom": "20px"}),
+        # ----- Oscillator-confirmed Level-Reversal Checkup -----
+        html.Details([
+            html.Summary("🧪 Oscillator Level-Reversal Checkup – level cross + Stoch/RSI trigger", style={"fontWeight": "bold", "cursor": "pointer"}),
+            html.Div([
+                html.P(
+                    "Waits for price to cross the signal level in the toward direction, then selects the UP-toward or DOWN-toward oscillator group. "
+                    "When all enabled Stoch/RSI conditions in that group match, it enters the reverse side and runs the same SL/TP/DD/trailing-stop simulation.",
+                    style={"marginTop": "10px", "color": "#555"}
+                ),
+                html.Details([
+                    html.Summary("ⓘ Logic and examples", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
+                    html.Div([
+                        html.Ul([
+                            html.Li("Resistance means the toward move is UP to resistance; the UP-toward group is used and the test enters SELL after confirmation."),
+                            html.Li("Support means the toward move is DOWN to support; the DOWN-toward group is used and the test enters BUY after confirmation."),
+                            html.Li("Use the UP-toward group for upper-limit logic, e.g. Stoch crossing down from 87 after price reaches resistance."),
+                            html.Li("Use the DOWN-toward group for lower-limit logic, e.g. Stoch crossing up from 13 after price reaches support."),
+                            html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10, K 300/1/10."),
+                            html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
+                            html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
+                            html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
+                            html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
+                            html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
+                            html.Li("The optional stochastic close section reports whether the trade closed by the four stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
+                            html.Li("Condition windows broaden multi-oscillator checks: a window of 1 requires all enabled conditions on the same candle; a window of 3 allows each condition to occur within the current candle or previous 2 candles."),
+                            html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
+                        ], style={"marginTop": 0}),
+                    ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
+                ], open=False),
+                html.Div([
+                    html.H5("UP-toward oscillator group (resistance → reverse SELL)", style={"margin": "8px 0", "color": "#6a1b9a"}),
+                    html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                    dcc.Input(id="osc-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                    dcc.Input(id="osc-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                    dcc.Input(id="osc-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                    dcc.Input(id="osc-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
+                    dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                ], style={"marginBottom": "12px"}),
+                html.Div([
+                    html.H5("DOWN-toward oscillator group (support → reverse BUY)", style={"margin": "8px 0", "color": "#1565c0"}),
+                    html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                    dcc.Input(id="osc-down-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-down-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                    dcc.Input(id="osc-down-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-down-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                    dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                    dcc.Input(id="osc-down-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-down-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
+                    dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
+                    dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Initial SL %:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
+                    html.Label("Max DD %:", style={"width": "85px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
+                    html.Label("TP levels %:", style={"width": "95px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "220px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Stop rules:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
+                    html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Entry condition window:", style={"width": "150px", "display": "inline-block"}),
+                    html.Span(" ⓘ", title="Number of candles where oscillator entry conditions may line up. 1 means all enabled conditions must be true on the same candle. 3 means each enabled condition may have occurred within the current candle or previous 2 candles.", style={"cursor": "help", "color": "#4a148c"}),
+                    dcc.Input(id="osc-entry-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
+                    html.Label("Close condition window:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
+                    html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60/300 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
+                    dcc.Input(id="osc-exit-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
+                    html.Span("1 = same candle; 3 = current + previous 2 candles", style={"marginLeft": "10px", "color": "#777"}),
+                ], style={"marginBottom": "10px"}),
+                html.Details([
+                    html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
+                    html.Div([
+                        html.P("When enabled, the simulated position waits for these four stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
+                        html.Div([
+                            dcc.Checklist(id="osc-exit-enabled-input", options=[{"label": "Enable stochastic close", "value": "enabled"}], value=[], style={"display": "inline-block", "marginRight": "20px"}),
+                        ], style={"marginBottom": "8px"}),
+                        html.Div([
+                            html.H5("Close SELL positions (resistance entries)", style={"margin": "8px 0", "color": "#6a1b9a"}),
+                            html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                            dcc.Input(id="osc-exit-sell-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                            dcc.Input(id="osc-exit-sell-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        ], style={"marginBottom": "8px"}),
+                        html.Div([
+                            html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                            dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                            dcc.Input(id="osc-exit-sell-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        ], style={"marginBottom": "10px"}),
+                        html.Div([
+                            html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
+                            html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
+                            dcc.Input(id="osc-exit-buy-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
+                            dcc.Input(id="osc-exit-buy-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        ], style={"marginBottom": "8px"}),
+                        html.Div([
+                            html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
+                            dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                            dcc.Input(id="osc-exit-buy-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                        ], style={"marginBottom": "4px"}),
+                    ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
+                ], open=False, style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Notional USD:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
+                    html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
+                    html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("Settings name:", style={"width": "100px", "display": "inline-block"}),
+                    dcc.Input(id="osc-settings-name-input", type="text", placeholder="my stochastic setup", style={"width": "220px"}),
+                    html.Button("Save Settings", id="osc-settings-save-btn", n_clicks=0, style={"marginLeft": "8px"}),
+                    html.Label("Open:", style={"marginLeft": "16px", "marginRight": "6px"}),
+                    dcc.Dropdown(id="osc-settings-open-dropdown", options=strategy_setting_options(), value=None, placeholder="choose saved settings", clearable=False, style={"width": "260px", "display": "inline-block", "verticalAlign": "middle"}),
+                    html.Button("Open Settings", id="osc-settings-open-btn", n_clicks=0, style={"marginLeft": "8px"}),
+                    html.Div(id="osc-settings-status", style={"marginTop": "6px", "color": "#4a148c", "fontWeight": "bold"}),
+                ], style={"marginBottom": "10px", "padding": "8px", "backgroundColor": "#f1e8ff", "border": "1px solid #ce93d8", "borderRadius": "4px"}),
+                html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
+                dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                html.Details([
+                    html.Summary("🔎 Research optimizer – compare oscillator/SL/stop combinations", style={"fontWeight": "bold", "cursor": "pointer", "color": "#4a148c", "marginTop": "14px"}),
+                    html.Div([
+                        html.P("Research mode runs multiple what-if combinations over historical candles and ranks them by net expectancy. It is for discovery/optimization, not a no-lookahead trading signal. After finding a candidate, validate it on a separate date range.", style={"color": "#555", "margin": "6px 0"}),
+                        html.Details([html.Summary("ⓘ How research optimizer works", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}), html.Ul([
+                            html.Li("It reuses the oscillator settings above as the base condition set."),
+                            html.Li("Condition variants test Base, Relaxed, and Strict levels. Relaxed makes high-threshold groups easier and low-threshold groups easier; Strict does the opposite."),
+                            html.Li("Window grids test whether conditions should align on the same candle or within several candles."),
+                            html.Li("SL grid and stop-rule presets test risk management combinations side by side."),
+                            html.Li("The ranked table includes entries, win-rate %, stop exits, stochastic exits, TP checkpoint success %, profit buckets, net expectancy, profit factor, and a plain-language advice column."),
+                            html.Li("It does not magically know future live reversals; it researches historical candles to find which settings would have captured reversals with lower adverse movement and better net results."),
+                        ], style={"fontSize": "13px", "lineHeight": "1.4"})], open=False),
+                        html.Div([
+                            html.Label("Entry windows:", style={"width": "110px", "display": "inline-block"}), dcc.Input(id="osc-research-entry-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
+                            html.Label("Close windows:", style={"width": "110px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-exit-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
+                            html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-sl-grid-input", type="text", value="1, 1.5, 2, 2.5, 3", style={"width": "180px"}),
+                        ], style={"marginBottom": "8px"}),
+                        html.Div([
+                            html.Label("Stop-rule presets:", style={"width": "120px", "display": "inline-block"}),
+                            dcc.Textarea(id="osc-research-stop-presets-input", value="1:0.35, 1.5:0.75, 2:1, 3:2, 4:3 | 0.7:0.25, 1:0.5, 2:1, 3:2, 4:3 | 1:0.5, 2:1, 3:2, 4:3", style={"width": "640px", "height": "44px", "verticalAlign": "middle"}),
+                            html.Span("Separate presets with |", style={"marginLeft": "8px", "color": "#777"}),
+                        ], style={"marginBottom": "8px"}),
+                        html.Div([
+                            html.Label("Max combinations:", style={"width": "120px", "display": "inline-block"}), dcc.Input(id="osc-research-max-combos-input", type="number", value=120, min=1, max=500, step=1, style={"width": "90px"}),
+                            html.Label("Top rows:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-top-input", type="number", value=20, min=5, max=100, step=1, style={"width": "80px"}),
+                            html.Button("Run Research Optimizer", id="osc-research-run-btn", n_clicks=0, style={"fontWeight": "bold", "marginLeft": "15px"}),
+                        ], style={"marginBottom": "8px"}),
+                        dcc.Loading(type="circle", children=[html.Div(id="osc-research-status", style={"marginTop": "8px", "fontWeight": "bold"}), html.Div(id="osc-research-results", style={"marginTop": "10px", "maxHeight": "520px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
+                    ], style={"padding": "8px", "backgroundColor": "#f6edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "marginTop": "8px"}),
+                ], open=False),
+            ], style={"padding": "10px", "backgroundColor": "#fbf3ff", "borderRadius": "5px", "border": "1px solid #ce93d8"})
+        ], open=False, style={"marginBottom": "20px"}),
+        # ----- Strategy Info Panel (collapsible) – Professional version -----
+        html.Details([
+            html.Summary("📊 Professional Strategy Framework – Multi‑Month Levels", style={"fontWeight": "bold", "cursor": "pointer"}),
+            html.Div([
+                html.P("This strategy integrates best practices from professional traders to trade multi‑month resistance/support levels with high probability.", style={"marginTop": "10px"}),
+                html.H5("🎯 Entry Confirmation (Configurable)", style={"marginTop": "15px"}),
+                html.Ul([
+                    html.Li("✅ Close confirmation – required by default (candle must close beyond the level)."),
+                    html.Li("📈 Volume spike – volume > 1.5x 20‑period average."),
+                    html.Li("🔄 Second touch – price touches level, moves away ≥0.5 ATR, then returns (optional)."),
+                    html.Li("📉 RSI divergence – regular/hidden divergence (detected automatically)."),
+                    html.Li("📊 OBV divergence – On‑Balance Volume divergence (optional)."),
+                    html.Li("💪 Elder's Force Index – strong directional force (optional)."),
+                    html.Li("📉 RSI extreme – overbought (>60) for resistance, oversold (<40) for support (optional)."),
+                    html.Li("📉 Moving average slope – trend alignment (optional)."),
+                    html.Li("🎲 Bollinger Band touch – price at outer band (optional)."),
+                    html.Li("📐 Candlestick patterns – engulfing, pin bar, shooting star, hammer, inside bar."),
+                    html.Li("🎯 Zone tolerance – price within ±0.3× ATR of the level (reduces noise)."),
+                ]),
+                html.H5("🚪 Exit & Risk Management", style={"marginTop": "15px"}),
+                html.Ul([
+                    html.Li("Initial take profit: 1.5× ATR."),
+                    html.Li("Initial stop loss: 0.75× ATR (bounce/retest) or fixed (momentum)."),
+                    html.Li("Trailing stop: after reaching target, stop trails at 1× ATR."),
+                    html.Li("Time stop: close after max 30 candles if no target/stop hit."),
+                    html.Li("Forward simulation – no look‑ahead bias."),
+                ]),
+                html.H5("📊 Parameters (can be adjusted)", style={"marginTop": "15px"}),
+                html.Ul([
+                    html.Li("volume_mult = 1.5"),
+                    html.Li("atr_period = 14"),
+                    html.Li("stop_loss_atr_mult = 0.75"),
+                    html.Li("max_holding_bars = 30"),
+                    html.Li("trail_atr = 1.0"),
+                    html.Li("zone_atr_mult = 0.3"),
+                    html.Li("use_close_confirmation = True (always on)"),
+                    html.Li("use_second_touch = False (recommend enabling)"),
+                    html.Li("use_obv_divergence = False"),
+                    html.Li("use_force_index = False"),
+                    html.Li("use_rsi_extreme = False"),
+                    html.Li("use_ma_slope = False"),
+                    html.Li("use_bollinger_bands = False"),
+                ]),
+                html.P("💡 **Tip:** Enable second touch, OBV divergence, and RSI extreme for higher‑probability but fewer signals. Disable them for more aggressive trading.", style={"marginTop": "10px", "fontStyle": "italic"}),
+                html.P("📈 Chart markers: 🟢 Green ▲ = Buy signal, 🔴 Red ▼ = Sell signal. White dashed lines = signal level and time.", style={"fontSize": "small"}),
+            ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px", "marginTop": "10px", "maxHeight": "400px", "overflowY": "auto"})
+        ], style={"marginBottom": "20px"}),
+        html.Hr(),
+        # Hidden target keeps the dedicated summary-stat cache callback active;
+        # visible summaries remain embedded in the task table below.
+        html.Div(id="summary-stats-container", style={"display": "none"}),
+        html.Div(id="task-table-container", style={"width": "100%"}),
+    ])
+
+
 @app.callback(
     Output("tab-content", "children"),
     Input("main-tabs", "value")
 )
 def render_tab(tab):
     if tab == "tab-tasks":
-        return html.Div([
-            html.H3("Create Tasks from Signal File"),
-            # Active Download Monitor
-            html.Div(
-                id="active-download-monitor",
-                style={
-                    "backgroundColor": "#f8f9fa",
-                    "border": "1px solid #ccc",
-                    "borderRadius": "6px",
-                    "padding": "12px",
-                    "marginBottom": "15px",
-                    "display": "flex",
-                    "alignItems": "center",
-                    "gap": "15px"
-                },
-                children=[
-                    html.Div("📡 Active Download:", style={"fontWeight": "bold", "minWidth": "140px"}),
-                    html.Div(id="monitor-task-info", children="Idle", style={"flex": "1", "fontSize": "13px"}),
-                    html.Progress(id="monitor-progress", value="0", max=100, style={"width": "150px"}),
-                    html.Button("⏸ Pause", id="monitor-pause-btn", style={"fontSize": "12px", "padding": "4px 8px"}, disabled=True),
-                    html.Button("⏹ Stop", id="monitor-stop-btn", style={"fontSize": "12px", "padding": "4px 8px", "backgroundColor": "#ffcccc"}, disabled=True),
-                ]
-            ),
-            # File upload
-            html.Div([
-                dcc.Upload(
-                    id="upload-signals",
-                    children=html.Button("Upload Signals File (TXT)"),
-                    multiple=False
-                ),
-                html.Div(id="upload-status"),
-            ]),
-            html.Br(),
-            html.H4("Or paste signals below:"),
-            dcc.Textarea(
-                id="signal-paste-input",
-                placeholder="Paste your signal text here...",
-                style={"width": "100%", "height": "200px"}
-            ),
-            html.Button("Parse Pasted Signals", id="parse-paste-btn", n_clicks=0),
-            html.Div(id="paste-status"),
-            html.Br(),
-            # Period type selection
-            html.Div([
-                dcc.RadioItems(
-                    id="period-type",
-                    options=[
-                        {'label': 'Date Range', 'value': 'date'},
-                        {'label': 'Hours from Signal', 'value': 'hours'}
-                    ],
-                    value='hours'
-                ),
-            ]),
-            # Date range picker (shown when period-type = 'date')
-            html.Div(
-                id="date-range-container",
-                children=[
-                    dcc.DatePickerRange(
-                        id="date-range-picker",
-                        start_date=datetime.now()-timedelta(days=30),
-                        end_date=datetime.now()
-                    ),
-                ]
-            ),
-            # Hours input (shown when period-type = 'hours')
-            html.Div(
-                id="hours-container",
-                style={'display': 'none'},
-                children=[
-                    dcc.Input(id="hours-input", type="number", min=1, value=20, step=1, style={"width": "100px"}),
-                    html.Span(" hours from signal time (with 5 min buffer before)"),
-                ]
-            ),
-            # Pre‑buffer minutes input (how much history before signal time)
-            html.Div([
-                dcc.Input(id="pre-buffer-input", type="number", min=10, max=480, step=10, value=120, style={"width": "100px"}),
-                html.Span("minutes of history BEFORE signal time (for ATR/volume calculation)", style={"marginLeft": "10px"}),
-            ], style={"marginBottom": "10px"}),
-            html.Br(),
-            # Common settings
-            html.Div([
-                html.Label("Timeframe:", style={"marginRight": "10px", "display": "inline-block"}),
-                dcc.Dropdown(
-                    id="timeframe-dropdown",
-                    options=[{"label": k, "value": v} for k, v in TIMEFRAMES.items()],
-                    value="1",
-                    clearable=False,
-                    style={"width": "200px", "display": "inline-block"}
-                ),
-            ], style={"marginBottom": "10px"}),
-            html.Div([
-                dcc.Checklist(
-                    id="overwrite-checkbox",
-                    options=[{"label": "Overwrite existing data", "value": "overwrite"}]
-                ),
-            ]),
-            html.Br(),
-            # Toggle for analysis beyond period
-            html.Div([
-                dcc.Checklist(
-                    id="analyze-beyond",
-                    options=[{"label": "Analyze beyond selected period (may produce long logs)", "value": "beyond"}],
-                    value=[]
-                ),
-            ]),
-            html.Br(),
-            html.Div([
-                html.Div([
-                    dcc.Checklist(id="disable-strategy", options=[{"label": "Disable strategy detection", "value": "disable"}], value=["disable"]),
-                    html.Button("🔄 Strategy", id="bulk-rerun-strategy", n_clicks=0, style={"marginLeft": "10px", "fontSize": "12px"})
-                ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
-                html.Div([
-                    dcc.Checklist(id="disable-impulse", options=[{"label": "Disable impulse detection", "value": "disable"}], value=["disable"]),
-                    html.Button("🔄 Impulse", id="bulk-rerun-impulse", n_clicks=0, style={"marginLeft": "10px", "fontSize": "12px"})
-                ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
-                html.Div([
-                    dcc.Checklist(id="enable-event-logs", options=[{"label": "Disable event logs", "value": "disable"}], value=["disable"]),
-                    html.Button("🔄 Events", id="bulk-rerun-events", n_clicks=0, style={"marginLeft": "10px", "fontSize": "12px"})
-                ], style={"display": "flex", "alignItems": "center", "marginBottom": "5px"}),
-                # NEW: Hide logs checkbox (checked by default for performance)
-                html.Div([
-                    dcc.Checklist(
-                        id="hide-logs-checkbox",
-                        options=[{"label": "Hide detailed logs in task table (faster)", "value": "hide"}],
-                        value=["hide"]  # Default: checked
-                    ),
-                ], style={"marginBottom": "10px"}),
-                html.Div([
-                    html.Label("Main table view:", style={"fontWeight": "bold", "marginRight": "10px"}),
-                    dcc.RadioItems(
-                        id="table-view-mode",
-                        options=[
-                            {"label": "Compact key columns (faster)", "value": "compact"},
-                            {"label": "Full table", "value": "full"},
-                        ],
-                        value="compact",
-                        inline=True,
-                    ),
-                ], style={"marginBottom": "10px"}),
-                html.Div([
-                    html.Label("Main table order:", style={"fontWeight": "bold", "marginRight": "10px"}),
-                    dcc.RadioItems(
-                        id="table-sort-mode",
-                        options=[
-                            {"label": "Newest signal first", "value": "newest"},
-                            {"label": "Original task order", "value": "original"},
-                        ],
-                        value="newest",
-                        inline=True,
-                    ),
-                    html.Span(" UI-only; JSON and calculations are unchanged.", style={"fontSize": "12px", "color": "#666", "marginLeft": "8px"}),
-                ], style={"marginBottom": "10px"}),
-            ], style={"marginBottom": "10px"}),
-                    html.Button("Create Tasks from Signals", id="create-signal-tasks-btn", n_clicks=0),
-                    html.Div([
-                        dcc.Checklist(
-                            id="autoclear-checkbox",
-                            options=[{"label": "🗑️ Auto-clear previous tasks before creating new", "value": "autoclear"}],
-                            value=["autoclear"],  # Checked by default
-                            style={"marginTop": "5px", "marginBottom": "5px"}
-                        )
-                    ]),
-                    html.Button("🗑️ Clear All Tasks Now", id="clear-all-tasks-btn", n_clicks=0, style={"backgroundColor": "#ffebee", "color": "#c62828", "marginLeft": "10px"}),
-                    # --- NEW: Save/Load Controls ---
-                # --- NEW: Save/Load Controls ---
-                html.Div([
-                    dcc.Input(id="save-filename-input", value="tasks_export", placeholder="Enter filename (e.g., my_tasks)",
-                              style={"marginRight": "10px", "width": "200px"}),
-                    html.Button("💾 Save Tasks", id="save-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
-                    dcc.Dropdown(id="json-file-select", options=[], placeholder="Select saved file to load...",
-                                 style={"width": "280px", "marginRight": "10px"}),
-                    html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
-                    html.Button("⚡ Recalc Table Flags", id="recalc-table-flags-btn", n_clicks=0, style={"marginRight": "10px"}),
-                ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "marginTop": "10px"}),
-                html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
-            html.Div(id="bulk-rerun-status", style={"marginBottom": "10px", "color": "#1565c0", "fontFamily": "monospace", "minHeight": "20px"}),
-            html.Div(id="recalc-status-bar", style={"marginBottom": "10px", "color": "#d84315", "fontFamily": "monospace", "minHeight": "20px", "fontWeight": "bold"}),
-            # ----- Impulse Parameters Panel (collapsible) -----
-            html.Details([
-                html.Summary("⚡ Impulse Parameters (click to expand)", style={"fontWeight": "bold", "cursor": "pointer", "marginTop": "20px"}),
-                html.Div([
-                    html.Label("Select completed task:"),
-                    dcc.Dropdown(id="impulse-task-selector", placeholder="Choose task", style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Div([
-                            html.Label("ATR multiplier (body):", style={"width": "200px", "display": "inline-block"}),
-                            dcc.Slider(id="impulse-range-mult", min=0.5, max=3.0, step=0.1, value=2.0, marks=None),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            html.Label("Volume multiplier:", style={"width": "200px", "display": "inline-block"}),
-                            dcc.Slider(id="impulse-vol-mult", min=1.0, max=3.0, step=0.1, value=1.5, marks=None),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            html.Label("Body/range ratio:", style={"width": "200px", "display": "inline-block"}),
-                            dcc.Slider(id="impulse-body-ratio", min=0.3, max=0.9, step=0.05, value=0.6, marks=None),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            html.Label("Wick/range ratio:", style={"width": "200px", "display": "inline-block"}),
-                            dcc.Slider(id="impulse-wick-ratio", min=0.3, max=0.8, step=0.05, value=0.5, marks=None),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            dcc.Checklist(id="impulse-next-confirm", options=[{"label": "Require next candle confirmation", "value": "confirm"}], value=["confirm"]),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            dcc.Checklist(id="impulse-rsi-divergence", options=[{"label": "Use RSI divergence", "value": "div"}], value=[]),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            html.Label("RSI extreme threshold:", style={"width": "200px", "display": "inline-block"}),
-                            dcc.Slider(id="impulse-rsi-extreme", min=60, max=90, step=5, value=80, marks=None),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            dcc.Checklist(id="impulse-base-candle", options=[{"label": "Require base candle before impulse", "value": "base"}], value=[]),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            dcc.Checklist(id="impulse-vol-accel", options=[{"label": "Require volume acceleration", "value": "accel"}], value=[]),
-                        ], style={"marginBottom": "10px"}),
-                        html.Div([
-                            dcc.Checklist(
-                                id="impulse-use-retracement",
-                                options=[{"label": "✨ Use retracement entry (wait for pullback – higher win rate)", "value": "retrace"}],
-                                value=["retrace"]
-                            ),
-                        ], style={"marginBottom": "10px"}),
-                        html.Button("Apply to Selected Task", id="apply-impulse-params", n_clicks=0),
-                        html.Button("Apply to All Completed Tasks", id="apply-impulse-all", n_clicks=0, style={"marginLeft": "10px"}),
-                        html.Button("Run Grid Search", id="run-grid-search", n_clicks=0, style={"margin": "5px"}),
-                        html.Button("Run Walk-Forward", id="run-walk-forward", n_clicks=0, style={"margin": "5px"}),
-                        html.Div(id="impulse-apply-status", style={"marginTop": "10px"}),
-                        html.Div(id="impulse-apply-all-status", style={"marginTop": "10px", "color": "blue"}),
-                        html.Hr(),
-                        html.H4("Impulse Backtest Results"),
-                        html.Div(id="impulse-results", style={"fontFamily": "monospace", "whiteSpace": "pre-wrap"}),
-                    ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px"})
-                ], style={"marginBottom": "20px"})
-            ]),
-            # ----- Dynamic Toward-Level Strategy Checkup (on-demand diagnostics) -----
-            html.Details([
-                html.Summary("🧪 Dynamic Toward-Level Checkup – variable SL / TP / trailing stop", style={"fontWeight": "bold", "cursor": "pointer"}),
-                html.Div([
-                    html.P(
-                        "Runs an on-demand diagnostic over raw candle data without changing saved task fields. "
-                        "Entry uses the first candle after signal time, buy toward resistance and sell toward support.",
-                        style={"marginTop": "10px", "color": "#555"}
-                    ),
-                    html.Details([
-                        html.Summary("ⓘ How to use SL grid, BE grid, TP levels, and dynamic stop rules", style={"cursor": "pointer", "color": "#0b63b6", "fontWeight": "bold"}),
-                        html.Div([
-                            html.P("Think of the controls as separate layers:", style={"marginBottom": "6px"}),
-                            html.Ul([
-                                html.Li("Initial stop loss % = where the first protective stop starts from entry; Initial stop events count trades closed by that stop before another exit type."),
-                                html.Li("SL grid % = extra initial-stop values to test side by side, for example 0.12 / 0.25 / 0.5."),
-                                html.Li("Take profit levels % = favorable-move checkpoints to count, such as 0.5 / 1 / 2 / 4."),
-                                html.Li("Dynamic stop rules = not take-profit orders; they move the stop after price moves in your favor."),
-                                html.Li("BE arm grid % = quick tests for moving the stop to entry after +0.25%, +0.5%, +1%, etc."),
-                                html.Li("Max adverse DD grid % = optional adverse-move caps from entry tested side by side."),
-                                html.Li("Net expectancy uses the simulated exit return minus your round-trip costs for every trade."),
-                                html.Li("Money estimate multiplies each net return by your notional per trade, for example 1000 USD."),
-                            ], style={"marginTop": 0}),
-                            html.P("Dynamic stop rule format: trigger%:move-stop-to-profit%.", style={"fontWeight": "bold", "marginBottom": "4px"}),
-                            html.Ul([
-                                html.Li("0.5:0 means: after price moves +0.5% in your favor, move stop to breakeven / entry."),
-                                html.Li("1:0.3 means: after price moves +1%, move stop to lock about +0.3% profit."),
-                                html.Li("2:1.5 means: after price moves +2%, move stop to lock about +1.5% profit."),
-                                html.Li("4:3 means: after price moves +4%, move stop to lock about +3% profit."),
-                            ], style={"marginTop": 0}),
-                            html.P(
-                                "The dynamic summary table shows the selected scenario plus grid rows: SL grid scenarios, BE-after rows, "
-                                "max adverse DD cap rows, TP hit rows, stop events, stop-after-TP, and dynamic-stop-moved counts.",
-                                style={"marginBottom": 0}
-                            ),
-                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#eef7ff", "border": "1px solid #cfe8ff", "borderRadius": "4px", "margin": "8px 0"})
-                    ], open=False),
-                    html.Div([
-                        html.Label("Initial stop loss %:", style={"width": "180px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Loss distance from the simulated entry. Example: 0.12 means close if price moves 0.12% against the entry before a tighter dynamic stop is active.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-sl-input", type="number", value=0.12, min=0, step=0.01, style={"width": "90px"}),
-                        html.Label("Max adverse DD from entry % (positive):", style={"width": "210px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Optional adverse-move cap measured from entry, always entered as a positive percent. It is an exit reason only if this cap is hit before the normal stop/trailing stop.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Take profit levels %:", style={"width": "180px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Favorable move checkpoints from entry. Example: 0.5, 1, 2, 4 counts candles that move at least those percentages in the trade direction.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
-                        html.Span("Example: 0.5, 1, 2, 4", style={"marginLeft": "10px", "color": "#777"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Dynamic stop rules:", style={"width": "180px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Comma-separated trigger:stop-profit pairs. Example 0.5:0 means: after price moves +0.5% in your favor, move the stop to breakeven. 1:0.3 means after +1%, lock +0.3% profit.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
-                        html.Span("trigger%:move-stop-to-profit% pairs", style={"marginLeft": "10px", "color": "#777"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("SL grid %:", style={"width": "180px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Extra stop-loss values to test side-by-side in the summary. They reuse the same raw candle paths for faster comparison.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-sl-grid-input", type="text", value="0.12, 0.15, 0.25, 0.35, 0.5", style={"width": "260px"}),
-                        html.Label("BE arm grid %:", style={"width": "130px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Breakeven-arm tests add a rule that moves stop to entry after this favorable move. Example 0.5 tests BE after +0.5%.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-be-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Max adverse DD grid %:", style={"width": "180px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Extra adverse drawdown caps from entry to test side-by-side. A cap only counts when it becomes the actual exit before another stop.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-dd-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
-                        html.Span("Grid rows reuse raw candle paths built once per task for faster comparison.", style={"marginLeft": "10px", "color": "#777"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Notional per trade USD:", style={"width": "180px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Diagnostic position size used only for estimated P/L. Example: 1000 means each simulated trade is counted as a 1000 USD notional trade.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
-                        html.Label("Round-trip costs %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Estimated total entry+exit cost as percent of notional, including fees, spread, slippage, and funding if applicable. It is subtracted from every simulated trade.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
-                        html.Label("Open/no-exit return %:", style={"width": "165px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Fallback return for diagnostic paths that never hit SL, DD cap, or moved stop. Use 0 for conservative flat close, or another value if you have a forced end-of-window exit rule.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="dynamic-check-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Button("Run Dynamic Checkup", id="dynamic-check-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
-                    dcc.Loading(
-                        type="circle",
-                        children=[
-                            html.Div(id="dynamic-check-status", style={"marginTop": "10px", "fontWeight": "bold"}),
-                            html.Div(
-                                id="dynamic-check-results",
-                                style={
-                                    "marginTop": "10px",
-                                    "maxHeight": "420px",
-                                    "overflowY": "auto",
-                                    "border": "1px solid #ddd",
-                                    "borderRadius": "4px",
-                                    "padding": "8px",
-                                    "backgroundColor": "#fff",
-                                }
-                            ),
-                        ],
-                    ),
-                ], style={"padding": "10px", "backgroundColor": "#f7fbff", "borderRadius": "5px", "border": "1px solid #cfe8ff"})
-            ], open=False, style={"marginBottom": "20px"}),
-            # ----- Level-Reversal Strategy Checkup (on-demand diagnostics) -----
-            html.Details([
-                html.Summary("🧪 Level-Reversal Checkup – enter after signal level touch/overshoot", style={"fontWeight": "bold", "cursor": "pointer"}),
-                html.Div([
-                    html.P(
-                        "Tests the opposite idea: wait until price reaches the signal level (or overshoots it by a chosen percent), "
-                        "then enter the reversal direction. Resistance becomes SELL; support becomes BUY. This is read-only and does not change saved task fields.",
-                        style={"marginTop": "10px", "color": "#555"}
-                    ),
-                    html.Details([
-                        html.Summary("ⓘ How the level-reversal checkup works", style={"cursor": "pointer", "color": "#9a5a00", "fontWeight": "bold"}),
-                        html.Div([
-                            html.P("This box tests a different entry idea from the first dynamic box:", style={"marginBottom": "6px"}),
-                            html.Ul([
-                                html.Li("Resistance signal: wait for price to touch/overshoot the resistance level, then simulate a SELL reversal."),
-                                html.Li("Support signal: wait for price to touch/overshoot the support level, then simulate a BUY reversal."),
-                                html.Li("Entry offset beyond level % = 0 means enter at the level; 0.25 waits for 0.25% overshoot beyond the level."),
-                                html.Li("SL, TP levels, max adverse DD, and dynamic stop rules work the same way as the main dynamic checkup, but from this reversal entry."),
-                                html.Li("Initial stop events count reversal entries that were closed by the initial or moved stop; they do not mean the task is bad/corrupted."),
-                                html.Li("The summary is intentionally unified: it treats support/resistance as one concept — move toward the level, reject, then go back — instead of showing separate BUY/SELL cases."),
-                                html.Li("Entry offset grid % tests how many tasks still trigger if you require extra overshoot before reversal entry."),
-                                html.Li("Net expectancy and USD P/L rows use the same simulated exits, costs, and notional as the first dynamic box."),
-                            ], style={"marginTop": 0}),
-                            html.P("Examples:", style={"fontWeight": "bold", "marginBottom": "4px"}),
-                            html.Ul([
-                                html.Li("Offset 0%: enter reversal as soon as the signal level is touched."),
-                                html.Li("Offset 0.25% on resistance: wait until high reaches resistance +0.25%, then test SELL reversal."),
-                                html.Li("Offset 0.25% on support: wait until low reaches support -0.25%, then test BUY reversal."),
-                                html.Li("Dynamic stop rule 1:0.3 still means: after +1% favorable reversal move, move stop to lock +0.3%."),
-                            ], style={"marginTop": 0}),
-                            html.P(
-                                "The level-reversal summary table shows triggered entries, not-triggered entries, TP hit rows, SL events, "
-                                "adverse-DD events, stop-after-TP, dynamic-stop-moved rows, SL grid rows, and entry-offset grid rows as one unified level-rejection strategy.",
-                                style={"marginBottom": 0}
-                            ),
-                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#fff4de", "border": "1px solid #f4d19b", "borderRadius": "4px", "margin": "8px 0"})
-                    ], open=False),
-                    html.Div([
-                        html.Label("Entry offset beyond level %:", style={"width": "210px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="0 means enter at the signal level. 0.2 means wait for 0.2% beyond resistance/support before entering the reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="level-reversal-offset-input", type="number", value=0, min=0, step=0.05, style={"width": "90px"}),
-                        html.Label("Initial stop loss %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Loss distance from reversal entry. Resistance reversal is SELL, support reversal is BUY.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="level-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
-                        html.Label("Max adverse DD %:", style={"width": "140px", "display": "inline-block", "marginLeft": "20px"}),
-                        dcc.Input(id="level-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Take profit levels %:", style={"width": "210px", "display": "inline-block"}),
-                        dcc.Input(id="level-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "240px"}),
-                        html.Label("Dynamic stop rules:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        dcc.Input(id="level-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("SL grid %:", style={"width": "210px", "display": "inline-block"}),
-                        dcc.Input(id="level-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "260px"}),
-                        html.Label("Entry offset grid %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        dcc.Input(id="level-reversal-offset-grid-input", type="text", value="0, 0.1, 0.25, 0.5", style={"width": "220px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Notional per trade USD:", style={"width": "210px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Diagnostic position size used only for estimated P/L. Example: 1000 means each triggered reversal entry is counted as a 1000 USD notional trade.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="level-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
-                        html.Label("Round-trip costs %:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Estimated total entry+exit cost as percent of notional, including fees, spread, slippage, and funding if applicable. It is subtracted from every triggered reversal trade.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="level-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
-                        html.Label("Open/no-exit return %:", style={"width": "165px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Fallback return for diagnostic paths that never hit SL, DD cap, or moved stop. Use 0 for conservative flat close unless you define a forced end-of-window exit rule.", style={"cursor": "help", "color": "#0b63b6"}),
-                        dcc.Input(id="level-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Button("Run Level-Reversal Checkup", id="level-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
-                    dcc.Loading(
-                        type="circle",
-                        children=[
-                            html.Div(id="level-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}),
-                            html.Div(
-                                id="level-reversal-results",
-                                style={
-                                    "marginTop": "10px",
-                                    "maxHeight": "420px",
-                                    "overflowY": "auto",
-                                    "border": "1px solid #ddd",
-                                    "borderRadius": "4px",
-                                    "padding": "8px",
-                                    "backgroundColor": "#fff",
-                                }
-                            ),
-                        ],
-                    ),
-                ], style={"padding": "10px", "backgroundColor": "#fffaf2", "borderRadius": "5px", "border": "1px solid #f4d19b"})
-            ], open=False, style={"marginBottom": "20px"}),
-            # ----- Oscillator-confirmed Level-Reversal Checkup -----
-            html.Details([
-                html.Summary("🧪 Oscillator Level-Reversal Checkup – level cross + Stoch/RSI trigger", style={"fontWeight": "bold", "cursor": "pointer"}),
-                html.Div([
-                    html.P(
-                        "Waits for price to cross the signal level in the toward direction, then selects the UP-toward or DOWN-toward oscillator group. "
-                        "When all enabled Stoch/RSI conditions in that group match, it enters the reverse side and runs the same SL/TP/DD/trailing-stop simulation.",
-                        style={"marginTop": "10px", "color": "#555"}
-                    ),
-                    html.Details([
-                        html.Summary("ⓘ Logic and examples", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
-                        html.Div([
-                            html.Ul([
-                                html.Li("Resistance means the toward move is UP to resistance; the UP-toward group is used and the test enters SELL after confirmation."),
-                                html.Li("Support means the toward move is DOWN to support; the DOWN-toward group is used and the test enters BUY after confirmation."),
-                                html.Li("Use the UP-toward group for upper-limit logic, e.g. Stoch crossing down from 87 after price reaches resistance."),
-                                html.Li("Use the DOWN-toward group for lower-limit logic, e.g. Stoch crossing up from 13 after price reaches support."),
-                                html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10, K 300/1/10."),
-                                html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
-                                html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
-                                html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
-                                html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
-                                html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
-                                html.Li("The optional stochastic close section reports whether the trade closed by the four stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
-                                html.Li("Condition windows broaden multi-oscillator checks: a window of 1 requires all enabled conditions on the same candle; a window of 3 allows each condition to occur within the current candle or previous 2 candles."),
-                                html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
-                            ], style={"marginTop": 0}),
-                        ], style={"fontSize": "13px", "lineHeight": "1.4", "padding": "8px", "backgroundColor": "#f3e5f5", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
-                    ], open=False),
-                    html.Div([
-                        html.H5("UP-toward oscillator group (resistance → reverse SELL)", style={"margin": "8px 0", "color": "#6a1b9a"}),
-                        html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
-                        dcc.Input(id="osc-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
-                        dcc.Input(id="osc-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
-                        dcc.Input(id="osc-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
-                        dcc.Input(id="osc-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
-                        dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                    ], style={"marginBottom": "12px"}),
-                    html.Div([
-                        html.H5("DOWN-toward oscillator group (support → reverse BUY)", style={"margin": "8px 0", "color": "#1565c0"}),
-                        html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
-                        dcc.Input(id="osc-down-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-down-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
-                        dcc.Input(id="osc-down-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-down-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
-                        dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
-                        dcc.Input(id="osc-down-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-down-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
-                        dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
-                        dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Initial SL %:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
-                        html.Label("Max DD %:", style={"width": "85px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-max-dd-input", type="number", value=None, min=0, step=0.1, placeholder="optional", style={"width": "110px"}),
-                        html.Label("TP levels %:", style={"width": "95px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-tp-levels-input", type="text", value="0.5, 1, 2, 4", style={"width": "220px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Stop rules:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-trail-rules-input", type="text", value="0.5:0, 1:0.5, 2:1, 4:2", style={"width": "320px"}),
-                        html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-sl-grid-input", type="text", value="0.25, 0.5, 0.75, 1", style={"width": "220px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Entry condition window:", style={"width": "150px", "display": "inline-block"}),
-                        html.Span(" ⓘ", title="Number of candles where oscillator entry conditions may line up. 1 means all enabled conditions must be true on the same candle. 3 means each enabled condition may have occurred within the current candle or previous 2 candles.", style={"cursor": "help", "color": "#4a148c"}),
-                        dcc.Input(id="osc-entry-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
-                        html.Label("Close condition window:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60/300 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
-                        dcc.Input(id="osc-exit-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
-                        html.Span("1 = same candle; 3 = current + previous 2 candles", style={"marginLeft": "10px", "color": "#777"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Details([
-                        html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
-                        html.Div([
-                            html.P("When enabled, the simulated position waits for these four stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
-                            html.Div([
-                                dcc.Checklist(id="osc-exit-enabled-input", options=[{"label": "Enable stochastic close", "value": "enabled"}], value=[], style={"display": "inline-block", "marginRight": "20px"}),
-                            ], style={"marginBottom": "8px"}),
-                            html.Div([
-                                html.H5("Close SELL positions (resistance entries)", style={"margin": "8px 0", "color": "#6a1b9a"}),
-                                html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
-                                dcc.Input(id="osc-exit-sell-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-sell-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                                html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
-                                dcc.Input(id="osc-exit-sell-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-sell-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                            ], style={"marginBottom": "8px"}),
-                            html.Div([
-                                html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
-                                dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                                html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
-                                dcc.Input(id="osc-exit-sell-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-sell-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                            ], style={"marginBottom": "10px"}),
-                            html.Div([
-                                html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
-                                html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
-                                dcc.Input(id="osc-exit-buy-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-buy-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                                html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
-                                dcc.Input(id="osc-exit-buy-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-buy-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                            ], style={"marginBottom": "8px"}),
-                            html.Div([
-                                html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
-                                dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                                html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
-                                dcc.Input(id="osc-exit-buy-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                                dcc.Dropdown(id="osc-exit-buy-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                            ], style={"marginBottom": "4px"}),
-                        ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
-                    ], open=False, style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Notional USD:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
-                        html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
-                        html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
-                    ], style={"marginBottom": "10px"}),
-                    html.Div([
-                        html.Label("Settings name:", style={"width": "100px", "display": "inline-block"}),
-                        dcc.Input(id="osc-settings-name-input", type="text", placeholder="my stochastic setup", style={"width": "220px"}),
-                        html.Button("Save Settings", id="osc-settings-save-btn", n_clicks=0, style={"marginLeft": "8px"}),
-                        html.Label("Open:", style={"marginLeft": "16px", "marginRight": "6px"}),
-                        dcc.Dropdown(id="osc-settings-open-dropdown", options=strategy_setting_options(), value=None, placeholder="choose saved settings", clearable=False, style={"width": "260px", "display": "inline-block", "verticalAlign": "middle"}),
-                        html.Button("Open Settings", id="osc-settings-open-btn", n_clicks=0, style={"marginLeft": "8px"}),
-                        html.Div(id="osc-settings-status", style={"marginTop": "6px", "color": "#4a148c", "fontWeight": "bold"}),
-                    ], style={"marginBottom": "10px", "padding": "8px", "backgroundColor": "#f1e8ff", "border": "1px solid #ce93d8", "borderRadius": "4px"}),
-                    html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
-                    dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
-                    html.Details([
-                        html.Summary("🔎 Research optimizer – compare oscillator/SL/stop combinations", style={"fontWeight": "bold", "cursor": "pointer", "color": "#4a148c", "marginTop": "14px"}),
-                        html.Div([
-                            html.P("Research mode runs multiple what-if combinations over historical candles and ranks them by net expectancy. It is for discovery/optimization, not a no-lookahead trading signal. After finding a candidate, validate it on a separate date range.", style={"color": "#555", "margin": "6px 0"}),
-                            html.Details([html.Summary("ⓘ How research optimizer works", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}), html.Ul([
-                                html.Li("It reuses the oscillator settings above as the base condition set."),
-                                html.Li("Condition variants test Base, Relaxed, and Strict levels. Relaxed makes high-threshold groups easier and low-threshold groups easier; Strict does the opposite."),
-                                html.Li("Window grids test whether conditions should align on the same candle or within several candles."),
-                                html.Li("SL grid and stop-rule presets test risk management combinations side by side."),
-                                html.Li("The ranked table includes entries, win-rate %, stop exits, stochastic exits, TP checkpoint success %, profit buckets, net expectancy, profit factor, and a plain-language advice column."),
-                                html.Li("It does not magically know future live reversals; it researches historical candles to find which settings would have captured reversals with lower adverse movement and better net results."),
-                            ], style={"fontSize": "13px", "lineHeight": "1.4"})], open=False),
-                            html.Div([
-                                html.Label("Entry windows:", style={"width": "110px", "display": "inline-block"}), dcc.Input(id="osc-research-entry-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
-                                html.Label("Close windows:", style={"width": "110px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-exit-windows-input", type="text", value="1, 3, 5", style={"width": "140px"}),
-                                html.Label("SL grid %:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-sl-grid-input", type="text", value="1, 1.5, 2, 2.5, 3", style={"width": "180px"}),
-                            ], style={"marginBottom": "8px"}),
-                            html.Div([
-                                html.Label("Stop-rule presets:", style={"width": "120px", "display": "inline-block"}),
-                                dcc.Textarea(id="osc-research-stop-presets-input", value="1:0.35, 1.5:0.75, 2:1, 3:2, 4:3 | 0.7:0.25, 1:0.5, 2:1, 3:2, 4:3 | 1:0.5, 2:1, 3:2, 4:3", style={"width": "640px", "height": "44px", "verticalAlign": "middle"}),
-                                html.Span("Separate presets with |", style={"marginLeft": "8px", "color": "#777"}),
-                            ], style={"marginBottom": "8px"}),
-                            html.Div([
-                                html.Label("Max combinations:", style={"width": "120px", "display": "inline-block"}), dcc.Input(id="osc-research-max-combos-input", type="number", value=120, min=1, max=500, step=1, style={"width": "90px"}),
-                                html.Label("Top rows:", style={"width": "80px", "display": "inline-block", "marginLeft": "15px"}), dcc.Input(id="osc-research-top-input", type="number", value=20, min=5, max=100, step=1, style={"width": "80px"}),
-                                html.Button("Run Research Optimizer", id="osc-research-run-btn", n_clicks=0, style={"fontWeight": "bold", "marginLeft": "15px"}),
-                            ], style={"marginBottom": "8px"}),
-                            dcc.Loading(type="circle", children=[html.Div(id="osc-research-status", style={"marginTop": "8px", "fontWeight": "bold"}), html.Div(id="osc-research-results", style={"marginTop": "10px", "maxHeight": "520px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
-                        ], style={"padding": "8px", "backgroundColor": "#f6edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "marginTop": "8px"}),
-                    ], open=False),
-                ], style={"padding": "10px", "backgroundColor": "#fbf3ff", "borderRadius": "5px", "border": "1px solid #ce93d8"})
-            ], open=False, style={"marginBottom": "20px"}),
-            # ----- Strategy Info Panel (collapsible) – Professional version -----
-            html.Details([
-                html.Summary("📊 Professional Strategy Framework – Multi‑Month Levels", style={"fontWeight": "bold", "cursor": "pointer"}),
-                html.Div([
-                    html.P("This strategy integrates best practices from professional traders to trade multi‑month resistance/support levels with high probability.", style={"marginTop": "10px"}),
-                    html.H5("🎯 Entry Confirmation (Configurable)", style={"marginTop": "15px"}),
-                    html.Ul([
-                        html.Li("✅ Close confirmation – required by default (candle must close beyond the level)."),
-                        html.Li("📈 Volume spike – volume > 1.5x 20‑period average."),
-                        html.Li("🔄 Second touch – price touches level, moves away ≥0.5 ATR, then returns (optional)."),
-                        html.Li("📉 RSI divergence – regular/hidden divergence (detected automatically)."),
-                        html.Li("📊 OBV divergence – On‑Balance Volume divergence (optional)."),
-                        html.Li("💪 Elder's Force Index – strong directional force (optional)."),
-                        html.Li("📉 RSI extreme – overbought (>60) for resistance, oversold (<40) for support (optional)."),
-                        html.Li("📉 Moving average slope – trend alignment (optional)."),
-                        html.Li("🎲 Bollinger Band touch – price at outer band (optional)."),
-                        html.Li("📐 Candlestick patterns – engulfing, pin bar, shooting star, hammer, inside bar."),
-                        html.Li("🎯 Zone tolerance – price within ±0.3× ATR of the level (reduces noise)."),
-                    ]),
-                    html.H5("🚪 Exit & Risk Management", style={"marginTop": "15px"}),
-                    html.Ul([
-                        html.Li("Initial take profit: 1.5× ATR."),
-                        html.Li("Initial stop loss: 0.75× ATR (bounce/retest) or fixed (momentum)."),
-                        html.Li("Trailing stop: after reaching target, stop trails at 1× ATR."),
-                        html.Li("Time stop: close after max 30 candles if no target/stop hit."),
-                        html.Li("Forward simulation – no look‑ahead bias."),
-                    ]),
-                    html.H5("📊 Parameters (can be adjusted)", style={"marginTop": "15px"}),
-                    html.Ul([
-                        html.Li("volume_mult = 1.5"),
-                        html.Li("atr_period = 14"),
-                        html.Li("stop_loss_atr_mult = 0.75"),
-                        html.Li("max_holding_bars = 30"),
-                        html.Li("trail_atr = 1.0"),
-                        html.Li("zone_atr_mult = 0.3"),
-                        html.Li("use_close_confirmation = True (always on)"),
-                        html.Li("use_second_touch = False (recommend enabling)"),
-                        html.Li("use_obv_divergence = False"),
-                        html.Li("use_force_index = False"),
-                        html.Li("use_rsi_extreme = False"),
-                        html.Li("use_ma_slope = False"),
-                        html.Li("use_bollinger_bands = False"),
-                    ]),
-                    html.P("💡 **Tip:** Enable second touch, OBV divergence, and RSI extreme for higher‑probability but fewer signals. Disable them for more aggressive trading.", style={"marginTop": "10px", "fontStyle": "italic"}),
-                    html.P("📈 Chart markers: 🟢 Green ▲ = Buy signal, 🔴 Red ▼ = Sell signal. White dashed lines = signal level and time.", style={"fontSize": "small"}),
-                ], style={"padding": "10px", "backgroundColor": "#f9f9f9", "borderRadius": "5px", "marginTop": "10px", "maxHeight": "400px", "overflowY": "auto"})
-            ], style={"marginBottom": "20px"}),
-            html.Hr(),
-            # Hidden target keeps the dedicated summary-stat cache callback active;
-            # visible summaries remain embedded in the task table below.
-            html.Div(id="summary-stats-container", style={"display": "none"}),
-            html.Div(id="task-table-container", style={"width": "100%"}),
-        ])
+        return build_tasks_tab_layout()
     else:
         # Data Analysis tab - now imported from database module
         return create_data_analysis_tab()
