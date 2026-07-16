@@ -41,6 +41,7 @@ from database import (
     INTERVAL_MS,
     DUCKDB_AVAILABLE,
     em,
+    validate_stored_candle_range,
 )
 
 # =============================================================================
@@ -11027,7 +11028,7 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                     f"[{index}/{total}] Downloading verified missing history for "
                     f"{task.symbols[0]} {task.timeframe} (up to {missing_minutes} minutes)..."
                 )
-                em._extend_left(
+                em.extend_left_safely(
                     task.symbols[0], str(task.timeframe), missing_minutes,
                     progress_base=(index - 1) / total * 90,
                     progress_span=90 / total,
@@ -11052,6 +11053,13 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
             if not available:
                 raise RuntimeError(f"{str(task.task_id)[:8]} final verification failed: {detail}")
             starts[str(task.task_id)] = int(detail)
+            deep_valid, deep_detail = validate_stored_candle_range(
+                task.symbols[0], str(task.timeframe), detail, task.signal_time
+            )
+            if not deep_valid:
+                raise RuntimeError(
+                    f"{str(task.task_id)[:8]} final OHLCV verification failed: {deep_detail}"
+                )
 
         with tm.lock:
             for task in tasks:

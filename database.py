@@ -566,6 +566,41 @@ def _contiguous_period_bounds(existing, interval_ms, anchor_start=None):
     return selected, previous_end, next_start
 
 
+def validate_stored_candle_range(symbol, timeframe, start_ms, end_ms):
+    """Deeply validate one inclusive stored range without modifying the file."""
+    try:
+        interval_ms = INTERVAL_MS.get(str(timeframe))
+        if interval_ms is None:
+            return False, f"unsupported timeframe {timeframe}"
+        file_path = os.path.join(
+            _symbol_timeframe_path(MARKET_DATA_DIR, symbol, timeframe), "data.parquet"
+        )
+        if not os.path.exists(file_path):
+            return False, f"data.parquet not found for {symbol} {timeframe}"
+        first_candle = ((int(start_ms) + interval_ms - 1) // interval_ms) * interval_ms
+        last_candle = (int(end_ms) // interval_ms) * interval_ms
+        frame = pd.read_parquet(
+            file_path,
+            filters=[("timestamp", ">=", first_candle), ("timestamp", "<=", last_candle)],
+        ).sort_values("timestamp").reset_index(drop=True)
+        issues = _validate_ohlcv_frame(frame)
+        if issues:
+            return False, "; ".join(issues)
+        numeric_ts = pd.to_numeric(frame["timestamp"], errors="coerce").astype("int64")
+        expected = max(0, ((last_candle - first_candle) // interval_ms) + 1)
+        if len(numeric_ts) != expected:
+            return False, f"needs {expected} candles but found {len(numeric_ts)}"
+        if expected and (
+            int(numeric_ts.iloc[0]) != first_candle or
+            int(numeric_ts.iloc[-1]) != last_candle or
+            (len(numeric_ts) > 1 and not (numeric_ts.diff().iloc[1:] == interval_ms).all())
+        ):
+            return False, "timestamps are not a complete aligned sequence"
+        return True, f"validated {len(frame)} candles"
+    except Exception as exc:
+        return False, f"range validation failed: {exc}"
+
+
 class ExtensionManager:
     """Safely extends existing Parquet periods to the left without replacing old candles."""
 
@@ -594,6 +629,13 @@ class ExtensionManager:
     def get_state(self):
         with self.lock:
             return self.running, self.progress, self.status, "\n".join(self.log[-200:])
+
+    def extend_left_safely(self, symbol, timeframe, minutes, period_start=None,
+                           progress_base=0, progress_span=100):
+        """Use the canonical validated/backup/atomic left-extension pipeline."""
+        return self._extend_left(
+            symbol, timeframe, minutes, progress_base, progress_span, period_start
+        )
 
     def start(self, symbol, timeframe, minutes, period_start=None):
         if self.running:
