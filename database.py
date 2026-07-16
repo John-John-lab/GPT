@@ -437,6 +437,11 @@ def _validate_ohlcv_frame(df):
         issues.append("null timestamps")
     if df["timestamp"].duplicated().any():
         issues.append("duplicate timestamps")
+    numeric_columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    numeric = df[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    if numeric.isna().any().any() or not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        issues.append("null, non-numeric, or non-finite OHLCV values")
+        return issues
     invalid = df[
         (df["high"] < df["low"]) |
         (df["high"] < df["open"]) |
@@ -503,6 +508,10 @@ class ExtensionManager:
             if status is not None:
                 self.status = status
                 self.log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {status}")
+                # Long 1-minute history jobs can contain thousands of API
+                # batches. Keep monitoring useful without unbounded RAM use.
+                if len(self.log) > 1000:
+                    self.log = self.log[-1000:]
             if progress is not None:
                 self.progress = float(progress)
 
@@ -528,6 +537,72 @@ class ExtensionManager:
         self.thread.start()
         return True, f"▶️ Started safe extension for {symbol} {timeframe} by {minutes} minutes."
 
+    def start_all(self, periods, minutes=None, through_now=False):
+        """Start one serial job for every discovered period.
+
+        Serial processing deliberately limits API pressure, memory use and disk
+        writes.  ``minutes=None`` means continue left until Bybit has no older
+        candles; ``through_now`` additionally fills the right side to the time
+        at which the button was pressed.
+        """
+        if self.running:
+            return False, "⚠️ Another extension is already running. Please wait."
+        unique_periods = sorted({(str(symbol), str(timeframe)) for symbol, timeframe in periods})
+        if not unique_periods:
+            return False, "⚠️ No downloaded periods were found. Existing data was not changed."
+        if minutes is not None:
+            try:
+                minutes = int(minutes)
+            except Exception:
+                return False, "❌ Enter a whole number of minutes for all periods."
+            if minutes <= 0:
+                return False, "❌ Minutes must be greater than zero."
+        self.running = True
+        with self.lock:
+            self.progress = 0.0
+            self.status = "Starting safe batch operation..."
+            self.log = []
+        pressed_at_ms = int(time.time() * 1000)
+        self.thread = threading.Thread(
+            target=self._run_all,
+            args=(unique_periods, minutes, through_now, pressed_at_ms),
+            daemon=True,
+        )
+        self.thread.start()
+        action = "complete history" if through_now else ("earliest available candle" if minutes is None else f"{minutes} minutes left")
+        return True, f"▶️ Started {action} for {len(unique_periods)} downloaded periods."
+
+    def _run_all(self, periods, minutes, through_now, pressed_at_ms):
+        failures = []
+        try:
+            total = len(periods)
+            for index, (symbol, timeframe) in enumerate(periods, 1):
+                base = (index - 1) / total * 100
+                span = 100 / total
+                self._set_state(f"[{index}/{total}] Processing {symbol} {timeframe}...", base)
+                try:
+                    self._extend_left(symbol, timeframe, minutes, base, span * (0.5 if through_now else 1.0))
+                    if through_now:
+                        self._extend_right(symbol, timeframe, pressed_at_ms, base + span * 0.5, span * 0.5)
+                except Exception as exc:
+                    failures.append(f"{symbol} {timeframe}: {exc}")
+                    self._set_state(
+                        f"⚠️ [{index}/{total}] {symbol} {timeframe} was left unchanged: {exc}",
+                        base + span,
+                    )
+            if failures:
+                self._set_state(
+                    f"⚠️ Batch finished: {total - len(failures)}/{total} periods completed; "
+                    f"{len(failures)} unavailable or failed. Existing files were kept.",
+                    100,
+                )
+            else:
+                self._set_state(f"✅ Batch completed safely for all {total} periods.", 100)
+        except Exception as exc:
+            self._set_state(f"❌ Batch stopped: {exc}", self.progress)
+        finally:
+            self.running = False
+
     def _run(self, symbol, timeframe, minutes):
         try:
             self._extend_left(symbol, timeframe, minutes)
@@ -537,8 +612,10 @@ class ExtensionManager:
         finally:
             self.running = False
 
-    def _extend_left(self, symbol, timeframe, minutes):
-        interval_ms = self.interval_ms.get(str(timeframe), 60000)
+    def _extend_left(self, symbol, timeframe, minutes, progress_base=0, progress_span=100):
+        interval_ms = self.interval_ms.get(str(timeframe))
+        if interval_ms is None:
+            raise RuntimeError(f"unsupported timeframe {timeframe}")
         path = _symbol_timeframe_path(self.market_data_dir, symbol, timeframe)
         file_path = os.path.join(path, "data.parquet")
         if not os.path.exists(file_path):
@@ -551,10 +628,13 @@ class ExtensionManager:
             raise RuntimeError("existing file failed safety validation: " + "; ".join(issues))
         existing = existing.sort_values("timestamp").reset_index(drop=True)
         existing_start = _safe_int_timestamp(existing["timestamp"].min())
-        target_start = max(0, existing_start - int(minutes) * 60_000)
+        target_start = 0 if minutes is None else max(0, existing_start - int(minutes) * 60_000)
         target_end = existing_start - interval_ms
         if target_start > target_end:
-            self._set_state("Requested extension is shorter than one candle; nothing to download.", 100)
+            self._set_state(
+                "Requested extension is shorter than one candle; nothing to download.",
+                progress_base + progress_span,
+            )
             return
 
         expected = max(1, ((target_end - target_start) // interval_ms) + 1)
@@ -581,49 +661,139 @@ class ExtensionManager:
             batches.append(df)
             downloaded += len(df)
             oldest = int(df["timestamp"].min())
+            if oldest > cur_end:
+                raise RuntimeError("Bybit response did not move toward older candles")
             cur_end = oldest - interval_ms
             self._set_state(
                 f"Downloaded {downloaded} raw candles; checking for overlaps and gaps...",
-                min(90, 5 + downloaded / expected * 80),
+                progress_base + min(progress_span * 0.9, downloaded / expected * progress_span * 0.8),
             )
 
         if not batches:
-            self._set_state("No earlier candles returned by Bybit; existing file was not changed.", 100)
+            self._set_state(
+                "No earlier candles returned by Bybit; existing file was not changed.",
+                progress_base + progress_span,
+            )
             return
 
         new_data = pd.concat(batches, ignore_index=True).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
         new_data = new_data[new_data["timestamp"] < existing_start]
         if new_data.empty:
-            self._set_state("Downloaded data overlapped existing period only; existing file was not changed.", 100)
+            self._set_state(
+                "Downloaded data overlapped existing period only; existing file was not changed.",
+                progress_base + progress_span,
+            )
             return
 
         overlap = set(new_data["timestamp"].astype(int)).intersection(set(existing["timestamp"].astype(int)))
         if overlap:
             raise RuntimeError(f"overlap safety check failed for {len(overlap)} timestamps")
 
-        self._set_state("Merging with existing data using existing rows as immutable source of truth...", 92)
-        combined = pd.concat([new_data, existing], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
-        combined = combined.drop_duplicates("timestamp", keep="last")
-        combined_issues = _validate_ohlcv_frame(combined)
-        if combined_issues:
-            raise RuntimeError("combined file failed safety validation: " + "; ".join(combined_issues))
+        self._set_state(
+            "Merging with existing data using existing rows as immutable source of truth...",
+            progress_base + progress_span * 0.92,
+        )
+        self._set_state(
+            "Writing atomically with backup; original file remains until final replace...",
+            progress_base + progress_span * 0.96,
+        )
+        backup_path = self._write_preserving_existing(
+            file_path, existing, new_data, symbol, timeframe
+        )
+        self._set_state(
+            f"Saved {len(new_data)} new candles. Backup kept at {backup_path}.",
+            progress_base + progress_span,
+        )
 
-        preserved = combined[combined["timestamp"].isin(existing["timestamp"])]
-        if len(preserved) != len(existing):
-            raise RuntimeError("preservation check failed: existing timestamp count changed")
+    def _extend_right(self, symbol, timeframe, pressed_at_ms, progress_base=0, progress_span=100):
+        """Append only closed candles after an existing period, preserving every old row."""
+        interval_ms = self.interval_ms.get(str(timeframe))
+        if interval_ms is None:
+            raise RuntimeError(f"unsupported timeframe {timeframe}")
+        file_path = os.path.join(
+            _symbol_timeframe_path(self.market_data_dir, symbol, timeframe), "data.parquet"
+        )
+        existing = pd.read_parquet(file_path).sort_values("timestamp").reset_index(drop=True)
+        issues = _validate_ohlcv_frame(existing)
+        if issues:
+            raise RuntimeError("existing file failed safety validation: " + "; ".join(issues))
+        existing_end = _safe_int_timestamp(existing["timestamp"].max())
+        # Never persist an in-progress candle.
+        target_end = (int(pressed_at_ms) // interval_ms) * interval_ms - interval_ms
+        cursor = existing_end + interval_ms
+        if cursor > target_end:
+            self._set_state(f"{symbol} {timeframe} is already current through the last closed candle.", progress_base + progress_span)
+            return
 
+        expected = max(1, ((target_end - cursor) // interval_ms) + 1)
+        batches, downloaded = [], 0
+        while cursor <= target_end:
+            batch_end = min(target_end, cursor + (200 - 1) * interval_ms)
+            time.sleep(RATE_LIMIT_SECONDS)
+            frame = fetch_klines_for_extension(symbol, timeframe, cursor, batch_end, limit=200)
+            if frame.empty:
+                break
+            frame = frame[(frame["timestamp"] >= cursor) & (frame["timestamp"] <= target_end)]
+            if frame.empty:
+                break
+            if not (frame["timestamp"] % interval_ms == 0).all():
+                raise RuntimeError("downloaded batch contains timestamps not aligned to timeframe")
+            batch_issues = _validate_ohlcv_frame(frame)
+            if batch_issues:
+                raise RuntimeError("downloaded batch failed safety validation: " + "; ".join(batch_issues))
+            batches.append(frame)
+            downloaded += len(frame)
+            newest = int(frame["timestamp"].max())
+            if newest < cursor:
+                raise RuntimeError("Bybit response did not advance the download cursor")
+            cursor = newest + interval_ms
+            self._set_state(
+                f"{symbol} {timeframe}: downloaded {downloaded}/{expected} newer candles...",
+                progress_base + min(progress_span * 0.9, downloaded / expected * progress_span * 0.9),
+            )
+
+        if not batches:
+            self._set_state(f"No newer candles are available for {symbol} {timeframe}; existing file was kept.", progress_base + progress_span)
+            return
+        new_data = pd.concat(batches, ignore_index=True).sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+        new_data = new_data[new_data["timestamp"] > existing_end]
+        self._write_preserving_existing(file_path, existing, new_data, symbol, timeframe)
+        self._set_state(f"Saved {len(new_data)} newer candles for {symbol} {timeframe}.", progress_base + progress_span)
+
+    def _write_preserving_existing(self, file_path, existing, new_data, symbol, timeframe):
+        """Validate, reread and atomically replace while proving old rows survived."""
+        if new_data.empty:
+            return
+        if set(new_data["timestamp"].astype(int)).intersection(set(existing["timestamp"].astype(int))):
+            raise RuntimeError("overlap safety check failed")
+        combined = pd.concat([existing, new_data], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        issues = _validate_ohlcv_frame(combined)
+        if issues:
+            raise RuntimeError("combined file failed safety validation: " + "; ".join(issues))
+        existing_sorted = existing.sort_values("timestamp").reset_index(drop=True)
+        old_rows = combined[combined["timestamp"].isin(existing["timestamp"])].reset_index(drop=True)
+        try:
+            pd.testing.assert_frame_equal(old_rows[existing_sorted.columns], existing_sorted)
+        except AssertionError as exc:
+            raise RuntimeError("preservation check failed: existing candle values changed") from exc
         backup_path = f"{file_path}.bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         temp_path = f"{file_path}.tmp_{uuid.uuid4().hex}"
-        self._set_state("Writing atomically with backup; original file remains until final replace...", 96)
         shutil.copy2(file_path, backup_path)
-        combined.to_parquet(temp_path, compression="zstd")
-        reread = pd.read_parquet(temp_path)
-        reread_issues = _validate_ohlcv_frame(reread)
-        if reread_issues:
-            os.remove(temp_path)
-            raise RuntimeError("new parquet failed reread validation: " + "; ".join(reread_issues))
-        os.replace(temp_path, file_path)
-        self._set_state(f"Saved {len(new_data)} new candles. Backup kept at {backup_path}.", 99)
+        try:
+            combined.to_parquet(temp_path, compression="zstd")
+            reread = pd.read_parquet(temp_path)
+            if len(reread) != len(combined) or _validate_ohlcv_frame(reread):
+                raise RuntimeError("new parquet failed reread validation")
+            reread_old = reread[reread["timestamp"].isin(existing_sorted["timestamp"])].reset_index(drop=True)
+            try:
+                pd.testing.assert_frame_equal(reread_old[existing_sorted.columns], existing_sorted)
+            except AssertionError as exc:
+                raise RuntimeError("parquet reread preservation check failed") from exc
+            os.replace(temp_path, file_path)
+            return backup_path
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
 em = ExtensionManager(MARKET_DATA_DIR, INTERVAL_MS)
@@ -691,6 +861,64 @@ def _build_extension_status_panel():
     ], style={"border": "1px solid #d9e8ff", "backgroundColor": "#f7fbff", "padding": "10px", "margin": "10px 0"})
 
 
+def _build_period_extension_box(details):
+    """Build collapsible batch controls followed by the per-period table."""
+    period_count = len(details)
+    return html.Details([
+        html.Summary(
+            f"⬅️ Safe candle history tools and downloaded periods ({period_count})",
+            style={"fontWeight": "bold", "fontSize": "17px", "cursor": "pointer", "padding": "8px"},
+        ),
+        html.Div([
+            html.H4("All downloaded periods", style={"marginBottom": "5px"}),
+            html.P(
+                "Jobs run one period at a time. Existing candles are validated and preserved; "
+                "new files are reread before an atomic replacement and a backup is retained. "
+                "Unavailable or delisted pairs are logged and skipped without deleting their data.",
+                style={"marginTop": "0"},
+            ),
+            html.Div([
+                dcc.Input(
+                    id="extend-all-minutes",
+                    type="number",
+                    min=1,
+                    step=1,
+                    placeholder="extra minutes",
+                    style={"width": "145px", "marginRight": "6px"},
+                ),
+                html.Button("⬅️ Extend all by minutes", id="extend-all-minutes-btn", n_clicks=0),
+            ], style={"margin": "7px 0"}),
+            html.Div([
+                html.Button(
+                    "⏮️ Extend all to earliest available Bybit candle",
+                    id="extend-all-earliest-btn",
+                    n_clicks=0,
+                    title="Continues backwards until Bybit returns no older candles.",
+                ),
+                html.Button(
+                    "📅 Complete all histories through now",
+                    id="complete-all-history-btn",
+                    n_clicks=0,
+                    style={"marginLeft": "7px"},
+                    title="For every downloaded period, fetches earliest available history and then all closed candles through the time pressed.",
+                ),
+            ], style={"margin": "7px 0"}),
+            dcc.Checklist(
+                id="confirm-long-history-download",
+                options=[{
+                    "label": "I understand earliest/full-history jobs can take a long time and use substantial disk space",
+                    "value": "confirm",
+                }],
+                value=[],
+                style={"margin": "8px 0", "color": "#7a4b00"},
+            ),
+            _build_extension_status_panel(),
+            html.H4("Downloaded periods", style={"marginBottom": "6px"}),
+            _build_details_table(details),
+        ], style={"padding": "0 10px 10px"}),
+    ], open=False, style={"border": "1px solid #b9cbe3", "borderRadius": "5px", "margin": "10px 0"})
+
+
 def _build_candles_per_symbol_figure(details):
     """Build a lightweight summary figure from already collected metadata."""
     if details:
@@ -706,7 +934,6 @@ def create_data_analysis_tab():
     total_candles = sum(d["candles"] for d in info["details"])
     total_size_mb = info["size"] / 1e6
     total_symbols = info["symbols"]
-    table = _build_details_table(info["details"])
     fig = _build_candles_per_symbol_figure(info["details"])
     
     # Build symbol/timeframe dropdown options
@@ -723,9 +950,7 @@ def create_data_analysis_tab():
         html.P(f"Total database size: {total_size_mb:.2f} MB"),
         html.Button("Download Backup", id="download-db-btn"),
         dcc.Download(id="download-db"),
-        _build_extension_status_panel(),
-        html.H4("Detailed Table"),
-        table,
+        _build_period_extension_box(info["details"]),
         html.H4("Candles per Symbol"),
         dcc.Graph(figure=fig),
         html.Hr(),
@@ -818,6 +1043,35 @@ def register_database_callbacks(app):
                 break
         _, message = em.start(symbol, timeframe, minutes)
         return message
+
+    @app.callback(
+        Output("extend-status", "children", allow_duplicate=True),
+        Input("extend-all-minutes-btn", "n_clicks"),
+        Input("extend-all-earliest-btn", "n_clicks"),
+        Input("complete-all-history-btn", "n_clicks"),
+        State("extend-all-minutes", "value"),
+        State("confirm-long-history-download", "value"),
+        prevent_initial_call=True,
+    )
+    def start_all_period_extension(_minutes_clicks, _earliest_clicks, _complete_clicks,
+                                   minutes, confirmations):
+        """Dispatch batch jobs using a fresh inventory of existing periods."""
+        trigger = ctx.triggered_id
+        info = get_database_info(force_refresh=True)
+        periods = [(detail["symbol"], detail["timeframe"]) for detail in info["details"]]
+        if trigger == "extend-all-minutes-btn":
+            _, message = em.start_all(periods, minutes=minutes, through_now=False)
+            return message
+        if trigger in {"extend-all-earliest-btn", "complete-all-history-btn"}:
+            if "confirm" not in (confirmations or []):
+                return "⚠️ Confirm the long download and disk-space warning before starting. Nothing was changed."
+            _, message = em.start_all(
+                periods,
+                minutes=None,
+                through_now=(trigger == "complete-all-history-btn"),
+            )
+            return message
+        return no_update
 
     @app.callback(
         Output("extend-progress", "value"),
