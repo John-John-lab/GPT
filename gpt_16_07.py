@@ -794,7 +794,9 @@ last_rendered_stats = {} # Cache for summary tables to prevent disappearance
 OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 1500
 oscillator_reversal_source_cache = OrderedDict()
 
-CHART_PARQUET_CACHE_MAX = 6
+# Keep enough recently opened chart sources for quick left/right navigation.
+# The cache is still bounded and invalidated by parquet mtime/size.
+CHART_PARQUET_CACHE_MAX = 24
 chart_parquet_cache = OrderedDict()
 
 def read_chart_parquet_cached(fp):
@@ -6483,7 +6485,7 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
         updated_context = dict(event_context, index=next_idx)
         return target_id, no_update, {f"{target_id}_chart": time.time()}, updated_context, carry_chart_view_state_to_task(chart_view_state, target_id)
 
-    all_tasks, chartable = get_chartable_tasks_for_navigation()
+    _, chartable = get_chartable_tasks_for_navigation()
     chart_ids = [str(t.task_id) for t in chartable]
     if current_task_id not in chart_ids:
         return no_update, no_update, no_update, no_update, no_update
@@ -6494,8 +6496,10 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
         return no_update, no_update, no_update, no_update, no_update
 
     target_id = str(chartable[next_idx].task_id)
-    target_page = page_for_task(target_id, all_tasks)
-    return target_id, target_page, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
+    # Keep chart navigation independent from the main task table.  Jumping the
+    # table page here triggers an expensive table rebuild and makes the chart's
+    # left/right buttons feel delayed on large task sets.
+    return target_id, no_update, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
 clientside_callback(
     """
@@ -7682,8 +7686,6 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         return 100 * (close - ema) / ema
 
     has_volume = 'volume' in df.columns
-    if volume_visible and has_volume:
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
 
     def add_main_candles(target_fig):
         target_fig.add_trace(go.Candlestick(
@@ -7793,28 +7795,45 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         target_fig.add_hline(y=0, line_dash="dot", line_color="yellow", row=row, col=1)
         target_fig.update_yaxes(title_text="CMOa DIX", row=row, col=1)
 
-    # Low-spec chart cache: compute indicators once per period view and source file version.
+    # Low-spec chart cache: cache the period view and compute indicator columns
+    # lazily.  Left/right chart navigation often uses only candles; computing
+    # every oscillator on every newly opened task made navigation feel slow.
     # Including parquet mtime/size prevents stale chart data after database updates.
     try:
         source_stat = os.stat(fp)
-        cache_key = ("chart_indicators_v3_adx_macd_disparity", start_ms, end_ms, source_stat.st_mtime_ns, source_stat.st_size)
+        cache_key = ("chart_period_v4_lazy_indicators", start_ms, end_ms, source_stat.st_mtime_ns, source_stat.st_size)
     except OSError:
-        cache_key = ("chart_indicators_v3_adx_macd_disparity", start_ms, end_ms)
+        cache_key = ("chart_period_v4_lazy_indicators", start_ms, end_ms)
     if cache_key not in task._chart_cache:
-        df['rsi'] = compute_rsi(df['close'])
-        df['stoch_k_14_1_3'], df['stoch_d_14_1_3'] = compute_stochastic(df['high'], df['low'], df['close'], 14, 1, 3)
-        df['stoch_k_40_1_4'], df['stoch_d_40_1_4'] = compute_stochastic(df['high'], df['low'], df['close'], 40, 1, 4)
-        df['stoch_k_60_1_10'], df['stoch_d_60_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 60, 1, 10)
-        df['stoch_k_300_1_10'], df['stoch_d_300_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 300, 10, 1)
-        df['adx_14_1'], df['plus_di_14'], df['minus_di_14'] = compute_adx(df['high'], df['low'], df['close'], 14, 1)
-        df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_macd(df['close'], 12, 26, 9)
-        df['disparity_50'] = compute_disparity_index(df['close'], 50)
-        df['disparity_25'] = compute_disparity_index(df['close'], 25)
-        df['disparity_9'] = compute_disparity_index(df['close'], 9)
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
-    else:
-        df = task._chart_cache[cache_key]
+    df = task._chart_cache[cache_key]
+
+    if volume_visible and has_volume:
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+    if rsi_visible and 'rsi' not in df.columns:
+        df['rsi'] = compute_rsi(df['close'])
+    if stochastic_visible:
+        stochastic_columns = {
+            ('stoch_k_14_1_3', 'stoch_d_14_1_3'): (14, 1, 3),
+            ('stoch_k_40_1_4', 'stoch_d_40_1_4'): (40, 1, 4),
+            ('stoch_k_60_1_10', 'stoch_d_60_1_10'): (60, 1, 10),
+            ('stoch_k_300_1_10', 'stoch_d_300_1_10'): (300, 10, 1),
+        }
+        for (k_col, d_col), params in stochastic_columns.items():
+            if k_col not in df.columns or d_col not in df.columns:
+                df[k_col], df[d_col] = compute_stochastic(df['high'], df['low'], df['close'], *params)
+    if adx_visible and not {'adx_14_1', 'plus_di_14', 'minus_di_14'}.issubset(df.columns):
+        df['adx_14_1'], df['plus_di_14'], df['minus_di_14'] = compute_adx(df['high'], df['low'], df['close'], 14, 1)
+    if macd_visible and not {'macd_line', 'macd_signal', 'macd_hist'}.issubset(df.columns):
+        df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_macd(df['close'], 12, 26, 9)
+    if disparity_visible:
+        if 'disparity_50' not in df.columns:
+            df['disparity_50'] = compute_disparity_index(df['close'], 50)
+        if 'disparity_25' not in df.columns:
+            df['disparity_25'] = compute_disparity_index(df['close'], 25)
+        if 'disparity_9' not in df.columns:
+            df['disparity_9'] = compute_disparity_index(df['close'], 9)
     # Create figure
     volume_enabled = bool(volume_visible and has_volume)
     indicator_specs = []
