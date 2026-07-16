@@ -794,6 +794,65 @@ last_rendered_stats = {} # Cache for summary tables to prevent disappearance
 OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 1500
 oscillator_reversal_source_cache = OrderedDict()
 
+CHART_PARQUET_CACHE_MAX = 6
+chart_parquet_cache = OrderedDict()
+
+def read_chart_parquet_cached(fp):
+    """Read chart source parquet with a small mtime-aware cache for fast task switching."""
+    stat = os.stat(fp)
+    cache_key = (fp, stat.st_mtime_ns, stat.st_size)
+    cached = chart_parquet_cache.get(cache_key)
+    if cached is not None:
+        chart_parquet_cache.move_to_end(cache_key)
+        return cached
+
+    # Drop stale versions of the same file before reading the current one.
+    for old_key in [key for key in chart_parquet_cache if key[0] == fp]:
+        chart_parquet_cache.pop(old_key, None)
+
+    df = pd.read_parquet(fp)
+    chart_parquet_cache[cache_key] = df
+    chart_parquet_cache.move_to_end(cache_key)
+    while len(chart_parquet_cache) > CHART_PARQUET_CACHE_MAX:
+        chart_parquet_cache.popitem(last=False)
+    return df
+
+STRATEGY_SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_settings")
+OSCILLATOR_SETTINGS_IDS = [
+    "osc-stoch-14-level-input", "osc-stoch-14-condition-input", "osc-stoch-40-level-input", "osc-stoch-40-condition-input",
+    "osc-stoch-60-level-input", "osc-stoch-60-condition-input", "osc-stoch-300-level-input", "osc-stoch-300-condition-input", "osc-rsi-level-input", "osc-rsi-condition-input",
+    "osc-down-stoch-14-level-input", "osc-down-stoch-14-condition-input", "osc-down-stoch-40-level-input", "osc-down-stoch-40-condition-input",
+    "osc-down-stoch-60-level-input", "osc-down-stoch-60-condition-input", "osc-down-stoch-300-level-input", "osc-down-stoch-300-condition-input", "osc-down-rsi-level-input", "osc-down-rsi-condition-input",
+    "osc-reversal-sl-input", "osc-reversal-max-dd-input", "osc-reversal-tp-levels-input", "osc-reversal-trail-rules-input",
+    "osc-reversal-sl-grid-input", "osc-entry-window-input", "osc-exit-window-input", "osc-exit-enabled-input",
+    "osc-exit-sell-stoch-14-level-input", "osc-exit-sell-stoch-14-condition-input", "osc-exit-sell-stoch-40-level-input", "osc-exit-sell-stoch-40-condition-input",
+    "osc-exit-sell-stoch-60-level-input", "osc-exit-sell-stoch-60-condition-input", "osc-exit-sell-stoch-300-level-input", "osc-exit-sell-stoch-300-condition-input", "osc-exit-buy-stoch-14-level-input", "osc-exit-buy-stoch-14-condition-input",
+    "osc-exit-buy-stoch-40-level-input", "osc-exit-buy-stoch-40-condition-input", "osc-exit-buy-stoch-60-level-input", "osc-exit-buy-stoch-60-condition-input", "osc-exit-buy-stoch-300-level-input", "osc-exit-buy-stoch-300-condition-input",
+    "osc-reversal-notional-input", "osc-reversal-cost-input", "osc-reversal-open-return-input",
+    "osc-research-entry-windows-input", "osc-research-exit-windows-input", "osc-research-sl-grid-input", "osc-research-stop-presets-input",
+    "osc-research-max-combos-input", "osc-research-top-input",
+]
+
+def _safe_strategy_settings_name(name):
+    cleaned = re.sub(r"[^A-Za-z0-9_. -]+", "_", str(name or "")).strip().strip(".")
+    return cleaned[:80] or None
+
+def list_strategy_setting_names():
+    os.makedirs(STRATEGY_SETTINGS_DIR, exist_ok=True)
+    names = []
+    for path in sorted(glob.glob(os.path.join(STRATEGY_SETTINGS_DIR, "*.json"))):
+        names.append(os.path.splitext(os.path.basename(path))[0])
+    return names
+
+def strategy_setting_options():
+    return [{"label": name, "value": name} for name in list_strategy_setting_names()]
+
+def strategy_setting_path(name):
+    safe_name = _safe_strategy_settings_name(name)
+    if not safe_name:
+        return None
+    return os.path.join(STRATEGY_SETTINGS_DIR, f"{safe_name}.json")
+
 # Global stats cache for ALL tasks (calculated once per data version)
 cached_signal_stats_html = None  # Full Signal Performance Summary table
 cached_toward_strategy_stats_html = None  # Separate toward-level strategy summary table
@@ -2934,6 +2993,28 @@ th {
 .strike-through {
     text-decoration: line-through !important;
 }
+.chart-button-strip {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+.chart-button-strip::-webkit-scrollbar {
+    display: none;
+}
+.chart-button-strip button {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 max-content;
+    width: max-content;
+    min-width: max-content;
+    max-width: none;
+    min-height: 34px;
+    height: auto;
+    line-height: 1.2;
+    overflow: visible;
+    text-align: center;
+}
 </style>
 </head>
 <body>
@@ -3230,15 +3311,19 @@ def build_root_layout():
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
-    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": True}),
+    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
+    dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
+    dcc.Store(id="chart-dragmode-enforcer-store", data=None),  # keeps Measure draw-rectangle mode synced with Plotly modebar
     dcc.Store(id="osc-event-groups-store", data={}),
     dcc.Store(id="rsi-visible-store", data=False),   # default: RSI hidden
     dcc.Store(id="stochastic-visible-store", data=False),  # default: stochastic panes hidden
     dcc.Store(id="volume-visible-store", data=False),  # default: Volume hidden
+    dcc.Store(id="adx-visible-store", data=False),  # default: ADX hidden
+    dcc.Store(id="macd-visible-store", data=False),  # default: MACD hidden
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
-    dcc.Store(id="measure-anchor-store", data=True),
+    dcc.Store(id="measure-anchor-store", data=False),
     dcc.Store(id="measure-hover-store", data=True),
     dcc.Store(id="chart-info-box-store", data=True),
     dcc.Store(id="chart-extend-x-store", data=False),
@@ -3249,7 +3334,7 @@ def build_root_layout():
     dcc.Store(id="details-click-store", data={}),   # deduplication for details button
     # --------------------------------
     dcc.Store(id="impulse-visible-store", data=True),
-    dcc.Store(id="events-visible-store", data=True),
+    dcc.Store(id="events-visible-store", data=False),
     dcc.Store(id="impulse-params-store", data={}),
     # 🔧 CRITICAL: Hidden dummy buttons for CustomEvent-triggered callbacks (using html.Button which supports n_clicks)
     html.Button(id="chart-event-dummy", style={"display": "none"}, n_clicks=0),
@@ -3290,17 +3375,20 @@ def build_root_layout():
                 children=[
                     # Button row (Toggle RSI + Toggle Strategy + Measure + Close)
                     html.Div(
+                        className="chart-button-strip",
                         style={
                             "position": "absolute",
                             "top": "10px",
                             "left": "10px",
                             "right": "10px",
                             "display": "flex",
-                            "justifyContent": "flex-end",
+                            "flexWrap": "nowrap",
+                            "justifyContent": "flex-start",
                             "gap": "6px",
                             "overflowX": "auto",
                             "overflowY": "hidden",
-                            "paddingBottom": "4px",
+                            "alignItems": "center",
+                            "paddingBottom": "12px",
                             "maxWidth": "calc(100% - 20px)",
                             "whiteSpace": "nowrap",
                         },
@@ -3355,6 +3443,26 @@ def build_root_layout():
                                 "minWidth": "86px",
                                 "whiteSpace": "nowrap"
                             }),
+                            html.Button("Toggle ADX", id="toggle-adx-btn", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Toggle MACD", id="toggle-macd-btn", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "88px",
+                                "whiteSpace": "nowrap"
+                            }),
                             html.Button("Toggle Strategy", id="toggle-strategy-btn", style={
                                 "background": "transparent",
                                 "color": "black",
@@ -3375,10 +3483,10 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Snap: On", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
-                                "background": "#e8f5e9",
+                            html.Button("Snap: Off", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
+                                "background": "transparent",
                                 "color": "black",
-                                "border": "1px solid #2e7d32",
+                                "border": "1px solid #999",
                                 "padding": "6px 10px",
                                 "cursor": "pointer",
                                 "fontSize": "12px",
@@ -3435,10 +3543,10 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Event Marks: On", id="toggle-chart-event-marks-btn", title="Toggle research entry/exit markers", style={
-                                "background": "#e8f5e9",
+                            html.Button("Event Marks: Off", id="toggle-chart-event-marks-btn", title="Toggle research entry/exit markers", style={
+                                "background": "transparent",
                                 "color": "black",
-                                "border": "1px solid #2e7d32",
+                                "border": "1px solid #999",
                                 "padding": "6px 10px",
                                 "cursor": "pointer",
                                 "fontSize": "12px",
@@ -4006,13 +4114,13 @@ def render_tab(tab):
                                 html.Li("Support means the toward move is DOWN to support; the DOWN-toward group is used and the test enters BUY after confirmation."),
                                 html.Li("Use the UP-toward group for upper-limit logic, e.g. Stoch crossing down from 87 after price reaches resistance."),
                                 html.Li("Use the DOWN-toward group for lower-limit logic, e.g. Stoch crossing up from 13 after price reaches support."),
-                                html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10."),
+                                html.Li("Stoch lines match the chart: K 14/1/3, K 40/1/4, K 60/1/10, K 300/1/10."),
                                 html.Li("Cross down 87 means previous value was above 87 and current value is at/below 87; Cross up 13 means previous value was below 13 and current value is at/above 13."),
                                 html.Li("RSI(14,14) means RSI(14) smoothed by a 14-candle average. Disable RSI if you only want Stochastic."),
                                 html.Li("Speed note: candle paths and oscillator lines are cached per task snapshot, so changing only levels/conditions should be faster on repeated runs."),
                                 html.Li("Exit note: TP levels in this table are favorable-move checkpoints, not real take-profit orders. Actual exits are original SL, moved/trailing stop, max-DD cap, stochastic close, or open/no-exit fallback."),
                                 html.Li("Original SL hit means the first stop-loss set in the menu was reached before any moved stop or stochastic close. Moved-stop rows mean price first reached the trigger, then later closed by that adjusted stop."),
-                                html.Li("The optional stochastic close section reports whether the trade closed by the three stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
+                                html.Li("The optional stochastic close section reports whether the trade closed by the four stochastic curves and buckets those realized returns so you can see losses vs profit ranges."),
                                 html.Li("Condition windows broaden multi-oscillator checks: a window of 1 requires all enabled conditions on the same candle; a window of 3 allows each condition to occur within the current candle or previous 2 candles."),
                                 html.Li("Maintenance note: this checkup is isolated in the strategy-checkup helper section so future curves can be added by extending oscillator specs instead of touching table/chart code."),
                             ], style={"marginTop": 0}),
@@ -4031,7 +4139,12 @@ def render_tab(tab):
                         html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     ], style={"marginBottom": "12px"}),
@@ -4048,7 +4161,12 @@ def render_tab(tab):
                         html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
-                        html.Label("RSI(14,14):", style={"width": "100px", "display": "inline-block", "marginLeft": "18px"}),
+                        html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                        dcc.Input(id="osc-down-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                        dcc.Dropdown(id="osc-down-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
                         dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
                         dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     ], style={"marginBottom": "10px"}),
@@ -4066,14 +4184,14 @@ def render_tab(tab):
                         html.Span(" ⓘ", title="Number of candles where oscillator entry conditions may line up. 1 means all enabled conditions must be true on the same candle. 3 means each enabled condition may have occurred within the current candle or previous 2 candles.", style={"cursor": "help", "color": "#4a148c"}),
                         dcc.Input(id="osc-entry-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
                         html.Label("Close condition window:", style={"width": "150px", "display": "inline-block", "marginLeft": "20px"}),
-                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
+                        html.Span(" ⓘ", title="Number of candles where stochastic close conditions may line up. Use 2-5 to avoid requiring Stoch 14/40/60/300 crosses on the exact same candle.", style={"cursor": "help", "color": "#4a148c"}),
                         dcc.Input(id="osc-exit-window-input", type="number", value=1, min=1, step=1, style={"width": "70px"}),
                         html.Span("1 = same candle; 3 = current + previous 2 candles", style={"marginLeft": "10px", "color": "#777"}),
                     ], style={"marginBottom": "10px"}),
                     html.Details([
                         html.Summary("Optional stochastic close confirmation", style={"cursor": "pointer", "color": "#4a148c", "fontWeight": "bold"}),
                         html.Div([
-                            html.P("When enabled, the simulated position waits for these three stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
+                            html.P("When enabled, the simulated position waits for these four stochastic conditions after entry and closes on that candle close. If they do not trigger first, the normal stop-loss / DD / moved-stop logic can still close the position.", style={"margin": "6px 0", "color": "#555"}),
                             html.Div([
                                 dcc.Checklist(id="osc-exit-enabled-input", options=[{"label": "Enable stochastic close", "value": "enabled"}], value=[], style={"display": "inline-block", "marginRight": "20px"}),
                             ], style={"marginBottom": "8px"}),
@@ -4090,6 +4208,9 @@ def render_tab(tab):
                                 html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                                 dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
                                 dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-sell-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-sell-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             ], style={"marginBottom": "10px"}),
                             html.Div([
                                 html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
@@ -4104,6 +4225,9 @@ def render_tab(tab):
                                 html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                                 dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
                                 dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                                html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
+                                dcc.Input(id="osc-exit-buy-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
+                                dcc.Dropdown(id="osc-exit-buy-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             ], style={"marginBottom": "4px"}),
                         ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
                     ], open=False, style={"marginBottom": "10px"}),
@@ -4112,6 +4236,15 @@ def render_tab(tab):
                         html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
                         html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
                     ], style={"marginBottom": "10px"}),
+                    html.Div([
+                        html.Label("Settings name:", style={"width": "100px", "display": "inline-block"}),
+                        dcc.Input(id="osc-settings-name-input", type="text", placeholder="my stochastic setup", style={"width": "220px"}),
+                        html.Button("Save Settings", id="osc-settings-save-btn", n_clicks=0, style={"marginLeft": "8px"}),
+                        html.Label("Open:", style={"marginLeft": "16px", "marginRight": "6px"}),
+                        dcc.Dropdown(id="osc-settings-open-dropdown", options=strategy_setting_options(), value=None, placeholder="choose saved settings", clearable=False, style={"width": "260px", "display": "inline-block", "verticalAlign": "middle"}),
+                        html.Button("Open Settings", id="osc-settings-open-btn", n_clicks=0, style={"marginLeft": "8px"}),
+                        html.Div(id="osc-settings-status", style={"marginTop": "6px", "color": "#4a148c", "fontWeight": "bold"}),
+                    ], style={"marginBottom": "10px", "padding": "8px", "backgroundColor": "#f1e8ff", "border": "1px solid #ce93d8", "borderRadius": "4px"}),
                     html.Button("Run Oscillator Reversal Checkup", id="osc-reversal-run-btn", n_clicks=0, style={"fontWeight": "bold"}),
                     dcc.Loading(type="circle", children=[html.Div(id="osc-reversal-status", style={"marginTop": "10px", "fontWeight": "bold"}), html.Div(id="osc-reversal-results", style={"marginTop": "10px", "maxHeight": "420px", "overflowY": "auto", "border": "1px solid #ddd", "borderRadius": "4px", "padding": "8px", "backgroundColor": "#fff"})]),
                     html.Details([
@@ -6283,48 +6416,61 @@ def update_chart_nav_buttons(task_id, version, event_context):
     idx = chart_ids.index(task_id)
     return idx <= 0, idx >= len(chart_ids) - 1
 
+def carry_chart_view_state_to_task(view_state, target_task_id):
+    """Carry current zoom/pan ranges to a newly selected chart task."""
+    if not isinstance(view_state, dict) or not view_state.get("axes") or not target_task_id:
+        return no_update
+    next_state = dict(view_state)
+    next_state["task_id"] = str(target_task_id)
+    next_state["carried_to_task_ts"] = time.time()
+    return next_state
+
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
     Output("task-page-store", "data", allow_duplicate=True),
     Output("chart-click-store", "data", allow_duplicate=True),
     Output("chart-event-context-store", "data", allow_duplicate=True),
+    Output("chart-view-state-store", "data", allow_duplicate=True),
     Input("prev-chart-btn", "n_clicks"),
     Input("next-chart-btn", "n_clicks"),
     State("chart-task-id", "data"),
     State("chart-event-context-store", "data"),
+    State("chart-view-state-store", "data"),
     prevent_initial_call=True
 )
-def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context):
+def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context, chart_view_state):
     triggered = ctx.triggered_id
     if triggered not in ("prev-chart-btn", "next-chart-btn") or not current_task_id:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
 
     if isinstance(event_context, dict) and event_context.get("events"):
         events = event_context.get("events") or []
         current_idx = int(event_context.get("index") or 0)
         next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
         if next_idx < 0 or next_idx >= len(events):
-            return no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update
         target_id = str(events[next_idx].get("task_id") or "")
         if not target_id:
-            return no_update, no_update, no_update, no_update
-        all_tasks, _ = get_chartable_tasks_for_navigation()
+            return no_update, no_update, no_update, no_update, no_update
+        # Event-group navigation is opened from summary tables and can include many
+        # rows.  Do not force the task table to jump pages here; that expensive
+        # table rebuild made left/right chart navigation feel very slow.
         updated_context = dict(event_context, index=next_idx)
-        return target_id, page_for_task(target_id, all_tasks), {f"{target_id}_chart": time.time()}, updated_context
+        return target_id, no_update, {f"{target_id}_chart": time.time()}, updated_context, carry_chart_view_state_to_task(chart_view_state, target_id)
 
     all_tasks, chartable = get_chartable_tasks_for_navigation()
     chart_ids = [str(t.task_id) for t in chartable]
     if current_task_id not in chart_ids:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
 
     current_idx = chart_ids.index(current_task_id)
     next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
     if next_idx < 0 or next_idx >= len(chartable):
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
 
     target_id = str(chartable[next_idx].task_id)
     target_page = page_for_task(target_id, all_tasks)
-    return target_id, target_page, {f"{target_id}_chart": time.time()}, no_update
+    return target_id, target_page, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
 clientside_callback(
     """
@@ -6391,7 +6537,7 @@ def set_chart_task_id(trigger_data, click_store):
         return no_update, no_update, no_update
     
     click_store[key] = current_time
-    return task_id, click_store, {"events": [], "index": 0, "overlay": True}
+    return task_id, click_store, {"events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
 @app.callback(
@@ -6419,7 +6565,7 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 )
 def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
-    return None, None, {}, {"events": [], "index": 0, "overlay": True}
+    return None, None, {}, {"events": [], "index": 0, "overlay": False}
 
 @app.callback(
     Output("rsi-visible-store", "data"),
@@ -6447,11 +6593,13 @@ def toggle_stochastic(n_clicks, current):
     Output("rsi-visible-store", "data", allow_duplicate=True),
     Output("stochastic-visible-store", "data", allow_duplicate=True),
     Input({"type": "osc-event-chart", "category": ALL}, "n_clicks"),
+    State({"type": "osc-event-index", "category": ALL}, "value"),
+    State({"type": "osc-event-index", "category": ALL}, "id"),
     State("osc-event-groups-store", "data"),
     prevent_initial_call=True,
 )
-def open_oscillator_event_chart(_clicks, event_groups):
-    """Open the chart on a diagnostic event group and enable oscillator panes."""
+def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids, event_groups):
+    """Open the chart on a selected diagnostic event number and enable oscillator panes."""
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict):
         return no_update, no_update, no_update, no_update, no_update
@@ -6459,10 +6607,22 @@ def open_oscillator_event_chart(_clicks, event_groups):
     events = (event_groups or {}).get(category) or []
     if not events:
         return no_update, no_update, no_update, no_update, no_update
-    task_id = str(events[0].get("task_id") or "")
+
+    requested_number = 1
+    for value, id_obj in zip(requested_indices or [], requested_index_ids or []):
+        if isinstance(id_obj, dict) and id_obj.get("category") == category:
+            requested_number = value or 1
+            break
+    try:
+        event_index = int(requested_number) - 1
+    except Exception:
+        event_index = 0
+    event_index = max(0, min(event_index, len(events) - 1))
+
+    task_id = str(events[event_index].get("task_id") or "")
     if not task_id:
         return no_update, no_update, no_update, no_update, no_update
-    context = {"category": category, "events": events, "index": 0, "overlay": True}
+    context = {"category": category, "events": events, "index": event_index, "overlay": True}
     return task_id, {f"{task_id}_chart": time.time()}, context, True, True
 
 @app.callback(
@@ -6497,6 +6657,24 @@ def update_chart_event_marks_button(event_context):
     prevent_initial_call=True
 )
 def toggle_volume(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("adx-visible-store", "data"),
+    Input("toggle-adx-btn", "n_clicks"),
+    State("adx-visible-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_adx(n_clicks, current):
+    return not current
+
+@app.callback(
+    Output("macd-visible-store", "data"),
+    Input("toggle-macd-btn", "n_clicks"),
+    State("macd-visible-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_macd(n_clicks, current):
     return not current
 
 @app.callback(
@@ -6682,13 +6860,40 @@ def update_chart_extend_x_button(extend_enabled):
 
 clientside_callback(
     """
-function(measureMode, measureHover, infoBox, extendX, figure) {
+function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
     const fig = JSON.parse(JSON.stringify(figure));
     fig.layout = fig.layout || {};
+    function forceGraphDragmode(mode) {
+        window.setTimeout(function() {
+            const root = document.getElementById('task-chart');
+            const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+            if (plot && window.Plotly && mode) {
+                window.Plotly.relayout(plot, {dragmode: mode});
+            }
+        }, 0);
+    }
+    function applyStoredRanges(targetFig, storedView, skipX) {
+        if (!storedView || String(storedView.task_id || '') !== String(chartTaskId || '')) return;
+        const axes = storedView && storedView.axes ? storedView.axes : {};
+        Object.keys(axes).forEach(function(axisName) {
+            const axisState = axes[axisName] || {};
+            if (skipX && /^xaxis[0-9]*$/.test(axisName)) return;
+            const targetAxis = targetFig.layout[axisName];
+            if (!targetAxis) return;
+            if (axisState.range && axisState.range.length === 2) {
+                targetAxis.range = axisState.range.slice();
+                targetAxis.autorange = false;
+            } else if (axisState.autorange) {
+                delete targetAxis.range;
+                targetAxis.autorange = true;
+            }
+        });
+    }
     fig.layout.dragmode = measureMode ? 'drawrect' : 'pan';
+    forceGraphDragmode(fig.layout.dragmode);
     const showHover = (!measureMode || measureHover);
     fig.layout.hovermode = showHover ? 'x' : false;
 
@@ -6701,12 +6906,9 @@ function(measureMode, measureHover, infoBox, extendX, figure) {
             fig.layout[key].spikecolor = '#666';
             fig.layout[key].spikethickness = 1;
             fig.layout[key].spikedash = 'dash';
-            if (targetRange && targetRange.length === 2) {
+            if (extendX && targetRange && targetRange.length === 2) {
                 fig.layout[key].range = targetRange;
                 fig.layout[key].autorange = false;
-            } else if (!extendX) {
-                delete fig.layout[key].range;
-                fig.layout[key].autorange = true;
             }
         }
         if (/^yaxis[0-9]*$/.test(key)) {
@@ -6725,21 +6927,19 @@ function(measureMode, measureHover, infoBox, extendX, figure) {
         if (trace.type === 'candlestick') {
             delete trace.hoverinfo;
             trace.hovertemplate = candleTemplate;
-        } else if (trace.name && String(trace.name).includes('%D')) {
-            trace.hoverinfo = 'skip';
-            trace.hovertemplate = null;
         } else if (trace.name && String(trace.name).includes('Volume')) {
             delete trace.hoverinfo;
             trace.hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
         } else if (trace.name && String(trace.name).includes('RSI')) {
             delete trace.hoverinfo;
             trace.hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
-        } else if (trace.name && String(trace.name).includes('%K')) {
+        } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
             delete trace.hoverinfo;
-            const cleanName = String(trace.name).replace(' %K', '');
+            const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
             trace.hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
         }
     });
+    applyStoredRanges(fig, viewState, Boolean(extendX));
     fig.layout.uirevision = fig.layout.uirevision || 'chart';
     return fig;
 }
@@ -6750,7 +6950,89 @@ function(measureMode, measureHover, infoBox, extendX, figure) {
     Input("chart-info-box-store", "data"),
     Input("chart-extend-x-store", "data"),
     State("task-chart", "figure"),
+    State("chart-view-state-store", "data"),
+    State("chart-task-id", "data"),
     prevent_initial_call=True
+)
+
+clientside_callback(
+    """
+function(relayoutData, measureMode) {
+    if (!measureMode || !relayoutData || !relayoutData.dragmode || relayoutData.dragmode === 'drawrect') {
+        return window.dash_clientside.no_update;
+    }
+    window.setTimeout(function() {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (plot && window.Plotly) {
+            window.Plotly.relayout(plot, {dragmode: 'drawrect'});
+        }
+    }, 0);
+    return {ts: Date.now(), forced: 'drawrect', previous: relayoutData.dragmode};
+}
+""",
+    Output("chart-dragmode-enforcer-store", "data"),
+    Input("task-chart", "relayoutData"),
+    State("measure-mode-store", "data"),
+    prevent_initial_call=True,
+)
+
+clientside_callback(
+    """
+function(relayoutData, taskId, currentView) {
+    if (!relayoutData || !taskId) {
+        return window.dash_clientside.no_update;
+    }
+    const axes = {};
+    function ensureAxis(axisName) {
+        if (!axes[axisName]) axes[axisName] = {};
+        return axes[axisName];
+    }
+    Object.keys(relayoutData).forEach(function(key) {
+        let match = key.match(/^(xaxis[0-9]*|yaxis[0-9]*)\\.range\\[(0|1)\\]$/);
+        if (match) {
+            const axis = ensureAxis(match[1]);
+            axis.range = axis.range || [null, null];
+            axis.range[Number(match[2])] = relayoutData[key];
+            return;
+        }
+        match = key.match(/^(xaxis[0-9]*|yaxis[0-9]*)\\.range$/);
+        if (match && Array.isArray(relayoutData[key]) && relayoutData[key].length === 2) {
+            ensureAxis(match[1]).range = relayoutData[key].slice();
+            return;
+        }
+        match = key.match(/^(xaxis[0-9]*|yaxis[0-9]*)\\.autorange$/);
+        if (match && relayoutData[key]) {
+            ensureAxis(match[1]).autorange = true;
+            delete ensureAxis(match[1]).range;
+        }
+    });
+    Object.keys(axes).forEach(function(axisName) {
+        const axis = axes[axisName];
+        if (axis.range && (axis.range[0] === null || axis.range[1] === null)) {
+            delete axis.range;
+        }
+    });
+    if (!Object.keys(axes).length) {
+        return window.dash_clientside.no_update;
+    }
+    const nextView = Object.assign({}, currentView || {});
+    const canMergeCurrent = currentView && String(currentView.task_id || '') === String(taskId || '');
+    const mergedAxes = Object.assign({}, canMergeCurrent ? (currentView.axes || {}) : {});
+    Object.keys(axes).forEach(function(axisName) {
+        mergedAxes[axisName] = Object.assign({}, mergedAxes[axisName] || {}, axes[axisName]);
+    });
+    nextView.task_id = taskId;
+    nextView.axes = mergedAxes;
+    nextView.ts = Date.now();
+    return nextView;
+}
+""",
+    Output("chart-view-state-store", "data"),
+    Input("task-chart", "relayoutData"),
+    State("chart-task-id", "data"),
+    State("chart-view-state-store", "data"),
+    prevent_initial_call=True,
 )
 
 def _extract_measure_point(click_data, anchor_enabled=True):
@@ -7092,6 +7374,36 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     title = f"Strategy Signals – {task.symbols[0]} ({task.timeframe})"
     return {"display": "flex"}, title, content
 
+def apply_chart_view_state_to_figure(fig, view_state, task_id):
+    """Reapply the user's current Plotly zoom/pan ranges after a figure rebuild."""
+    if not isinstance(view_state, dict) or str(view_state.get("task_id")) != str(task_id):
+        return fig
+    axes = view_state.get("axes") or {}
+    for axis_name, axis_state in axes.items():
+        if not isinstance(axis_state, dict):
+            continue
+        axis_range = axis_state.get("range")
+        if axis_range and len(axis_range) == 2:
+            try:
+                if re.match(r"^xaxis[0-9]*$", axis_name):
+                    # Shared x-axes should move together when the main x-axis is restored.
+                    if axis_name == "xaxis":
+                        fig.update_xaxes(range=list(axis_range), autorange=False)
+                    else:
+                        fig.layout[axis_name].range = list(axis_range)
+                        fig.layout[axis_name].autorange = False
+                elif re.match(r"^yaxis[0-9]*$", axis_name):
+                    fig.layout[axis_name].range = list(axis_range)
+                    fig.layout[axis_name].autorange = False
+            except Exception:
+                continue
+        elif axis_state.get("autorange"):
+            try:
+                fig.layout[axis_name].autorange = True
+            except Exception:
+                continue
+    return fig
+
 # ----- Chart figure callback (light theme) -----
 @app.callback(
     Output("task-chart", "figure"),
@@ -7099,6 +7411,8 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("rsi-visible-store", "data"),
     Input("stochastic-visible-store", "data"),
     Input("volume-visible-store", "data"),
+    Input("adx-visible-store", "data"),
+    Input("macd-visible-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
@@ -7106,9 +7420,10 @@ def toggle_strategy_details_modal(task_id, close_clicks):
     Input("measure-points-store", "data"),
     Input("measure-result-store", "data"),
     Input("chart-event-context-store", "data"),
+    State("chart-view-state-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -7120,19 +7435,20 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     fp = os.path.join(path, "data.parquet")
     if not os.path.exists(fp):
         return go.Figure()
-    df = pd.read_parquet(fp)
-    if df.empty:
+    df_source = read_chart_parquet_cached(fp)
+    if df_source.empty:
         return go.Figure()
     # Filter period
     start_ms = int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.start_date else 0
-    end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.end_date else df['timestamp'].max()
-    df = df[(df['timestamp'] >= start_ms) & (df['timestamp'] <= end_ms)].copy()
+    end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.end_date else df_source['timestamp'].max()
+    df = df_source[(df_source['timestamp'] >= start_ms) & (df_source['timestamp'] <= end_ms)].copy()
     if df.empty:
         return go.Figure()
-    # UTC datetime conversion
+    # UTC datetime conversion. Vectorized pandas conversion is much faster than
+    # per-row datetime.fromtimestamp when switching charts across many tasks.
     def ms_to_utc_datetime(ms):
         return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
-    df['x'] = df['timestamp'].apply(ms_to_utc_datetime)
+    df['x'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
     signal_dt = ms_to_utc_datetime(task.signal_time)
     # RSI calculation
     def compute_rsi(series, period=14):
@@ -7153,6 +7469,31 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         k_line = raw_k.rolling(window=smooth, min_periods=smooth).mean()
         d_line = k_line.rolling(window=d_length, min_periods=d_length).mean()
         return k_line, d_line
+
+    def compute_adx(high, low, close, di_length=14, adx_smoothing=1):
+        high = pd.Series(high, dtype="float64")
+        low = pd.Series(low, dtype="float64")
+        close = pd.Series(close, dtype="float64")
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
+        tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        tr_rma = tr.ewm(alpha=1 / di_length, adjust=False, min_periods=di_length).mean().replace(0, np.nan)
+        plus_di = 100 * plus_dm.ewm(alpha=1 / di_length, adjust=False, min_periods=di_length).mean() / tr_rma
+        minus_di = 100 * minus_dm.ewm(alpha=1 / di_length, adjust=False, min_periods=di_length).mean() / tr_rma
+        dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+        adx = dx.ewm(alpha=1 / max(int(adx_smoothing or 1), 1), adjust=False, min_periods=max(int(adx_smoothing or 1), 1)).mean()
+        return adx, plus_di, minus_di
+
+    def compute_macd(close, fast_length=12, slow_length=26, signal_length=9):
+        close = pd.Series(close, dtype="float64")
+        fast_ema = close.ewm(span=fast_length, adjust=False, min_periods=fast_length).mean()
+        slow_ema = close.ewm(span=slow_length, adjust=False, min_periods=slow_length).mean()
+        macd_line = fast_ema - slow_ema
+        signal_line = macd_line.ewm(span=signal_length, adjust=False, min_periods=signal_length).mean()
+        hist = macd_line - signal_line
+        return macd_line, signal_line, hist
 
     has_volume = 'volume' in df.columns
     if volume_visible and has_volume:
@@ -7205,27 +7546,47 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         target_fig.update_yaxes(title_text="RSI", row=row, col=1, range=[0, 100])
 
     def add_stochastic_trace(target_fig, row, k_col, d_col, title, color):
-        target_fig.add_trace(go.Scatter(
-            x=df['x'], y=df[k_col], mode='lines', name=f'{title} %K',
-            line=dict(color=color, width=1.4), connectgaps=True,
-            hovertemplate=f'{title}: %{{y:.2f}}<extra></extra>'
-        ), row=row, col=1)
+        # Only the %D curve is visible and used for strategy checks.  Keep k_col
+        # in the signature so existing indicator_specs tuples remain readable.
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
-            line=dict(color='#555', width=0.9, dash='dot'), connectgaps=True,
-            showlegend=False, hoverinfo='skip'
+            line=dict(color=color, width=1.4), connectgaps=True,
+            hovertemplate=f'{title} %D: %{{y:.2f}}<extra></extra>'
         ), row=row, col=1)
         target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
         target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
         target_fig.update_yaxes(title_text=title, row=row, col=1, range=[0, 100])
 
-    # Low-spec chart cache: compute indicators once per period view
-    cache_key = (start_ms, end_ms)
+    def add_adx_trace(target_fig, row):
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['adx_14_1'], mode='lines', name='ADX 14/1', line=dict(color='#6d4c41', width=1.4), connectgaps=True, hovertemplate='ADX: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['plus_di_14'], mode='lines', name='+DI 14', line=dict(color='#2e7d32', width=1.0), connectgaps=True, hovertemplate='+DI: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['minus_di_14'], mode='lines', name='-DI 14', line=dict(color='#c62828', width=1.0), connectgaps=True, hovertemplate='-DI: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=25, line_dash="dash", line_color="#999", row=row, col=1)
+        target_fig.update_yaxes(title_text="ADX", row=row, col=1, range=[0, 100])
+
+    def add_macd_trace(target_fig, row):
+        colors = np.where(df['macd_hist'] >= 0, '#26a69a', '#ef5350')
+        target_fig.add_trace(go.Bar(x=df['x'], y=df['macd_hist'], name='MACD Hist', marker_color=colors, showlegend=False, hovertemplate='Hist: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=0, line_dash="dash", line_color="#999", row=row, col=1)
+        target_fig.update_yaxes(title_text="MACD", row=row, col=1)
+
+    # Low-spec chart cache: compute indicators once per period view and source file version.
+    # Including parquet mtime/size prevents stale chart data after database updates.
+    try:
+        source_stat = os.stat(fp)
+        cache_key = ("chart_indicators_v2_adx_macd", start_ms, end_ms, source_stat.st_mtime_ns, source_stat.st_size)
+    except OSError:
+        cache_key = ("chart_indicators_v2_adx_macd", start_ms, end_ms)
     if cache_key not in task._chart_cache:
         df['rsi'] = compute_rsi(df['close'])
         df['stoch_k_14_1_3'], df['stoch_d_14_1_3'] = compute_stochastic(df['high'], df['low'], df['close'], 14, 1, 3)
         df['stoch_k_40_1_4'], df['stoch_d_40_1_4'] = compute_stochastic(df['high'], df['low'], df['close'], 40, 1, 4)
         df['stoch_k_60_1_10'], df['stoch_d_60_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 60, 1, 10)
+        df['stoch_k_300_1_10'], df['stoch_d_300_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 300, 10, 1)
+        df['adx_14_1'], df['plus_di_14'], df['minus_di_14'] = compute_adx(df['high'], df['low'], df['close'], 14, 1)
+        df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_macd(df['close'], 12, 26, 9)
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     else:
@@ -7240,7 +7601,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             ("stoch", ("stoch_k_14_1_3", "stoch_d_14_1_3", "Stoch 14/1/3", "#1565c0")),
             ("stoch", ("stoch_k_40_1_4", "stoch_d_40_1_4", "Stoch 40/1/4", "#ef6c00")),
             ("stoch", ("stoch_k_60_1_10", "stoch_d_60_1_10", "Stoch 60/1/10", "#2e7d32")),
+            ("stoch", ("stoch_k_300_1_10", "stoch_d_300_1_10", "Stoch 300/1/10", "#6a1b9a")),
         ])
+    if adx_visible:
+        indicator_specs.append(("adx", None))
+    if macd_visible:
+        indicator_specs.append(("macd", None))
     if volume_enabled:
         indicator_specs.append(("volume", None))
 
@@ -7263,6 +7629,10 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             add_rsi_trace(fig, current_row)
         elif indicator_type == "stoch":
             add_stochastic_trace(fig, current_row, *indicator_data)
+        elif indicator_type == "adx":
+            add_adx_trace(fig, current_row)
+        elif indicator_type == "macd":
+            add_macd_trace(fig, current_row)
         elif indicator_type == "volume":
             add_volume_trace(fig, row=current_row)
         current_row += 1
@@ -7462,13 +7832,17 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         clickmode="event+select",
         dragmode="pan",
         newshape=dict(line_color="#1976d2", fillcolor="rgba(25,118,210,0.08)", opacity=0.35),
-        height=980 if stochastic_visible else (780 if (rsi_visible and volume_enabled) else (700 if (rsi_visible or volume_enabled) else 500)),
+        height=980 if stochastic_visible else (780 if sum(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible)) >= 2 else (700 if any(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible)) else 500)),
         margin=dict(l=50, r=50, t=50, b=50),
         meta={
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
         },
-        uirevision="task-chart-preserve-view"
+        # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
+        # or marker overlays rebuild this figure.  The key changes only when a
+        # different task chart is opened, so a new task still starts from its
+        # own default view.
+        uirevision=f"task-chart-preserve-view-{task_id}"
     )
     # X-axis tick format and native Plotly spike lines.
     # showspikes + spikemode="across" keeps the thin dashed hover line synced
@@ -7494,6 +7868,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         fig.update_layout(hoversubplots="axis")
     except ValueError:
         pass
+    apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
     return fig
 
 # =============================================================================
@@ -8230,12 +8605,13 @@ def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
     return True
 
 
-def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
+def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
     """Build normalized oscillator condition specs from UI values."""
     return [
-        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
-        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
-        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 14/1/3", "column": "stoch_d_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_d_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_d_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 300/1/10", "column": "stoch_d_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
         {"label": "RSI(14,14)", "column": "rsi_14_14", "level": float(rsi_level if rsi_level is not None else default_rsi_level), "condition": normalize_oscillator_condition(rsi_condition)},
     ]
 
@@ -8248,12 +8624,13 @@ def build_oscillator_spec_groups(up_inputs, down_inputs):
     }
 
 
-def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, default_stoch_level):
+def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, default_stoch_level):
     """Build normalized stochastic-only exit specs using the same curve style as oscillator entries."""
     return [
-        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
-        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
-        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 14/1/3", "column": "stoch_d_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_d_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_d_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 300/1/10", "column": "stoch_d_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
     ]
 
 
@@ -8301,6 +8678,7 @@ def format_oscillator_specs(specs):
 def make_oscillator_reversal_source_cache_key(task):
     """Return a stable cache key for oscillator source data derived from one task snapshot."""
     return (
+        "osc_source_v3_stoch_d_only",
         getattr(task, "task_id", None),
         getattr(task, "signal_time", None),
         getattr(task, "signal_price", None),
@@ -8334,9 +8712,10 @@ def build_oscillator_reversal_source_uncached(task):
     df_sorted = df.sort_values("timestamp").reset_index(drop=True).copy()
     for col in ["high", "low", "close"]:
         df_sorted[col] = pd.to_numeric(df_sorted[col], errors="coerce")
-    df_sorted["stoch_k_14_1_3"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
-    df_sorted["stoch_k_40_1_4"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
-    df_sorted["stoch_k_60_1_10"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
+    df_sorted["stoch_k_14_1_3"], df_sorted["stoch_d_14_1_3"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
+    df_sorted["stoch_k_40_1_4"], df_sorted["stoch_d_40_1_4"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
+    df_sorted["stoch_k_60_1_10"], df_sorted["stoch_d_60_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
+    df_sorted["stoch_k_300_1_10"], df_sorted["stoch_d_300_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 10, 1)
     df_sorted["rsi_14_14"] = compute_dynamic_rsi_series(df_sorted["close"], 14).rolling(window=14, min_periods=1).mean()
 
     search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
@@ -8413,9 +8792,10 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
         "lows": path_df["low"].to_numpy(dtype=float, copy=False),
         "closes": path_df["close"].to_numpy(dtype=float, copy=False),
         "timestamps": path_df["timestamp"].to_numpy(dtype=float, copy=False),
-        "stoch_k_14_1_3": path_df["stoch_k_14_1_3"].to_numpy(dtype=float, copy=False),
-        "stoch_k_40_1_4": path_df["stoch_k_40_1_4"].to_numpy(dtype=float, copy=False),
-        "stoch_k_60_1_10": path_df["stoch_k_60_1_10"].to_numpy(dtype=float, copy=False),
+        "stoch_d_14_1_3": path_df["stoch_d_14_1_3"].to_numpy(dtype=float, copy=False),
+        "stoch_d_40_1_4": path_df["stoch_d_40_1_4"].to_numpy(dtype=float, copy=False),
+        "stoch_d_60_1_10": path_df["stoch_d_60_1_10"].to_numpy(dtype=float, copy=False),
+        "stoch_d_300_1_10": path_df["stoch_d_300_1_10"].to_numpy(dtype=float, copy=False),
         "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
         "level_cross_idx": cross_idx,
         "oscillator_idx": oscillator_idx,
@@ -8478,14 +8858,30 @@ def build_chart_event_record(path, result, category, label):
 
 
 def chart_event_button(label, category, count):
-    """Render a summary-row button that opens chart navigation for one event group."""
-    return html.Button(
-        f"📈 {label} ({count})",
-        id={"type": "osc-event-chart", "category": category},
-        n_clicks=0,
-        title="Open chart and navigate this specific result group",
-        style={"fontSize": "11px", "padding": "2px 6px", "cursor": "pointer"},
-    )
+    """Render summary controls that open a selected event number from a result group."""
+    disabled = not bool(count)
+    return html.Span([
+        html.Span(f"Total: {count}", style={"marginRight": "6px", "fontSize": "11px", "color": "#555"}),
+        html.Label("#", style={"fontSize": "11px", "marginRight": "2px"}),
+        dcc.Input(
+            id={"type": "osc-event-index", "category": category},
+            type="number",
+            value=1 if count else None,
+            min=1,
+            max=max(int(count or 0), 1),
+            step=1,
+            disabled=disabled,
+            style={"width": "58px", "fontSize": "11px", "marginRight": "4px"},
+        ),
+        html.Button(
+            f"📈 {label}",
+            id={"type": "osc-event-chart", "category": category},
+            n_clicks=0,
+            disabled=disabled,
+            title="Enter an event number, then open that exact chart. Use ‹/› to move through this result group.",
+            style={"fontSize": "11px", "padding": "2px 6px", "cursor": "pointer" if not disabled else "not-allowed"},
+        ),
+    ], style={"display": "inline-flex", "alignItems": "center", "gap": "2px", "flexWrap": "nowrap"})
 
 
 def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_pct, max_dd_pct, tp_levels, stop_rules, sl_grid=None, notional_usd=1000, round_trip_cost_pct=0.0, open_return_pct=0.0, oscillator_exit_specs=None, entry_condition_window=1, oscillator_exit_window=1, return_event_groups=False):
@@ -8514,6 +8910,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
     valid_results = [r for r in results if r["valid"]]
     valid_total = len(valid_results)
     event_groups = {"original_sl": [], "stochastic_close": []}
+    stop_execution_levels = {}
     for level in tp_levels:
         event_groups[f"tp_{level:g}"] = []
     for path, result in zip(paths, results):
@@ -8523,6 +8920,15 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
             event = build_chart_event_record(path, result, "original_sl", "Original SL exit")
             if event:
                 event_groups["original_sl"].append(event)
+        if result.get("stop_hit") and result.get("stop_return_pct") is not None:
+            stop_return_pct = float(result.get("stop_return_pct") or 0.0)
+            stop_key_value = f"{stop_return_pct:g}".replace("-", "minus_").replace(".", "p")
+            stop_category = f"stop_exec_{stop_key_value}"
+            stop_label = ("Original SL" if result.get("initial_stop_hit") else "Moved stop") + f" executed at {stop_return_pct:g}% return"
+            stop_execution_levels[stop_category] = stop_return_pct
+            event = build_chart_event_record(path, result, stop_category, stop_label)
+            if event:
+                event_groups.setdefault(stop_category, []).append(event)
         if result.get("oscillator_exit_hit"):
             event = build_chart_event_record(path, result, "stochastic_close", "Stochastic close")
             if event:
@@ -8601,6 +9007,15 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         html.Tr([html.Td("Actual stochastic close exits", style=td_style), html.Td([fmt_stat(oscillator_exit_count, valid_total), " ", chart_event_button("Chart stochastic exits", "stochastic_close", oscillator_exit_count)], style=td_style)]),
         html.Tr([html.Td("Open/no actual exit fallback", style=td_style), html.Td(fmt_stat(sum(1 for r in valid_results if r.get("exit_return_pct") is None), valid_total), style=td_style)]),
     ]
+    if stop_execution_levels:
+        rows.append(html.Tr([html.Td("— Actual stop-loss orders executed by stop level —", style=td_style), html.Td("These are real simulated stop exits, grouped by the stop price/return that actually closed the order", style=td_style)]))
+        for stop_category, stop_return_pct in sorted(stop_execution_levels.items(), key=lambda item: item[1]):
+            count = len(event_groups.get(stop_category, []))
+            stop_name = "Original SL" if stop_return_pct < 0 else "Moved/dynamic stop"
+            rows.append(html.Tr([
+                html.Td(f"{stop_name} executed at {stop_return_pct:g}% return", style=td_style),
+                html.Td([fmt_stat(count, valid_total), " ", chart_event_button(f"Chart stop {stop_return_pct:g}%", stop_category, count)], style=td_style),
+            ]))
     rows.extend(build_expectancy_summary_rows(valid_results, notional_usd, round_trip_cost_pct, open_return_pct, td_style, label_prefix="Oscillator reversal scenario"))
     if oscillator_exit_specs:
         rows.append(html.Tr([html.Td("— Stochastic close realized-return spread —", style=td_style), html.Td("Only trades actually closed by stochastic conditions", style=td_style)]))
@@ -8914,6 +9329,55 @@ def build_level_reversal_summary_table(tasks, entry_offset_pct, stop_loss_pct, m
 
 
 @app.callback(
+    Output("osc-settings-status", "children"),
+    Output("osc-settings-open-dropdown", "options"),
+    Output("osc-settings-open-dropdown", "value"),
+    Input("osc-settings-save-btn", "n_clicks"),
+    State("osc-settings-name-input", "value"),
+    *[State(component_id, "value") for component_id in OSCILLATOR_SETTINGS_IDS],
+    prevent_initial_call=True,
+)
+def save_oscillator_strategy_settings(n_clicks, settings_name, *values):
+    """Persist oscillator/dynamic stochastic strategy menu values as JSON."""
+    safe_name = _safe_strategy_settings_name(settings_name)
+    if not safe_name:
+        return "❌ Enter a settings name before saving.", strategy_setting_options(), no_update
+    path = strategy_setting_path(safe_name)
+    payload = {
+        "schema_version": 1,
+        "strategy": "oscillator_level_reversal",
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "parameters": {component_id: value for component_id, value in zip(OSCILLATOR_SETTINGS_IDS, values)},
+    }
+    os.makedirs(STRATEGY_SETTINGS_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return f"✅ Saved strategy settings: {safe_name}", strategy_setting_options(), safe_name
+
+@app.callback(
+    Output("osc-settings-status", "children", allow_duplicate=True),
+    Output("osc-settings-open-dropdown", "options", allow_duplicate=True),
+    *[Output(component_id, "value") for component_id in OSCILLATOR_SETTINGS_IDS],
+    Input("osc-settings-open-btn", "n_clicks"),
+    State("osc-settings-open-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def open_oscillator_strategy_settings(n_clicks, settings_name):
+    """Load known oscillator/dynamic stochastic strategy fields from a JSON settings file."""
+    path = strategy_setting_path(settings_name)
+    if not path or not os.path.exists(path):
+        return ("❌ Choose an existing settings file to open.", strategy_setting_options(), *[no_update for _ in OSCILLATOR_SETTINGS_IDS])
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        parameters = payload.get("parameters", {}) if isinstance(payload, dict) else {}
+        values = [parameters.get(component_id, no_update) for component_id in OSCILLATOR_SETTINGS_IDS]
+        loaded_count = sum(1 for value in values if value is not no_update)
+        return (f"✅ Opened {settings_name}: loaded {loaded_count} matching parameters.", strategy_setting_options(), *values)
+    except Exception as exc:
+        return (f"❌ Could not open {settings_name}: {exc}", strategy_setting_options(), *[no_update for _ in OSCILLATOR_SETTINGS_IDS])
+
+@app.callback(
     Output("dynamic-check-status", "children"),
     Output("dynamic-check-results", "children"),
     Input("dynamic-check-run-btn", "n_clicks"),
@@ -9035,6 +9499,8 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-stoch-40-condition-input", "value"),
     State("osc-stoch-60-level-input", "value"),
     State("osc-stoch-60-condition-input", "value"),
+    State("osc-stoch-300-level-input", "value"),
+    State("osc-stoch-300-condition-input", "value"),
     State("osc-rsi-level-input", "value"),
     State("osc-rsi-condition-input", "value"),
     State("osc-down-stoch-14-level-input", "value"),
@@ -9043,6 +9509,8 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-down-stoch-40-condition-input", "value"),
     State("osc-down-stoch-60-level-input", "value"),
     State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-stoch-300-level-input", "value"),
+    State("osc-down-stoch-300-condition-input", "value"),
     State("osc-down-rsi-level-input", "value"),
     State("osc-down-rsi-condition-input", "value"),
     State("osc-reversal-sl-input", "value"),
@@ -9059,19 +9527,23 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-exit-sell-stoch-40-condition-input", "value"),
     State("osc-exit-sell-stoch-60-level-input", "value"),
     State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-sell-stoch-300-level-input", "value"),
+    State("osc-exit-sell-stoch-300-condition-input", "value"),
     State("osc-exit-buy-stoch-14-level-input", "value"),
     State("osc-exit-buy-stoch-14-condition-input", "value"),
     State("osc-exit-buy-stoch-40-level-input", "value"),
     State("osc-exit-buy-stoch-40-condition-input", "value"),
     State("osc-exit-buy-stoch-60-level-input", "value"),
     State("osc-exit-buy-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-300-level-input", "value"),
+    State("osc-exit-buy-stoch-300-condition-input", "value"),
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update, no_update
@@ -9083,12 +9555,14 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
                 stoch14_level, stoch14_condition,
                 stoch40_level, stoch40_condition,
                 stoch60_level, stoch60_condition,
+                stoch300_level, stoch300_condition,
                 rsi_level, rsi_condition,
             ),
             (
                 down_stoch14_level, down_stoch14_condition,
                 down_stoch40_level, down_stoch40_condition,
                 down_stoch60_level, down_stoch60_condition,
+                down_stoch300_level, down_stoch300_condition,
                 down_rsi_level, down_rsi_condition,
             ),
         )
@@ -9098,11 +9572,13 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
                 exit_sell_stoch14_level, exit_sell_stoch14_condition,
                 exit_sell_stoch40_level, exit_sell_stoch40_condition,
                 exit_sell_stoch60_level, exit_sell_stoch60_condition,
+                exit_sell_stoch300_level, exit_sell_stoch300_condition,
             ),
             (
                 exit_buy_stoch14_level, exit_buy_stoch14_condition,
                 exit_buy_stoch40_level, exit_buy_stoch40_condition,
                 exit_buy_stoch60_level, exit_buy_stoch60_condition,
+                exit_buy_stoch300_level, exit_buy_stoch300_condition,
             ),
         )
         tp_levels = parse_dynamic_percent_levels(tp_text)
@@ -9150,6 +9626,8 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-stoch-40-condition-input", "value"),
     State("osc-stoch-60-level-input", "value"),
     State("osc-stoch-60-condition-input", "value"),
+    State("osc-stoch-300-level-input", "value"),
+    State("osc-stoch-300-condition-input", "value"),
     State("osc-rsi-level-input", "value"),
     State("osc-rsi-condition-input", "value"),
     State("osc-down-stoch-14-level-input", "value"),
@@ -9158,6 +9636,8 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-down-stoch-40-condition-input", "value"),
     State("osc-down-stoch-60-level-input", "value"),
     State("osc-down-stoch-60-condition-input", "value"),
+    State("osc-down-stoch-300-level-input", "value"),
+    State("osc-down-stoch-300-condition-input", "value"),
     State("osc-down-rsi-level-input", "value"),
     State("osc-down-rsi-condition-input", "value"),
     State("osc-exit-enabled-input", "value"),
@@ -9167,12 +9647,16 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-exit-sell-stoch-40-condition-input", "value"),
     State("osc-exit-sell-stoch-60-level-input", "value"),
     State("osc-exit-sell-stoch-60-condition-input", "value"),
+    State("osc-exit-sell-stoch-300-level-input", "value"),
+    State("osc-exit-sell-stoch-300-condition-input", "value"),
     State("osc-exit-buy-stoch-14-level-input", "value"),
     State("osc-exit-buy-stoch-14-condition-input", "value"),
     State("osc-exit-buy-stoch-40-level-input", "value"),
     State("osc-exit-buy-stoch-40-condition-input", "value"),
     State("osc-exit-buy-stoch-60-level-input", "value"),
     State("osc-exit-buy-stoch-60-condition-input", "value"),
+    State("osc-exit-buy-stoch-300-level-input", "value"),
+    State("osc-exit-buy-stoch-300-condition-input", "value"),
     State("osc-research-entry-windows-input", "value"),
     State("osc-research-exit-windows-input", "value"),
     State("osc-research-sl-grid-input", "value"),
@@ -9185,7 +9669,7 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
     """Research optimizer for oscillator settings, windows, SLs, and stop rules."""
     if not n_clicks:
         return no_update, no_update
@@ -9195,12 +9679,14 @@ def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition
                 stoch14_level, stoch14_condition,
                 stoch40_level, stoch40_condition,
                 stoch60_level, stoch60_condition,
+                stoch300_level, stoch300_condition,
                 rsi_level, rsi_condition,
             ),
             (
                 down_stoch14_level, down_stoch14_condition,
                 down_stoch40_level, down_stoch40_condition,
                 down_stoch60_level, down_stoch60_condition,
+                down_stoch300_level, down_stoch300_condition,
                 down_rsi_level, down_rsi_condition,
             ),
         )
@@ -9210,11 +9696,13 @@ def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition
                 exit_sell_stoch14_level, exit_sell_stoch14_condition,
                 exit_sell_stoch40_level, exit_sell_stoch40_condition,
                 exit_sell_stoch60_level, exit_sell_stoch60_condition,
+                exit_sell_stoch300_level, exit_sell_stoch300_condition,
             ),
             (
                 exit_buy_stoch14_level, exit_buy_stoch14_condition,
                 exit_buy_stoch40_level, exit_buy_stoch40_condition,
                 exit_buy_stoch60_level, exit_buy_stoch60_condition,
+                exit_buy_stoch300_level, exit_buy_stoch300_condition,
             ),
         )
         entry_windows = [int(v) for v in parse_dynamic_percent_levels(entry_windows_text, default_levels=(1, 3, 5))]
