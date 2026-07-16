@@ -6896,6 +6896,7 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     forceGraphDragmode(fig.layout.dragmode);
     const showHover = (!measureMode || measureHover);
     fig.layout.hovermode = showHover ? 'x' : false;
+    fig.layout.hoversubplots = showHover ? 'axis' : false;
 
     const meta = fig.layout.meta || {};
     const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
@@ -6906,6 +6907,7 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
             fig.layout[key].spikecolor = '#666';
             fig.layout[key].spikethickness = 1;
             fig.layout[key].spikedash = 'dash';
+            fig.layout[key].spikesnap = 'cursor';
             if (extendX && targetRange && targetRange.length === 2) {
                 fig.layout[key].range = targetRange;
                 fig.layout[key].autorange = false;
@@ -6918,8 +6920,20 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
     (fig.data || []).forEach(function(trace) {
-        const isHelper = trace.name && String(trace.name).startsWith('_');
-        if (!showHover || !infoBox || isHelper) {
+        const traceName = trace.name ? String(trace.name) : '';
+        const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
+        const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
+        if (!showHover || isHelper) {
+            trace.hoverinfo = 'skip';
+            trace.hovertemplate = null;
+            return;
+        }
+        if (isSpikeHoverHelper) {
+            delete trace.hoverinfo;
+            trace.hovertemplate = infoBox ? '%{x|%Y-%m-%d %H:%M}<extra></extra>' : '<extra></extra>';
+            return;
+        }
+        if (!infoBox) {
             trace.hoverinfo = 'skip';
             trace.hovertemplate = null;
             return;
