@@ -7003,10 +7003,16 @@ function(figure) {
             const rects = plotBgs.map(function(bg) { return bg.getBoundingClientRect(); })
                 .filter(function(rect) { return rect && rect.width > 0 && rect.height > 0; });
             if (rects.length) {
-                const left = Math.min.apply(null, rects.map(function(rect) { return rect.left; }));
-                const right = Math.max.apply(null, rects.map(function(rect) { return rect.right; }));
-                const top = Math.min.apply(null, rects.map(function(rect) { return rect.top; }));
-                const bottom = Math.max.apply(null, rects.map(function(rect) { return rect.bottom; }));
+                let left = rects[0].left;
+                let right = rects[0].right;
+                let top = rects[0].top;
+                let bottom = rects[0].bottom;
+                rects.slice(1).forEach(function(rect) {
+                    if (rect.left < left) left = rect.left;
+                    if (rect.right > right) right = rect.right;
+                    if (rect.top < top) top = rect.top;
+                    if (rect.bottom > bottom) bottom = rect.bottom;
+                });
                 return {left: left || svgRect.left, right: right || svgRect.right, top: top || svgRect.top, bottom: bottom || svgRect.bottom, height: bottom - top};
             }
         }
