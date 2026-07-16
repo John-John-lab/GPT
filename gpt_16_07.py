@@ -799,20 +799,36 @@ oscillator_reversal_source_cache = OrderedDict()
 CHART_PARQUET_CACHE_MAX = 24
 chart_parquet_cache = OrderedDict()
 
-def read_chart_parquet_cached(fp):
-    """Read chart source parquet with a small mtime-aware cache for fast task switching."""
+def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
+    """Read only the chart period, with a bounded mtime-aware cache.
+
+    Market-data files can contain years of one-minute candles. Reading the
+    entire file before slicing a task period made the first chart open compete
+    with the UI and old SSD for several seconds. Parquet predicate filters keep
+    the chart read-only and preserve the exact same inclusive time bounds while
+    allowing PyArrow to skip unrelated row groups.
+    """
     stat = os.stat(fp)
-    cache_key = (fp, stat.st_mtime_ns, stat.st_size)
+    cache_key = (fp, stat.st_mtime_ns, stat.st_size, start_ms, end_ms)
     cached = chart_parquet_cache.get(cache_key)
     if cached is not None:
         chart_parquet_cache.move_to_end(cache_key)
         return cached
 
-    # Drop stale versions of the same file before reading the current one.
-    for old_key in [key for key in chart_parquet_cache if key[0] == fp]:
+    # Drop stale file versions, but retain other cached task ranges from the
+    # current immutable parquet version for fast previous/next navigation.
+    for old_key in [
+        key for key in chart_parquet_cache
+        if key[0] == fp and (key[1] != stat.st_mtime_ns or key[2] != stat.st_size)
+    ]:
         chart_parquet_cache.pop(old_key, None)
 
-    df = pd.read_parquet(fp)
+    filters = []
+    if start_ms is not None:
+        filters.append(("timestamp", ">=", int(start_ms)))
+    if end_ms is not None:
+        filters.append(("timestamp", "<=", int(end_ms)))
+    df = pd.read_parquet(fp, filters=filters or None)
     chart_parquet_cache[cache_key] = df
     chart_parquet_cache.move_to_end(cache_key)
     while len(chart_parquet_cache) > CHART_PARQUET_CACHE_MAX:
@@ -3123,6 +3139,10 @@ document.addEventListener('click', function(e) {
                     // Use CustomEvent to trigger Dash updates (Dash 4.x compatible)
                     if (actionType === 'chart') {
                         applyChartRowHighlight(taskId);
+                        // Show the shell immediately instead of waiting for a
+                        // server callback and parquet/figure construction.
+                        const chartModal = document.getElementById('chart-modal');
+                        if (chartModal) chartModal.style.display = 'flex';
                         pushDashStore('chart-button-trigger', {task_id: taskId, action: actionType}, 'dash-chart-trigger');
                     } else if (actionType === 'details') {
                         pushDashStore('strategy-details-trigger', {task_id: taskId, action: actionType}, 'dash-details-trigger');
@@ -3586,10 +3606,14 @@ def build_root_layout():
                             }),
                         ]
                     ),
-                    dcc.Graph(
-                        id="task-chart",
+                    dcc.Loading(
+                        dcc.Graph(
+                            id="task-chart",
+                            style={"flex": "1", "minHeight": "0"},
+                            config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect", "eraseshape"]}
+                        ),
+                        type="circle",
                         style={"flex": "1", "minHeight": "0"},
-                        config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect", "eraseshape"]}
                     ),
                     html.Div(id="measure-hint", style={"color": "#333", "fontSize": "12px", "textAlign": "center", "marginTop": "5px"}),
                     html.Div(id="measure-result", style={"color": "black", "marginTop": "10px", "textAlign": "center", "fontSize": "14px"})
@@ -4916,7 +4940,10 @@ def update_progress(_, stores):
             continue
         task = tm.get_task(tid)
         if task:
-            logs.append("\n".join(task.log) if task.log else "No logs yet...")
+            # Never ship an unbounded task log through the browser every ten
+            # seconds. This periodic payload could monopolize Dash rendering
+            # exactly when a chart control was clicked.
+            logs.append("\n".join(task.log[-200:]) if task.log else "No logs yet...")
             progs.append(str(task.progress))
             rem = max(0, task.total_candles - task.downloaded_candles) if task.total_candles else 0
             texts.append(f"{task.progress:.1f}%  {task.downloaded_candles}/{task.total_candles}/{rem}")
@@ -6535,38 +6562,30 @@ def auto_throttle_updates(_):
 
 # ----- NEW: Callback for chart button using data-action pattern -----
 # This callback listens to the hidden trigger that JS sets when chart button is clicked
-@app.callback(
+clientside_callback(
+    """
+function(triggerData, clickStore) {
+    if (!triggerData || !triggerData.task_id || triggerData.action !== 'chart') {
+        return [window.dash_clientside.no_update, window.dash_clientside.no_update, window.dash_clientside.no_update];
+    }
+    const taskId = String(triggerData.task_id);
+    const store = Object.assign({}, clickStore || {});
+    const key = taskId + '_chart';
+    const nowSeconds = Date.now() / 1000;
+    if (nowSeconds - Number(store[key] || 0) < 0.5) {
+        return [window.dash_clientside.no_update, window.dash_clientside.no_update, window.dash_clientside.no_update];
+    }
+    store[key] = nowSeconds;
+    return [taskId, store, {events: [], index: 0, overlay: false}];
+}
+""",
     Output("chart-task-id", "data"),
     Output("chart-click-store", "data"),
     Output("chart-event-context-store", "data"),
-    Input("chart-button-trigger", "data"),  # Hidden trigger set by JS
+    Input("chart-button-trigger", "data"),
     State("chart-click-store", "data"),
-    prevent_initial_call=True
+    prevent_initial_call=True,
 )
-def set_chart_task_id(trigger_data, click_store):
-    if not trigger_data:
-        return no_update, no_update, no_update
-    
-    task_id = trigger_data.get("task_id")
-    action = trigger_data.get("action")
-    
-    if not task_id or action != "chart":
-        return no_update, no_update, no_update
-
-    if click_store is None:
-        click_store = {}
-    
-    # Deduplication logic
-    key = f"{task_id}_chart"
-    current_time = time.time()
-    old_time = click_store.get(key, 0)
-    
-    # Only process if this is a new click (within 0.5 seconds)
-    if current_time - old_time < 0.5:
-        return no_update, no_update, no_update
-    
-    click_store[key] = current_time
-    return task_id, click_store, {"events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
 @app.callback(
@@ -6743,14 +6762,28 @@ def toggle_chart_extend_x(n_clicks, current):
     return not current
 
 # ----- Measurement tool callbacks -----
-@app.callback(
+clientside_callback(
+    """
+function(nClicks, current) {
+    if (!nClicks) return window.dash_clientside.no_update;
+    const active = !Boolean(current);
+    // Give immediate visual feedback even if unrelated server callbacks are
+    // busy rendering the task table or an indicator figure.
+    const button = document.getElementById('toggle-measure-btn');
+    if (button) {
+        button.textContent = active ? '📏 Measuring' : 'Measure';
+        button.style.background = active ? '#e3f2fd' : 'transparent';
+        button.style.border = active ? '2px solid #1976d2' : '1px solid black';
+        button.style.fontWeight = active ? 'bold' : 'normal';
+    }
+    return active;
+}
+""",
     Output("measure-mode-store", "data"),
     Input("toggle-measure-btn", "n_clicks"),
     State("measure-mode-store", "data"),
-    prevent_initial_call=True
+    prevent_initial_call=True,
 )
-def toggle_measure(n_clicks, current):
-    return not current
 
 @app.callback(
     Output("measure-anchor-store", "data"),
@@ -6902,101 +6935,79 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
-    const fig = JSON.parse(JSON.stringify(figure));
-    fig.layout = fig.layout || {};
-    function forceGraphDragmode(mode) {
-        window.setTimeout(function() {
-            const root = document.getElementById('task-chart');
-            const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
-            if (plot && window.Plotly && mode) {
-                window.Plotly.relayout(plot, {dragmode: mode});
-            }
-        }, 0);
-    }
-    function applyStoredRanges(targetFig, storedView, skipX) {
-        if (!storedView || String(storedView.task_id || '') !== String(chartTaskId || '')) return;
-        const axes = storedView && storedView.axes ? storedView.axes : {};
-        Object.keys(axes).forEach(function(axisName) {
-            const axisState = axes[axisName] || {};
-            if (skipX && /^xaxis[0-9]*$/.test(axisName)) return;
-            const targetAxis = targetFig.layout[axisName];
-            if (!targetAxis) return;
-            if (axisState.range && axisState.range.length === 2) {
-                targetAxis.range = axisState.range.slice();
-                targetAxis.autorange = false;
-            } else if (axisState.autorange) {
-                delete targetAxis.range;
-                targetAxis.autorange = true;
-            }
-        });
-    }
-    fig.layout.dragmode = measureMode ? 'drawrect' : 'pan';
-    forceGraphDragmode(fig.layout.dragmode);
-    const showHover = (!measureMode || measureHover);
-    fig.layout.hovermode = showHover ? 'x' : false;
-    fig.layout.hoversubplots = showHover ? 'axis' : false;
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (!plot || !window.Plotly) return window.dash_clientside.no_update;
 
-    const meta = fig.layout.meta || {};
+    // Do not deep-clone and return the complete chart. Large candle figures
+    // made that old path serialize/reconcile every point for a UI-only toggle.
+    const layoutUpdate = {dragmode: measureMode ? 'drawrect' : 'pan'};
+    const showHover = (!measureMode || measureHover);
+    layoutUpdate.hovermode = showHover ? 'x' : false;
+    layoutUpdate.hoversubplots = showHover ? 'axis' : false;
+
+    const meta = figure.layout.meta || {};
     const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
-    Object.keys(fig.layout).forEach(function(key) {
+    Object.keys(figure.layout).forEach(function(key) {
         if (/^xaxis[0-9]*$/.test(key)) {
-            fig.layout[key].showspikes = false;
-            fig.layout[key].spikemode = 'across+toaxis';
-            fig.layout[key].spikecolor = '#666';
-            fig.layout[key].spikethickness = 1;
-            fig.layout[key].spikedash = 'dash';
-            fig.layout[key].spikesnap = 'cursor';
+            layoutUpdate[key + '.showspikes'] = false;
+            layoutUpdate[key + '.spikemode'] = 'across+toaxis';
+            layoutUpdate[key + '.spikecolor'] = '#666';
+            layoutUpdate[key + '.spikethickness'] = 1;
+            layoutUpdate[key + '.spikedash'] = 'dash';
+            layoutUpdate[key + '.spikesnap'] = 'cursor';
             if (extendX && targetRange && targetRange.length === 2) {
-                fig.layout[key].range = targetRange;
-                fig.layout[key].autorange = false;
+                layoutUpdate[key + '.range'] = targetRange;
+                layoutUpdate[key + '.autorange'] = false;
             }
         }
         if (/^yaxis[0-9]*$/.test(key)) {
-            fig.layout[key].showspikes = false;
+            layoutUpdate[key + '.showspikes'] = false;
         }
     });
+    if (!extendX && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
+        const axes = viewState.axes || {};
+        Object.keys(axes).forEach(function(axisName) {
+            const axisState = axes[axisName] || {};
+            if (axisState.range && axisState.range.length === 2) {
+                layoutUpdate[axisName + '.range'] = axisState.range.slice();
+                layoutUpdate[axisName + '.autorange'] = false;
+            } else if (axisState.autorange) {
+                layoutUpdate[axisName + '.autorange'] = true;
+            }
+        });
+    }
+    window.Plotly.relayout(plot, layoutUpdate);
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
-    (fig.data || []).forEach(function(trace) {
+    (figure.data || []).forEach(function(trace, index) {
         const traceName = trace.name ? String(trace.name) : '';
         const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
         const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
+        let hoverinfo = null;
+        let hovertemplate = null;
         if (!showHover || isHelper) {
-            trace.hoverinfo = 'skip';
-            trace.hovertemplate = null;
-            return;
-        }
-        if (isSpikeHoverHelper) {
-            delete trace.hoverinfo;
-            trace.hovertemplate = infoBox ? '%{x|%Y-%m-%d %H:%M}<extra></extra>' : '<extra></extra>';
-            return;
-        }
-        if (!infoBox) {
-            trace.hoverinfo = 'skip';
-            trace.hovertemplate = null;
-            return;
-        }
-        if (trace.type === 'candlestick') {
-            delete trace.hoverinfo;
-            trace.hovertemplate = candleTemplate;
+            hoverinfo = 'skip';
+        } else if (isSpikeHoverHelper) {
+            hovertemplate = infoBox ? '%{x|%Y-%m-%d %H:%M}<extra></extra>' : '<extra></extra>';
+        } else if (!infoBox) {
+            hoverinfo = 'skip';
+        } else if (trace.type === 'candlestick') {
+            hovertemplate = candleTemplate;
         } else if (trace.name && String(trace.name).includes('Volume')) {
-            delete trace.hoverinfo;
-            trace.hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
+            hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
         } else if (trace.name && String(trace.name).includes('RSI')) {
-            delete trace.hoverinfo;
-            trace.hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
+            hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
         } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
-            delete trace.hoverinfo;
             const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
-            trace.hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+            hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
         }
+        window.Plotly.restyle(plot, {hoverinfo: hoverinfo, hovertemplate: hovertemplate}, [index]);
     });
-    applyStoredRanges(fig, viewState, Boolean(extendX));
-    fig.layout.uirevision = fig.layout.uirevision || 'chart';
-    return fig;
+    return {ts: Date.now(), measure: Boolean(measureMode), hover: Boolean(showHover)};
 }
 """,
-    Output("task-chart", "figure", allow_duplicate=True),
+    Output("chart-dragmode-enforcer-store", "data", allow_duplicate=True),
     Input("measure-mode-store", "data"),
     Input("measure-hover-store", "data"),
     Input("chart-info-box-store", "data"),
@@ -7620,12 +7631,21 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     fp = os.path.join(path, "data.parquet")
     if not os.path.exists(fp):
         return go.Figure()
-    df_source = read_chart_parquet_cached(fp)
+    # Resolve the task's inclusive period before touching candle data so the
+    # parquet reader can avoid loading years of unrelated history.
+    start_ms = int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.start_date else 0
+    if task.end_date:
+        end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    else:
+        timestamp_only = pd.read_parquet(fp, columns=["timestamp"], filters=[("timestamp", ">=", start_ms)])
+        if timestamp_only.empty:
+            return go.Figure()
+        end_ms = int(timestamp_only["timestamp"].max())
+    df_source = read_chart_parquet_cached(fp, start_ms, end_ms)
     if df_source.empty:
         return go.Figure()
-    # Filter period
-    start_ms = int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.start_date else 0
-    end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.end_date else df_source['timestamp'].max()
+    # Keep this defensive inclusive slice even though the parquet predicates
+    # use the same bounds; it preserves the original chart-period semantics.
     df = df_source[(df_source['timestamp'] >= start_ms) & (df_source['timestamp'] <= end_ms)].copy()
     if df.empty:
         return go.Figure()
