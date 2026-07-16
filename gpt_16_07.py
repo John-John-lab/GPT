@@ -39,7 +39,8 @@ from database import (
     register_database_callbacks,
     MARKET_DATA_DIR,
     INTERVAL_MS,
-    DUCKDB_AVAILABLE
+    DUCKDB_AVAILABLE,
+    em,
 )
 
 # =============================================================================
@@ -3954,6 +3955,27 @@ def build_tasks_tab_layout():
                 "Optional load override is used only in RAM for this load. Before applying it, every task is checked for a continuous candle range from the requested start through its signal.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "8px"},
             ),
+            html.Div([
+                dcc.Input(
+                    id="update-json-pre-signal-minutes",
+                    type="number",
+                    min=0,
+                    step=1,
+                    placeholder="new min before signal",
+                    style={"width": "205px", "marginRight": "10px"},
+                ),
+                html.Button(
+                    "⬇️ Prepare loaded tasks for new JSON",
+                    id="update-json-pre-signal-btn",
+                    n_clicks=0,
+                    title="Verify/download missing pre-signal candles, then update loaded task periods in RAM. Use Save Tasks to write a new file.",
+                ),
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
+            html.Div(
+                "This does not overwrite the selected JSON. When finished, choose a new filename and press Save Tasks.",
+                style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
+            ),
+            html.Div(id="update-json-pre-signal-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "8px"}),
             html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
         html.Div(id="bulk-rerun-status", style={"marginBottom": "10px", "color": "#1565c0", "fontFamily": "monospace", "minHeight": "20px"}),
         html.Div(id="recalc-status-bar", style={"marginBottom": "10px", "color": "#d84315", "fontFamily": "monospace", "minHeight": "20px", "fontWeight": "bold"}),
@@ -10930,6 +10952,196 @@ def check_pre_signal_database_coverage(task_data, minutes, timestamp_cache=None)
         return True, requested_start_ms
     except Exception as exc:
         return False, f"coverage check failed: {exc}"
+
+
+json_period_update_state = {
+    "running": False,
+    "progress": 0.0,
+    "message": "Idle.",
+    "lock": threading.Lock(),
+}
+
+
+def _set_json_period_update_state(message=None, progress=None, running=None):
+    with json_period_update_state["lock"]:
+        if message is not None:
+            json_period_update_state["message"] = message
+        if progress is not None:
+            json_period_update_state["progress"] = float(progress)
+        if running is not None:
+            json_period_update_state["running"] = bool(running)
+
+
+def _task_coverage_dict(task):
+    return {
+        "task_id": task.task_id,
+        "symbols": list(task.symbols),
+        "timeframe": task.timeframe,
+        "signal_time": task.signal_time,
+    }
+
+
+def _prepare_loaded_tasks_for_new_json(tasks, minutes):
+    """Download verified missing history, then atomically update task periods in RAM."""
+    try:
+        total = len(tasks)
+        for index, task in enumerate(tasks, 1):
+            task_data = _task_coverage_dict(task)
+            requested_start = max(0, int(float(task.signal_time)) - minutes * 60_000)
+            _set_json_period_update_state(
+                f"[{index}/{total}] Checking {task.symbols[0]} {task.timeframe}...",
+                (index - 1) / total * 90,
+            )
+            attempts = 0
+            while True:
+                available, detail = check_pre_signal_database_coverage(task_data, minutes)
+                if available:
+                    break
+                attempts += 1
+                if attempts > 20:
+                    raise RuntimeError(
+                        f"{str(task.task_id)[:8]}: unable to make requested range continuous ({detail})"
+                    )
+                signal_ms = int(float(task.signal_time))
+                info = get_database_info(force_refresh=True)
+                containing = next((
+                    period for period in info["details"]
+                    if period["symbol"] == task.symbols[0]
+                    and str(period["timeframe"]) == str(task.timeframe)
+                    and period["start_ms"] <= signal_ms <= period["end_ms"]
+                ), None)
+                if containing is None:
+                    raise RuntimeError(
+                        f"{str(task.task_id)[:8]}: no stored period contains the signal candle; "
+                        "safe extension has no trusted anchor"
+                    )
+                missing_minutes = max(
+                    1,
+                    int(math.ceil((containing["start_ms"] - requested_start) / 60_000)),
+                )
+                fp = os.path.join(
+                    symbol_timeframe_path(task.symbols[0], str(task.timeframe)), "data.parquet"
+                )
+                before = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
+                _set_json_period_update_state(
+                    f"[{index}/{total}] Downloading verified missing history for "
+                    f"{task.symbols[0]} {task.timeframe} (up to {missing_minutes} minutes)..."
+                )
+                em._extend_left(
+                    task.symbols[0], str(task.timeframe), missing_minutes,
+                    progress_base=(index - 1) / total * 90,
+                    progress_span=90 / total,
+                    period_start=containing["start_ms"],
+                )
+                after = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
+                clear_parquet_cache()
+                if after == before:
+                    available, reason = check_pre_signal_database_coverage(task_data, minutes)
+                    if not available:
+                        raise RuntimeError(
+                            f"{str(task.task_id)[:8]}: Bybit supplied no usable candles ({reason})"
+                        )
+
+        # Recheck every task after all downloads before changing task metadata.
+        coverage_cache = {}
+        starts = {}
+        for task in tasks:
+            available, detail = check_pre_signal_database_coverage(
+                _task_coverage_dict(task), minutes, coverage_cache
+            )
+            if not available:
+                raise RuntimeError(f"{str(task.task_id)[:8]} final verification failed: {detail}")
+            starts[str(task.task_id)] = int(detail)
+
+        with tm.lock:
+            for task in tasks:
+                task.pre_buffer_minutes = minutes
+                task.start_date = datetime.fromtimestamp(
+                    starts[str(task.task_id)] / 1000.0, tz=timezone.utc
+                )
+                for attr in (
+                    "_load_pre_signal_override_minutes", "_load_chart_start_ms",
+                    "_load_original_pre_buffer_minutes",
+                ):
+                    if hasattr(task, attr):
+                        delattr(task, attr)
+                if hasattr(task, "_chart_cache"):
+                    task._chart_cache.clear()
+            snapshot = list(tm.tasks.values())
+        publish_golden_task_snapshot(snapshot, reason="json_period_update")
+        _set_json_period_update_state(
+            f"✅ Finished. Updated {len(tasks)} loaded tasks to {minutes} minutes before signal. "
+            "Database coverage is continuous and verified. Enter a new filename and press Save Tasks.",
+            100,
+        )
+    except Exception as exc:
+        _set_json_period_update_state(
+            f"❌ Stopped safely: {exc}. Task period metadata was not updated; any successfully "
+            "validated candle downloads remain available with backups.",
+        )
+    finally:
+        with em.lock:
+            em.running = False
+        _set_json_period_update_state(running=False)
+
+
+@app.callback(
+    Output("update-json-pre-signal-status", "children"),
+    Input("update-json-pre-signal-btn", "n_clicks"),
+    State("update-json-pre-signal-minutes", "value"),
+    prevent_initial_call=True,
+)
+def start_json_period_update(_clicks, minutes_value):
+    try:
+        minutes = int(minutes_value)
+    except (TypeError, ValueError):
+        return "❌ Enter a whole number of minutes before signal."
+    if minutes < 0:
+        return "❌ Minutes cannot be negative."
+    tasks = tm.get_all_tasks()
+    if not tasks:
+        return "⚠️ Load tasks before preparing a new JSON."
+    with json_period_update_state["lock"]:
+        if json_period_update_state["running"]:
+            return "⚠️ JSON period update is already running."
+    with em.lock:
+        if em.running:
+            return "⚠️ Another safe market-data extension is already running. Please wait."
+        em.running = True
+        em.progress = 0.0
+        em.status = "Starting JSON period update..."
+        em.log = []
+    _set_json_period_update_state(
+        f"▶️ Starting verification/download for {len(tasks)} loaded tasks...",
+        0,
+        True,
+    )
+    threading.Thread(
+        target=_prepare_loaded_tasks_for_new_json,
+        args=(list(tasks), minutes),
+        daemon=True,
+    ).start()
+    return f"▶️ Started for {len(tasks)} tasks. Progress updates below."
+
+
+@app.callback(
+    Output("update-json-pre-signal-status", "children", allow_duplicate=True),
+    Input("recalc-status-interval", "n_intervals"),
+    prevent_initial_call=True,
+)
+def poll_json_period_update(_interval):
+    with json_period_update_state["lock"]:
+        running = json_period_update_state["running"]
+        message = json_period_update_state["message"]
+        progress = json_period_update_state["progress"]
+        if not running and message == "Idle.":
+            return no_update
+    if running:
+        _em_running, em_progress, em_status, _em_log = em.get_state()
+        if em_status and em_status != "Starting JSON period update...":
+            message = f"{message} | {em_status}"
+        progress = max(progress, em_progress)
+    return f"{message} [{progress:.1f}%]"
 
 
 @app.callback(
