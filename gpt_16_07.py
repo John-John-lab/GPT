@@ -3313,6 +3313,18 @@ def serve_task_card(task_id):
 '''
     return html_str
 
+CHART_PANEL_STYLE = {
+    "position": "relative",
+    "width": "100%",
+    "backgroundColor": "#f4f6f8",
+    "justifyContent": "center",
+    "alignItems": "stretch",
+    "marginTop": "18px",
+    "padding": "10px 0 24px 0",
+    "borderTop": "2px solid #c8d2dc",
+}
+
+
 def build_root_layout():
     """Build the root Dash layout.
 
@@ -3369,27 +3381,17 @@ def build_root_layout():
         dcc.Tab(label="Data Analysis", value="tab-analysis"),
     ]),
     html.Div(id="tab-content"),
-    # Modal overlay for chart (full-screen, high z-index)
+    # Inline chart panel. It intentionally follows tab-content in document flow
+    # so a cold chart load never covers the task and summary tables.
     html.Div(
         id="chart-modal",
-        style={
-            "display": "none",
-            "position": "fixed",
-            "top": "0",
-            "left": "0",
-            "width": "100vw",
-            "height": "100vh",
-            "backgroundColor": "rgba(240,240,240,0.95)",   # light overlay
-            "zIndex": "9999",
-            "justifyContent": "center",
-            "alignItems": "center"
-        },
+        style={**CHART_PANEL_STYLE, "display": "none"},
         children=[
             html.Div(
                 style={
                     "backgroundColor": "#ffffff",   # white background
-                    "width": "90%",
-                    "height": "90%",
+                    "width": "96%",
+                    "minHeight": "720px",
                     "borderRadius": "8px",
                     "padding": "50px 20px 20px 20px",
                     "position": "relative",
@@ -6598,9 +6600,9 @@ function(triggerData, clickStore) {
 def toggle_chart_modal(task_id, click_store, close_clicks):
     triggered = ctx.triggered_id
     if triggered == "close-chart-modal":
-        return {"display": "none"}
+        return {**CHART_PANEL_STYLE, "display": "none"}
     if task_id:
-        return {"display": "flex"}
+        return {**CHART_PANEL_STYLE, "display": "flex"}
     return no_update
 
 @app.callback(
@@ -7149,22 +7151,32 @@ function(figure) {
 
 clientside_callback(
     """
-function(relayoutData, measureMode) {
-    if (!measureMode || !relayoutData || !relayoutData.dragmode || relayoutData.dragmode === 'drawrect') {
+function(relayoutData, figure, measureMode) {
+    if (!measureMode) {
         return window.dash_clientside.no_update;
     }
-    window.setTimeout(function() {
+    if (relayoutData && relayoutData.dragmode === 'drawrect') {
+        return window.dash_clientside.no_update;
+    }
+    function forceMeasureMode() {
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
-        if (plot && window.Plotly) {
+        if (plot && window.Plotly && plot.layout && plot.layout.dragmode !== 'drawrect') {
             window.Plotly.relayout(plot, {dragmode: 'drawrect'});
         }
-    }, 0);
-    return {ts: Date.now(), forced: 'drawrect', previous: relayoutData.dragmode};
+    }
+    // A server-rendered indicator/measurement figure arrives after the Store
+    // has already said Measure is active. Reassert drawrect after Plotly has
+    // reconciled that figure so its default pan mode cannot win the race.
+    window.setTimeout(forceMeasureMode, 0);
+    window.setTimeout(forceMeasureMode, 60);
+    window.setTimeout(forceMeasureMode, 200);
+    return {ts: Date.now(), forced: 'drawrect', previous: relayoutData ? relayoutData.dragmode : null};
 }
 """,
     Output("chart-dragmode-enforcer-store", "data"),
     Input("task-chart", "relayoutData"),
+    Input("task-chart", "figure"),
     State("measure-mode-store", "data"),
     prevent_initial_call=True,
 )
@@ -7614,9 +7626,10 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("measure-result-store", "data"),
     Input("chart-event-context-store", "data"),
     State("chart-view-state-store", "data"),
+    State("measure-mode-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state, measure_mode):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -8094,7 +8107,10 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         hoverdistance=24,
         spikedistance=-1,
         clickmode="event+select",
-        dragmode="pan",
+        # Measure is a State, not an Input: clicking Measure stays clientside
+        # and does not rebuild the figure, while any later genuine rebuild
+        # still preserves the active ruler mode instead of reverting to pan.
+        dragmode="drawrect" if measure_mode else "pan",
         newshape=dict(line_color="#1976d2", fillcolor="rgba(25,118,210,0.08)", opacity=0.35),
         height=980 if stochastic_visible else (780 if sum(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible, disparity_visible)) >= 2 else (700 if any(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible, disparity_visible)) else 500)),
         margin=dict(l=50, r=50, t=50, b=50),
