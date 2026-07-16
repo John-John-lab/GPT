@@ -80,24 +80,57 @@ def _database_file_signature():
     return tuple(sorted(signature))
 
 
-def _read_parquet_summary(fp):
-    """Read only the timestamp column to keep tab switching fast."""
+def _split_contiguous_periods(timestamps, interval_ms):
+    """Return inclusive contiguous timestamp segments for one timeframe."""
+    numeric = pd.to_numeric(timestamps, errors="coerce")
+    if numeric.isna().any():
+        raise ValueError("timestamp column contains null or non-numeric values")
+    ordered = np.sort(numeric.astype("int64").unique())
+    if not len(ordered):
+        return []
+    break_positions = np.flatnonzero(np.diff(ordered) != int(interval_ms)) + 1
+    groups = np.split(ordered, break_positions)
+    return [
+        {"start_ms": int(group[0]), "end_ms": int(group[-1]), "candles": int(len(group))}
+        for group in groups if len(group)
+    ]
+
+
+def _read_parquet_summary(fp, timeframe):
+    """Read timestamps only and report every gap-separated candle period."""
+    interval_ms = INTERVAL_MS.get(str(timeframe))
+    if interval_ms is None:
+        raise ValueError(f"unsupported timeframe folder: {timeframe}")
     ts = pd.read_parquet(fp, columns=["timestamp"])["timestamp"]
-    if ts.empty:
-        return None
-    size = os.path.getsize(fp)
-    return {
-        "start": pd.to_datetime(ts.min(), unit="ms"),
-        "end": pd.to_datetime(ts.max(), unit="ms"),
-        "candles": len(ts),
-        "size": size,
-    }
+    periods = _split_contiguous_periods(ts, interval_ms)
+    numeric_ts = pd.to_numeric(ts, errors="coerce")
+    duplicate_timestamps = int(numeric_ts.duplicated().sum())
+    unaligned_timestamps = int((numeric_ts % interval_ms != 0).sum())
+    file_size = os.path.getsize(fp)
+    period_count = len(periods)
+    summaries = []
+    for index, period in enumerate(periods, 1):
+        summaries.append({
+            "start": pd.to_datetime(period["start_ms"], unit="ms"),
+            "end": pd.to_datetime(period["end_ms"], unit="ms"),
+            "start_ms": period["start_ms"],
+            "end_ms": period["end_ms"],
+            "candles": period["candles"],
+            "period_index": index,
+            "period_count": period_count,
+            "file_size": file_size,
+            "duplicate_timestamps": duplicate_timestamps,
+            "unaligned_timestamps": unaligned_timestamps,
+            # Count each physical file once in table totals/display.
+            "size": file_size if index == 1 else 0,
+        })
+    return summaries
 
 
 def get_database_info(force_refresh=False):
     """
     Walk the market_data folder and collect metadata about each Parquet file.
-    Safely skips corrupted files and prints their paths for manual cleanup.
+    Safely skips unreadable files without deleting or modifying them.
     """
     signature = _database_file_signature()
     now = time.time()
@@ -111,7 +144,7 @@ def get_database_info(force_refresh=False):
         return cached["info"]
 
     details, total_size, symbols = [], 0, set()
-    corrupted_files = []
+    unreadable_files = []
     for fp, file_size, _ in signature:
         rel = os.path.relpath(os.path.dirname(fp), MARKET_DATA_DIR).split(os.sep)
         if len(rel) != 2:
@@ -120,27 +153,33 @@ def get_database_info(force_refresh=False):
         symbols.add(sym)
         total_size += file_size
         try:
-            summary = _read_parquet_summary(fp)
-            if summary:
+            summaries = _read_parquet_summary(fp, tf)
+            for summary in summaries:
                 details.append({
                     "symbol": sym,
                     "timeframe": tf,
                     **summary,
                 })
         except Exception as e:
-            corrupted_files.append(fp)
-            print(f"⚠️ Skipping corrupted file: {fp} ({e})")
+            unreadable_files.append((fp, str(e)))
+            print(f"⚠️ Preserving but skipping unreadable market-data file: {fp} ({e})")
                     
-    if corrupted_files:
+    if unreadable_files:
         print("\n" + "="*60)
-        print("⚠️ CORRUPTED PARQUET FILES DETECTED ⚠️")
-        print("These files will cause crashes. Delete them and re-download:")
-        for f in corrupted_files:
-            folder = os.path.dirname(f)
-            print(f"  🗑️ rm -rf '{folder}'")
+        print("⚠️ UNREADABLE MARKET-DATA FILES DETECTED ⚠️")
+        print("No file was changed or deleted. Keep the original and its backups;")
+        print("inspect/restore it manually before considering a fresh download:")
+        for file_path, error in unreadable_files:
+            print(f"  • {file_path}: {error}")
         print("="*60 + "\n")
         
-    info = {"size": total_size, "symbols": len(symbols), "details": details}
+    details.sort(key=lambda item: (item["symbol"], item["timeframe"], item["start_ms"]))
+    info = {
+        "size": total_size,
+        "symbols": len(symbols),
+        "details": details,
+        "unreadable_files": unreadable_files,
+    }
     _DATABASE_INFO_CACHE.update({"signature": signature, "created": now, "info": info})
     return info
 
@@ -250,15 +289,19 @@ class VerificationManager:
                                 self.add_log(f"  ⚠ Duplicates: {dups}")
                             else:
                                 self.add_log(f"  ✓ No duplicates")
-                            interval_ms = INTERVAL_MS.get(timeframe, 60000)
+                            interval_ms = INTERVAL_MS.get(timeframe)
+                            if interval_ms is None:
+                                self.add_log(f"  ✗ Unsupported timeframe folder: {timeframe}")
+                                continue
                             if len(df) > 1:
-                                diffs = df["timestamp"].diff().iloc[1:].astype('int64')
-                                threshold_ns = interval_ms * 1_000_000 * 1.5
-                                gaps = diffs[diffs > threshold_ns]
+                                ordered_ts = pd.to_numeric(df["timestamp"], errors="coerce").sort_values()
+                                diffs = ordered_ts.diff().iloc[1:]
+                                gaps = diffs[diffs > interval_ms]
                                 if not gaps.empty:
                                     self.add_log(f"  ⚠ Gaps: {len(gaps)} detected")
                                     for i, gap in enumerate(gaps.head(5)):
-                                        self.add_log(f"    Gap {i+1}: {gap/1e6:.1f} ms ({gap/60000:.1f} minutes)")
+                                        missing = max(0, int(gap // interval_ms) - 1)
+                                        self.add_log(f"    Gap {i+1}: {gap:.0f} ms ({missing} missing timeframe candles)")
                                     if len(gaps) > 5:
                                         self.add_log(f"    ... and {len(gaps)-5} more")
                                 else:
@@ -320,15 +363,19 @@ class VerificationManager:
                                 self.add_log(f"  ⚠ Duplicates: {dups}")
                             else:
                                 self.add_log(f"  ✓ No duplicates")
-                            interval_ms = INTERVAL_MS.get(timeframe, 60000)
+                            interval_ms = INTERVAL_MS.get(timeframe)
+                            if interval_ms is None:
+                                self.add_log(f"  ✗ Unsupported timeframe folder: {timeframe}")
+                                continue
                             if len(df) > 1:
-                                diffs = df["timestamp"].diff().iloc[1:].astype('int64')
-                                threshold_ns = interval_ms * 1_000_000 * 1.5
-                                gaps = diffs[diffs > threshold_ns]
+                                ordered_ts = pd.to_numeric(df["timestamp"], errors="coerce").sort_values()
+                                diffs = ordered_ts.diff().iloc[1:]
+                                gaps = diffs[diffs > interval_ms]
                                 if not gaps.empty:
                                     self.add_log(f"  ⚠ Gaps: {len(gaps)} detected")
                                     for i, gap in enumerate(gaps.head(5)):
-                                        self.add_log(f"    Gap {i+1}: {gap/1e6:.1f} ms ({gap/60000:.1f} minutes)")
+                                        missing = max(0, int(gap // interval_ms) - 1)
+                                        self.add_log(f"    Gap {i+1}: {gap:.0f} ms ({missing} missing timeframe candles)")
                                     if len(gaps) > 5:
                                         self.add_log(f"    ... and {len(gaps)-5} more")
                                 else:
@@ -490,6 +537,35 @@ def fetch_klines_for_extension(symbol, interval, start, end, limit=200, max_retr
     return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
 
+def _contiguous_period_bounds(existing, interval_ms, anchor_start=None):
+    """Locate a stored period and its neighboring stored timestamps."""
+    periods = _split_contiguous_periods(existing["timestamp"], interval_ms)
+    if not periods:
+        raise RuntimeError("existing file contains no candle periods")
+    if anchor_start is None:
+        selected_index = 0
+    else:
+        anchor_start = int(anchor_start)
+        selected_index = next(
+            (index for index, period in enumerate(periods) if period["start_ms"] == anchor_start),
+            None,
+        )
+        if selected_index is None:
+            # A prior batch item may have just connected this period to its
+            # predecessor. Locate the now-merged segment containing the anchor.
+            selected_index = next(
+                (index for index, period in enumerate(periods)
+                 if period["start_ms"] <= anchor_start <= period["end_ms"]),
+                None,
+            )
+        if selected_index is None:
+            raise RuntimeError(f"stored period starting at {anchor_start} was not found")
+    selected = periods[selected_index]
+    previous_end = periods[selected_index - 1]["end_ms"] if selected_index > 0 else None
+    next_start = periods[selected_index + 1]["start_ms"] if selected_index + 1 < len(periods) else None
+    return selected, previous_end, next_start
+
+
 class ExtensionManager:
     """Safely extends existing Parquet periods to the left without replacing old candles."""
 
@@ -519,7 +595,7 @@ class ExtensionManager:
         with self.lock:
             return self.running, self.progress, self.status, "\n".join(self.log[-200:])
 
-    def start(self, symbol, timeframe, minutes):
+    def start(self, symbol, timeframe, minutes, period_start=None):
         if self.running:
             return False, "⚠️ Another extension is already running. Please wait."
         try:
@@ -533,9 +609,14 @@ class ExtensionManager:
             self.progress = 0.0
             self.status = "Starting safe extension..."
             self.log = []
-        self.thread = threading.Thread(target=self._run, args=(symbol, timeframe, minutes), daemon=True)
+        self.thread = threading.Thread(
+            target=self._run, args=(symbol, timeframe, minutes, period_start), daemon=True
+        )
         self.thread.start()
-        return True, f"▶️ Started safe extension for {symbol} {timeframe} by {minutes} minutes."
+        return True, (
+            f"▶️ Started safe extension for {symbol} {timeframe} period "
+            f"{period_start} by {minutes} minutes."
+        )
 
     def start_all(self, periods, minutes=None, through_now=False):
         """Start one serial job for every discovered period.
@@ -547,7 +628,10 @@ class ExtensionManager:
         """
         if self.running:
             return False, "⚠️ Another extension is already running. Please wait."
-        unique_periods = sorted({(str(symbol), str(timeframe)) for symbol, timeframe in periods})
+        unique_periods = sorted({
+            (str(symbol), str(timeframe), int(period_start))
+            for symbol, timeframe, period_start in periods
+        })
         if not unique_periods:
             return False, "⚠️ No downloaded periods were found. Existing data was not changed."
         if minutes is not None:
@@ -576,18 +660,28 @@ class ExtensionManager:
         failures = []
         try:
             total = len(periods)
-            for index, (symbol, timeframe) in enumerate(periods, 1):
+            for index, (symbol, timeframe, period_start) in enumerate(periods, 1):
                 base = (index - 1) / total * 100
                 span = 100 / total
-                self._set_state(f"[{index}/{total}] Processing {symbol} {timeframe}...", base)
+                self._set_state(
+                    f"[{index}/{total}] Processing {symbol} {timeframe} period {period_start}...",
+                    base,
+                )
                 try:
-                    self._extend_left(symbol, timeframe, minutes, base, span * (0.5 if through_now else 1.0))
+                    self._extend_left(
+                        symbol, timeframe, minutes, base,
+                        span * (0.5 if through_now else 1.0), period_start,
+                    )
                     if through_now:
-                        self._extend_right(symbol, timeframe, pressed_at_ms, base + span * 0.5, span * 0.5)
+                        self._extend_right(
+                            symbol, timeframe, pressed_at_ms,
+                            base + span * 0.5, span * 0.5, period_start,
+                        )
                 except Exception as exc:
                     failures.append(f"{symbol} {timeframe}: {exc}")
                     self._set_state(
-                        f"⚠️ [{index}/{total}] {symbol} {timeframe} was left unchanged: {exc}",
+                        f"⚠️ [{index}/{total}] {symbol} {timeframe} stopped: {exc}. "
+                        "No unvalidated write was installed; any earlier completed atomic step and its backup remain.",
                         base + span,
                     )
             if failures:
@@ -603,16 +697,17 @@ class ExtensionManager:
         finally:
             self.running = False
 
-    def _run(self, symbol, timeframe, minutes):
+    def _run(self, symbol, timeframe, minutes, period_start):
         try:
-            self._extend_left(symbol, timeframe, minutes)
+            self._extend_left(symbol, timeframe, minutes, period_start=period_start)
             self._set_state("✅ Extension completed safely.", 100)
         except Exception as e:
             self._set_state(f"❌ Extension stopped: {e}", self.progress)
         finally:
             self.running = False
 
-    def _extend_left(self, symbol, timeframe, minutes, progress_base=0, progress_span=100):
+    def _extend_left(self, symbol, timeframe, minutes, progress_base=0,
+                     progress_span=100, period_start=None):
         interval_ms = self.interval_ms.get(str(timeframe))
         if interval_ms is None:
             raise RuntimeError(f"unsupported timeframe {timeframe}")
@@ -621,14 +716,31 @@ class ExtensionManager:
         if not os.path.exists(file_path):
             raise RuntimeError(f"data.parquet not found for {symbol} {timeframe}")
 
-        self._set_state("Reading existing file and validating current data...", 2)
+        self._set_state(
+            "Reading existing file and validating current data...",
+            progress_base + progress_span * 0.02,
+        )
         existing = pd.read_parquet(file_path)
         issues = _validate_ohlcv_frame(existing)
         if issues:
             raise RuntimeError("existing file failed safety validation: " + "; ".join(issues))
+        if not (pd.to_numeric(existing["timestamp"]) % interval_ms == 0).all():
+            raise RuntimeError("existing file contains timestamps not aligned to its timeframe")
         existing = existing.sort_values("timestamp").reset_index(drop=True)
-        existing_start = _safe_int_timestamp(existing["timestamp"].min())
-        target_start = 0 if minutes is None else max(0, existing_start - int(minutes) * 60_000)
+        selected, previous_end, _next_start = _contiguous_period_bounds(
+            existing, interval_ms, period_start
+        )
+        existing_start = selected["start_ms"]
+        requested_start = 0 if minutes is None else max(
+            0, existing_start - int(minutes) * 60_000
+        )
+        # Never request candles already stored in an earlier period. If there
+        # is a prior segment, this operation safely fills only the gap between
+        # that segment and the selected one.
+        target_start = max(
+            requested_start,
+            previous_end + interval_ms if previous_end is not None else 0,
+        )
         target_end = existing_start - interval_ms
         if target_start > target_end:
             self._set_state(
@@ -640,7 +752,7 @@ class ExtensionManager:
         expected = max(1, ((target_end - target_start) // interval_ms) + 1)
         self._set_state(
             f"Downloading only missing left-side candles: {pd.to_datetime(target_start, unit='ms')} to {pd.to_datetime(target_end, unit='ms')} (~{expected}).",
-            5,
+            progress_base + progress_span * 0.05,
         )
         batches, cur_end, downloaded = [], target_end, 0
         while cur_end >= target_start:
@@ -705,8 +817,9 @@ class ExtensionManager:
             progress_base + progress_span,
         )
 
-    def _extend_right(self, symbol, timeframe, pressed_at_ms, progress_base=0, progress_span=100):
-        """Append only closed candles after an existing period, preserving every old row."""
+    def _extend_right(self, symbol, timeframe, pressed_at_ms, progress_base=0,
+                      progress_span=100, period_start=None):
+        """Extend one period right without crossing a following stored period."""
         interval_ms = self.interval_ms.get(str(timeframe))
         if interval_ms is None:
             raise RuntimeError(f"unsupported timeframe {timeframe}")
@@ -717,9 +830,18 @@ class ExtensionManager:
         issues = _validate_ohlcv_frame(existing)
         if issues:
             raise RuntimeError("existing file failed safety validation: " + "; ".join(issues))
-        existing_end = _safe_int_timestamp(existing["timestamp"].max())
+        if not (pd.to_numeric(existing["timestamp"]) % interval_ms == 0).all():
+            raise RuntimeError("existing file contains timestamps not aligned to its timeframe")
+        selected, _previous_end, next_start = _contiguous_period_bounds(
+            existing, interval_ms, period_start
+        )
+        existing_end = selected["end_ms"]
         # Never persist an in-progress candle.
-        target_end = (int(pressed_at_ms) // interval_ms) * interval_ms - interval_ms
+        last_closed = (int(pressed_at_ms) // interval_ms) * interval_ms - interval_ms
+        target_end = min(
+            last_closed,
+            next_start - interval_ms if next_start is not None else last_closed,
+        )
         cursor = existing_end + interval_ms
         if cursor > target_end:
             self._set_state(f"{symbol} {timeframe} is already current through the last closed candle.", progress_base + progress_span)
@@ -805,9 +927,14 @@ em = ExtensionManager(MARKET_DATA_DIR, INTERVAL_MS)
 
 def _build_extend_cell(detail):
     """Build the compact left-side extension controls for one data period."""
+    identity = {
+        "symbol": detail["symbol"],
+        "timeframe": detail["timeframe"],
+        "period_start": int(detail["start_ms"]),
+    }
     return html.Td(html.Div([
         dcc.Input(
-            id={"type": "extend-minutes-input", "symbol": detail["symbol"], "timeframe": detail["timeframe"]},
+            id={"type": "extend-minutes-input", **identity},
             type="number",
             min=1,
             step=1,
@@ -816,7 +943,7 @@ def _build_extend_cell(detail):
         ),
         html.Button(
             "⬅️ Extend",
-            id={"type": "extend-left-btn", "symbol": detail["symbol"], "timeframe": detail["timeframe"]},
+            id={"type": "extend-left-btn", **identity},
             n_clicks=0,
             title="Safely download this many extra minutes before the current start time.",
         ),
@@ -827,24 +954,33 @@ def _build_details_table(details):
     """Build the database-period table without embedding download logic."""
     rows = []
     for d in details:
+        warnings = []
+        if d.get("duplicate_timestamps"):
+            warnings.append(f"{d['duplicate_timestamps']} duplicate timestamps")
+        if d.get("unaligned_timestamps"):
+            warnings.append(f"{d['unaligned_timestamps']} unaligned timestamps")
         rows.append(html.Tr([
             _build_extend_cell(d),
             html.Td(d["symbol"]),
             html.Td(d["timeframe"]),
+            html.Td(f"{d['period_index']}/{d['period_count']}"),
             html.Td(d["start"].strftime("%Y-%m-%d %H:%M")),
             html.Td(d["end"].strftime("%Y-%m-%d %H:%M")),
             html.Td(f"{d['candles']:,}"),
-            html.Td(f"{d['size']/1e6:.2f} MB")
+            html.Td(f"{d['file_size']/1e6:.2f} MB" if d["period_index"] == 1 else "↑ same file"),
+            html.Td("; ".join(warnings) if d["period_index"] == 1 and warnings else "—"),
         ]))
     return html.Table([
         html.Thead(html.Tr([
             html.Th("Extend left"),
             html.Th("Symbol"),
             html.Th("TF"),
+            html.Th("Period"),
             html.Th("Start"),
             html.Th("End"),
             html.Th("Candles"),
-            html.Th("Size"),
+            html.Th("File size"),
+            html.Th("File warnings"),
         ])),
         html.Tbody(rows)
     ], style={"width": "100%", "border": "1px solid black", "borderCollapse": "collapse"})
@@ -853,8 +989,8 @@ def _build_details_table(details):
 def _build_extension_status_panel():
     """Build progress/status/log widgets for safe period extension."""
     return html.Div([
-        html.H4("Safe left-side period extension"),
-        html.P("Enter extra minutes beside any existing period and click Extend. The downloader only appends candles before the current start, rejects overlaps, validates OHLCV data, writes through a temporary file, and keeps a timestamped backup."),
+        html.H4("Safe contiguous-period extension"),
+        html.P("Each row is one uninterrupted candle segment. Enter extra minutes beside a segment to fill candles immediately before that segment; the operation stops at an earlier stored segment, rejects overlaps, validates OHLCV data, writes through a temporary file, and keeps a timestamped backup."),
         html.Progress(id="extend-progress", value="0", max="100", style={"width": "100%", "height": "18px"}),
         html.Div(id="extend-status", style={"marginTop": "8px", "fontWeight": "bold", "color": "#0b63b6"}),
         html.Pre(id="extend-log", style={"height": "140px", "overflowY": "scroll", "border": "1px solid #ccc", "padding": "5px", "marginTop": "8px"}),
@@ -872,10 +1008,15 @@ def _build_period_extension_box(details):
         html.Div([
             html.H4("All downloaded periods", style={"marginBottom": "5px"}),
             html.P(
-                "Jobs run one period at a time. Existing candles are validated and preserved; "
+                "Periods are detected wherever adjacent timestamps differ by more than one timeframe candle. "
+                "Jobs run one detected period at a time. Existing candles are validated and preserved; "
                 "new files are reread before an atomic replacement and a backup is retained. "
                 "Unavailable or delisted pairs are logged and skipped without deleting their data.",
                 style={"marginTop": "0"},
+            ),
+            html.P(
+                "A gap is treated as a period boundary, not automatically as corruption. An unreadable Parquet/schema/timestamp file is preserved and excluded. Readable files with duplicate or unaligned timestamps are shown with warnings and extension is refused until they are reviewed; full OHLCV checks run before every extension.",
+                style={"fontSize": "12px", "color": "#555"},
             ),
             html.Div([
                 dcc.Input(
@@ -934,10 +1075,22 @@ def create_data_analysis_tab():
     total_candles = sum(d["candles"] for d in info["details"])
     total_size_mb = info["size"] / 1e6
     total_symbols = info["symbols"]
+    total_files = len({(d["symbol"], d["timeframe"]) for d in info["details"]})
+    total_periods = len(info["details"])
     fig = _build_candles_per_symbol_figure(info["details"])
     
     # Build symbol/timeframe dropdown options
     symbol_options = [{"label": s, "value": s} for s in sorted(set(d["symbol"] for d in info["details"]))] if info["details"] else []
+    unreadable_warning = None
+    if info.get("unreadable_files"):
+        unreadable_warning = html.Div([
+            html.Strong("⚠️ Unreadable market-data files were preserved and excluded:"),
+            html.Ul([
+                html.Li(f"{path}: {error}")
+                for path, error in info["unreadable_files"]
+            ]),
+            html.P("The app does not delete these files. Inspect a backup or run verification before any manual replacement."),
+        ], style={"border": "1px solid #d98c00", "backgroundColor": "#fff8e1", "padding": "10px"})
     
     return html.Div([
         html.H3("Data Statistics"),
@@ -946,8 +1099,11 @@ def create_data_analysis_tab():
         # current layout even if the task-only status is visually hidden here.
         html.Div(id="bulk-rerun-status", style={"display": "none"}),
         html.P(f"Total symbols: {total_symbols}"),
+        html.P(f"Readable symbol/timeframe files: {total_files}"),
+        html.P(f"Detected continuous candle periods: {total_periods}"),
         html.P(f"Total candles: {total_candles:,}"),
         html.P(f"Total database size: {total_size_mb:.2f} MB"),
+        unreadable_warning,
         html.Button("Download Backup", id="download-db-btn"),
         dcc.Download(id="download-db"),
         _build_period_extension_box(info["details"]),
@@ -1025,9 +1181,9 @@ def register_database_callbacks(app):
 
     @app.callback(
         Output("extend-status", "children"),
-        Input({"type": "extend-left-btn", "symbol": ALL, "timeframe": ALL}, "n_clicks"),
-        State({"type": "extend-minutes-input", "symbol": ALL, "timeframe": ALL}, "value"),
-        State({"type": "extend-minutes-input", "symbol": ALL, "timeframe": ALL}, "id"),
+        Input({"type": "extend-left-btn", "symbol": ALL, "timeframe": ALL, "period_start": ALL}, "n_clicks"),
+        State({"type": "extend-minutes-input", "symbol": ALL, "timeframe": ALL, "period_start": ALL}, "value"),
+        State({"type": "extend-minutes-input", "symbol": ALL, "timeframe": ALL, "period_start": ALL}, "id"),
         prevent_initial_call=True
     )
     def start_left_extension(_clicks, minute_values, input_ids):
@@ -1036,12 +1192,17 @@ def register_database_callbacks(app):
             return no_update
         symbol = triggered.get("symbol")
         timeframe = triggered.get("timeframe")
+        period_start = triggered.get("period_start")
         minutes = None
         for value, input_id in zip(minute_values or [], input_ids or []):
-            if input_id.get("symbol") == symbol and input_id.get("timeframe") == timeframe:
+            if (
+                input_id.get("symbol") == symbol and
+                input_id.get("timeframe") == timeframe and
+                input_id.get("period_start") == period_start
+            ):
                 minutes = value
                 break
-        _, message = em.start(symbol, timeframe, minutes)
+        _, message = em.start(symbol, timeframe, minutes, period_start)
         return message
 
     @app.callback(
@@ -1058,7 +1219,10 @@ def register_database_callbacks(app):
         """Dispatch batch jobs using a fresh inventory of existing periods."""
         trigger = ctx.triggered_id
         info = get_database_info(force_refresh=True)
-        periods = [(detail["symbol"], detail["timeframe"]) for detail in info["details"]]
+        periods = [
+            (detail["symbol"], detail["timeframe"], detail["start_ms"])
+            for detail in info["details"]
+        ]
         if trigger == "extend-all-minutes-btn":
             _, message = em.start_all(periods, minutes=minutes, through_now=False)
             return message
