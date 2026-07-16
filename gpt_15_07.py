@@ -7668,6 +7668,14 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             bordercolor="#999", font=dict(color="#555", size=12)
         )
 
+    # Y-range for main chart (with padding) is needed before any full-height
+    # hover helpers or vertical signal/event guides are added.
+    y_min = df['low'].min()
+    y_max = df['high'].max()
+    y_padding = (y_max - y_min) * 0.05
+    y_min -= y_padding
+    y_max += y_padding
+
     # Full-height transparent hover target on the main chart keeps the vertical
     # dashed x-spike active anywhere in the candle pane, not only near candles.
     add_hover_spike_bar(fig, 1, y_min, y_max, '_spike_hover_main')
@@ -7691,12 +7699,6 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                 mode='markers', marker=dict(size=10, color=color),
                 name=event_type, showlegend=False, hoverinfo='skip'
             ), row=1, col=1)
-    # Y-range for main chart (with padding)
-    y_min = df['low'].min()
-    y_max = df['high'].max()
-    y_padding = (y_max - y_min) * 0.05
-    y_min -= y_padding
-    y_max += y_padding
     # Signal vertical line (fixed white dashed line at signal time)
     fig.add_trace(go.Scatter(
         x=[signal_dt, signal_dt], y=[y_min, y_max],
