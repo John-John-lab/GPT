@@ -3321,6 +3321,7 @@ def build_root_layout():
     dcc.Store(id="volume-visible-store", data=False),  # default: Volume hidden
     dcc.Store(id="adx-visible-store", data=False),  # default: ADX hidden
     dcc.Store(id="macd-visible-store", data=False),  # default: MACD hidden
+    dcc.Store(id="disparity-visible-store", data=False),  # default: CMOa Disparity Index hidden
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
@@ -3462,6 +3463,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "88px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Toggle DIX", id="toggle-disparity-btn", title="Toggle CMOa Disparity Index (EMA 50/25/9)", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid black",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "84px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Toggle Strategy", id="toggle-strategy-btn", style={
@@ -6679,6 +6690,15 @@ def toggle_macd(n_clicks, current):
     return not current
 
 @app.callback(
+    Output("disparity-visible-store", "data"),
+    Input("toggle-disparity-btn", "n_clicks"),
+    State("disparity-visible-store", "data"),
+    prevent_initial_call=True
+)
+def toggle_disparity(n_clicks, current):
+    return not current
+
+@app.callback(
     Output("strategy-visible-store", "data"),
     Input("toggle-strategy-btn", "n_clicks"),
     State("strategy-visible-store", "data"),
@@ -7560,6 +7580,7 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("volume-visible-store", "data"),
     Input("adx-visible-store", "data"),
     Input("macd-visible-store", "data"),
+    Input("disparity-visible-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
@@ -7570,7 +7591,7 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     State("chart-view-state-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -7641,6 +7662,11 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         signal_line = macd_line.ewm(span=signal_length, adjust=False, min_periods=signal_length).mean()
         hist = macd_line - signal_line
         return macd_line, signal_line, hist
+
+    def compute_disparity_index(close, length):
+        close = pd.Series(close, dtype="float64")
+        ema = close.ewm(span=length, adjust=False, min_periods=length).mean().replace(0, np.nan)
+        return 100 * (close - ema) / ema
 
     has_volume = 'volume' in df.columns
     if volume_visible and has_volume:
@@ -7742,13 +7768,25 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         target_fig.add_hline(y=0, line_dash="dash", line_color="#999", row=row, col=1)
         target_fig.update_yaxes(title_text="MACD", row=row, col=1)
 
+    def add_disparity_trace(target_fig, row):
+        dix_cols = ['disparity_50', 'disparity_25', 'disparity_9']
+        dix_range = pd.concat([df[col] for col in dix_cols], axis=1)
+        dix_min = float(dix_range.min().min())
+        dix_max = float(dix_range.max().max())
+        add_hover_spike_bar(target_fig, row, dix_min, dix_max, f'_spike_hover_disparity_{row}')
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['disparity_50'], mode='lines', name='DIX 1 (EMA 50)', line=dict(color='red', width=1.3), connectgaps=True, hovertemplate='DIX 1: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['disparity_25'], mode='lines', name='DIX 2 (EMA 25)', line=dict(color='blue', width=1.3), connectgaps=True, hovertemplate='DIX 2: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=df['x'], y=df['disparity_9'], mode='lines', name='DIX 3 (EMA 9)', line=dict(color='green', width=1.3), connectgaps=True, hovertemplate='DIX 3: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=0, line_dash="dot", line_color="yellow", row=row, col=1)
+        target_fig.update_yaxes(title_text="CMOa DIX", row=row, col=1)
+
     # Low-spec chart cache: compute indicators once per period view and source file version.
     # Including parquet mtime/size prevents stale chart data after database updates.
     try:
         source_stat = os.stat(fp)
-        cache_key = ("chart_indicators_v2_adx_macd", start_ms, end_ms, source_stat.st_mtime_ns, source_stat.st_size)
+        cache_key = ("chart_indicators_v3_adx_macd_disparity", start_ms, end_ms, source_stat.st_mtime_ns, source_stat.st_size)
     except OSError:
-        cache_key = ("chart_indicators_v2_adx_macd", start_ms, end_ms)
+        cache_key = ("chart_indicators_v3_adx_macd_disparity", start_ms, end_ms)
     if cache_key not in task._chart_cache:
         df['rsi'] = compute_rsi(df['close'])
         df['stoch_k_14_1_3'], df['stoch_d_14_1_3'] = compute_stochastic(df['high'], df['low'], df['close'], 14, 1, 3)
@@ -7757,6 +7795,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         df['stoch_k_300_1_10'], df['stoch_d_300_1_10'] = compute_stochastic(df['high'], df['low'], df['close'], 300, 10, 1)
         df['adx_14_1'], df['plus_di_14'], df['minus_di_14'] = compute_adx(df['high'], df['low'], df['close'], 14, 1)
         df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_macd(df['close'], 12, 26, 9)
+        df['disparity_50'] = compute_disparity_index(df['close'], 50)
+        df['disparity_25'] = compute_disparity_index(df['close'], 25)
+        df['disparity_9'] = compute_disparity_index(df['close'], 9)
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     else:
@@ -7777,6 +7818,8 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         indicator_specs.append(("adx", None))
     if macd_visible:
         indicator_specs.append(("macd", None))
+    if disparity_visible:
+        indicator_specs.append(("disparity", None))
     if volume_enabled:
         indicator_specs.append(("volume", None))
 
@@ -7803,6 +7846,8 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             add_adx_trace(fig, current_row)
         elif indicator_type == "macd":
             add_macd_trace(fig, current_row)
+        elif indicator_type == "disparity":
+            add_disparity_trace(fig, current_row)
         elif indicator_type == "volume":
             add_volume_trace(fig, row=current_row)
         current_row += 1
@@ -8002,7 +8047,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         clickmode="event+select",
         dragmode="pan",
         newshape=dict(line_color="#1976d2", fillcolor="rgba(25,118,210,0.08)", opacity=0.35),
-        height=980 if stochastic_visible else (780 if sum(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible)) >= 2 else (700 if any(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible)) else 500)),
+        height=980 if stochastic_visible else (780 if sum(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible, disparity_visible)) >= 2 else (700 if any(bool(v) for v in (rsi_visible, volume_enabled, adx_visible, macd_visible, disparity_visible)) else 500)),
         margin=dict(l=50, r=50, t=50, b=50),
         meta={
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
