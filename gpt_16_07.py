@@ -6615,34 +6615,92 @@ def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
     return None, None, {}, {"events": [], "index": 0, "overlay": False}
 
-def register_instant_chart_toggle(button_id, store_id, highlight="#e3f2fd"):
-    """Register a browser-only boolean toggle with immediate click feedback."""
-    clientside_callback(
-        f"""
-function(nClicks, current) {{
-    if (!nClicks) return window.dash_clientside.no_update;
-    const active = !Boolean(current);
-    const button = document.getElementById('{button_id}');
-    if (button) {{
-        button.setAttribute('aria-pressed', active ? 'true' : 'false');
-        button.style.background = active ? '{highlight}' : 'transparent';
-        button.style.borderWidth = active ? '2px' : '1px';
-    }}
-    return active;
-}}
-""",
-        Output(store_id, "data"),
-        Input(button_id, "n_clicks"),
-        State(store_id, "data"),
-        prevent_initial_call=True,
-    )
-
-
 # Plotly's modebar is natively clientside. Keep the top chart controls on the
-# same immediate path; indicator stores will then trigger only the one server
-# callback that is genuinely required to build a different subplot figure.
-register_instant_chart_toggle("toggle-rsi-btn", "rsi-visible-store")
-register_instant_chart_toggle("toggle-stochastic-btn", "stochastic-visible-store")
+# same immediate path. A single statically registered callback is used instead
+# of generating callback functions dynamically; this keeps Dash's clientside
+# function registry deterministic across Dash/browser versions.
+clientside_callback(
+    """
+function(rsiClick, stochClick, volumeClick, adxClick, macdClick, dixClick,
+         strategyClick, infoClick, extendClick, anchorClick, hoverClick,
+         impulsesClick, eventsClick,
+         rsi, stoch, volume, adx, macd, dix, strategy, info, extend,
+         anchor, hover, impulses, events) {
+    const ids = [
+        'toggle-rsi-btn', 'toggle-stochastic-btn', 'toggle-volume-btn',
+        'toggle-adx-btn', 'toggle-macd-btn', 'toggle-disparity-btn',
+        'toggle-strategy-btn', 'toggle-chart-info-box-btn',
+        'toggle-chart-extend-x-btn', 'toggle-measure-anchor-btn',
+        'toggle-measure-hover-btn', 'toggle-impulses-btn', 'toggle-events-btn'
+    ];
+    const current = [rsi, stoch, volume, adx, macd, dix, strategy, info,
+                     extend, anchor, hover, impulses, events];
+    const callbackContext = window.dash_clientside.callback_context;
+    const triggered = callbackContext && callbackContext.triggered_id
+        ? callbackContext.triggered_id
+        : (callbackContext && callbackContext.triggered && callbackContext.triggered.length
+            ? callbackContext.triggered[0].prop_id.split('.')[0]
+            : null);
+    const index = ids.indexOf(triggered);
+    if (index < 0) {
+        return ids.map(function() { return window.dash_clientside.no_update; });
+    }
+    const active = !Boolean(current[index]);
+    const button = document.getElementById(triggered);
+    if (button) {
+        const warm = triggered === 'toggle-chart-info-box-btn' ||
+                     triggered === 'toggle-measure-hover-btn';
+        const green = triggered === 'toggle-measure-anchor-btn';
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.style.background = active ? (warm ? '#fff8e1' : (green ? '#e8f5e9' : '#e3f2fd')) : 'transparent';
+        button.style.borderWidth = active ? '2px' : '1px';
+    }
+    return ids.map(function(_, itemIndex) {
+        return itemIndex === index ? active : window.dash_clientside.no_update;
+    });
+}
+""",
+    Output("rsi-visible-store", "data"),
+    Output("stochastic-visible-store", "data"),
+    Output("volume-visible-store", "data"),
+    Output("adx-visible-store", "data"),
+    Output("macd-visible-store", "data"),
+    Output("disparity-visible-store", "data"),
+    Output("strategy-visible-store", "data"),
+    Output("chart-info-box-store", "data"),
+    Output("chart-extend-x-store", "data"),
+    Output("measure-anchor-store", "data"),
+    Output("measure-hover-store", "data"),
+    Output("impulse-visible-store", "data"),
+    Output("events-visible-store", "data"),
+    Input("toggle-rsi-btn", "n_clicks"),
+    Input("toggle-stochastic-btn", "n_clicks"),
+    Input("toggle-volume-btn", "n_clicks"),
+    Input("toggle-adx-btn", "n_clicks"),
+    Input("toggle-macd-btn", "n_clicks"),
+    Input("toggle-disparity-btn", "n_clicks"),
+    Input("toggle-strategy-btn", "n_clicks"),
+    Input("toggle-chart-info-box-btn", "n_clicks"),
+    Input("toggle-chart-extend-x-btn", "n_clicks"),
+    Input("toggle-measure-anchor-btn", "n_clicks"),
+    Input("toggle-measure-hover-btn", "n_clicks"),
+    Input("toggle-impulses-btn", "n_clicks"),
+    Input("toggle-events-btn", "n_clicks"),
+    State("rsi-visible-store", "data"),
+    State("stochastic-visible-store", "data"),
+    State("volume-visible-store", "data"),
+    State("adx-visible-store", "data"),
+    State("macd-visible-store", "data"),
+    State("disparity-visible-store", "data"),
+    State("strategy-visible-store", "data"),
+    State("chart-info-box-store", "data"),
+    State("chart-extend-x-store", "data"),
+    State("measure-anchor-store", "data"),
+    State("measure-hover-store", "data"),
+    State("impulse-visible-store", "data"),
+    State("events-visible-store", "data"),
+    prevent_initial_call=True,
+)
 
 
 @app.callback(
@@ -6718,14 +6776,6 @@ def update_chart_event_marks_button(event_context):
     }
     return ("Event Marks: On" if enabled else "Event Marks: Off"), style
 
-register_instant_chart_toggle("toggle-volume-btn", "volume-visible-store")
-register_instant_chart_toggle("toggle-adx-btn", "adx-visible-store")
-register_instant_chart_toggle("toggle-macd-btn", "macd-visible-store")
-register_instant_chart_toggle("toggle-disparity-btn", "disparity-visible-store")
-register_instant_chart_toggle("toggle-strategy-btn", "strategy-visible-store")
-register_instant_chart_toggle("toggle-chart-info-box-btn", "chart-info-box-store", "#fff8e1")
-register_instant_chart_toggle("toggle-chart-extend-x-btn", "chart-extend-x-store")
-
 # ----- Measurement tool callbacks -----
 clientside_callback(
     """
@@ -6749,9 +6799,6 @@ function(nClicks, current) {
     State("measure-mode-store", "data"),
     prevent_initial_call=True,
 )
-
-register_instant_chart_toggle("toggle-measure-anchor-btn", "measure-anchor-store", "#e8f5e9")
-register_instant_chart_toggle("toggle-measure-hover-btn", "measure-hover-store", "#fff8e1")
 
 @app.callback(
     Output("measure-mode-store", "data", allow_duplicate=True),
@@ -10191,9 +10238,6 @@ def export_impulse_csv(n_clicks, title):
         })
     df = pd.DataFrame(data)
     return dcc.send_data_frame(df.to_csv, f"impulse_signals_{sym}.csv", index=False)
-
-register_instant_chart_toggle("toggle-impulses-btn", "impulse-visible-store")
-register_instant_chart_toggle("toggle-events-btn", "events-visible-store")
 
 @app.callback(
 Output("impulse-results", "children"),
