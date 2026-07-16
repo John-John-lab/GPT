@@ -457,6 +457,10 @@ def task_to_serializable_dict(task):
         if k in RUNTIME_TASK_FIELDS:
             continue
 
+        # A JSON-load pre-signal override is explicitly runtime-only. Even if
+        # the user later presses Save, preserve the value from the loaded JSON.
+        if k == "pre_buffer_minutes" and hasattr(task, "_load_original_pre_buffer_minutes"):
+            v = task._load_original_pre_buffer_minutes
         # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
         d[k] = sanitize_for_json(v)
 
@@ -624,7 +628,8 @@ UI_TASK_FIELDS = {"log_events", "hide_logs"}
 # backward compatibility or runtime persistence behavior.
 RUNTIME_TASK_FIELDS = {
     "stop_event", "pause_event", "state_lock", "raw_batches",
-    "_chart_cache", "symbol_ranges",
+    "_chart_cache", "symbol_ranges", "_load_pre_signal_override_minutes",
+    "_load_chart_start_ms", "_load_original_pre_buffer_minutes",
 }
 
 TASK_DATETIME_FIELDS = {
@@ -3933,9 +3938,22 @@ def build_tasks_tab_layout():
                 html.Button("💾 Save Tasks", id="save-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
                 dcc.Dropdown(id="json-file-select", options=[], placeholder="Select saved file to load...",
                              style={"width": "280px", "marginRight": "10px"}),
+                dcc.Input(
+                    id="load-pre-signal-minutes",
+                    type="number",
+                    min=0,
+                    step=1,
+                    placeholder="one-time min before signal",
+                    title="Optional runtime-only override for calculations and charts. The JSON file is not changed.",
+                    style={"width": "205px", "marginRight": "10px"},
+                ),
                 html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
                 html.Button("⚡ Recalc Table Flags", id="recalc-table-flags-btn", n_clicks=0, style={"marginRight": "10px"}),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "marginTop": "10px"}),
+            html.Div(
+                "Optional load override is used only in RAM for this load. Before applying it, every task is checked for a continuous candle range from the requested start through its signal.",
+                style={"fontSize": "12px", "color": "#666", "marginBottom": "8px"},
+            ),
             html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
         html.Div(id="bulk-rerun-status", style={"marginBottom": "10px", "color": "#1565c0", "fontFamily": "monospace", "minHeight": "20px"}),
         html.Div(id="recalc-status-bar", style={"marginBottom": "10px", "color": "#d84315", "fontFamily": "monospace", "minHeight": "20px", "fontWeight": "bold"}),
@@ -7570,7 +7588,13 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         return go.Figure()
     # Resolve the task's inclusive period before touching candle data so the
     # parquet reader can avoid loading years of unrelated history.
-    start_ms = int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if task.start_date else 0
+    runtime_chart_start = getattr(task, "_load_chart_start_ms", None)
+    start_ms = (
+        int(runtime_chart_start)
+        if runtime_chart_start is not None
+        else int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        if task.start_date else 0
+    )
     if task.end_date:
         end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
     else:
@@ -10860,6 +10884,54 @@ def sync_golden_store_version_from_server(_n_intervals, client_version):
     return dash.no_update
 
 # 3. Load tasks from selected JSON file (Optimized & Thread-Safe)
+def check_pre_signal_database_coverage(task_data, minutes, timestamp_cache=None):
+    """Verify continuous stored candles for a runtime-only JSON load override."""
+    try:
+        symbols = task_data.get("symbols") or []
+        symbol = symbols[0]
+        timeframe = str(task_data.get("timeframe"))
+        interval_ms = INTERVAL_MS.get(timeframe)
+        signal_ms = int(float(task_data.get("signal_time")))
+        if not symbol or interval_ms is None:
+            return False, "missing symbol or unsupported timeframe"
+        requested_start_ms = max(0, signal_ms - int(minutes) * 60_000)
+        first_candle = ((requested_start_ms + interval_ms - 1) // interval_ms) * interval_ms
+        last_candle = (signal_ms // interval_ms) * interval_ms
+        fp = os.path.join(symbol_timeframe_path(symbol, timeframe), "data.parquet")
+        if not os.path.exists(fp):
+            return False, f"database file not found: {fp}"
+        cache = timestamp_cache if timestamp_cache is not None else {}
+        if fp not in cache:
+            # During one JSON load, read each physical timestamp column once;
+            # many tasks often share the same symbol/timeframe file.
+            loaded = pd.read_parquet(fp, columns=["timestamp"])["timestamp"]
+            if loaded.dtype.name.startswith("datetime"):
+                loaded = (loaded.astype("int64") // 1_000_000).astype("int64")
+            else:
+                loaded = pd.to_numeric(loaded, errors="coerce")
+            cache[fp] = loaded
+        all_timestamps = cache[fp]
+        timestamps = all_timestamps[
+            (all_timestamps >= first_candle) & (all_timestamps <= last_candle)
+        ]
+        numeric = pd.to_numeric(timestamps, errors="coerce")
+        if numeric.isna().any() or numeric.duplicated().any():
+            return False, "requested database range has invalid or duplicate timestamps"
+        ordered = np.sort(numeric.astype("int64").unique())
+        expected = max(0, ((last_candle - first_candle) // interval_ms) + 1)
+        if len(ordered) != expected:
+            return False, f"needs {expected} candles but found {len(ordered)}"
+        if expected and (
+            int(ordered[0]) != first_candle or
+            int(ordered[-1]) != last_candle or
+            (len(ordered) > 1 and not (np.diff(ordered) == interval_ms).all())
+        ):
+            return False, "requested pre-signal range is not continuous"
+        return True, requested_start_ms
+    except Exception as exc:
+        return False, f"coverage check failed: {exc}"
+
+
 @app.callback(
     Output("save-load-status", "children", allow_duplicate=True),
     Output("task-ids-store", "data", allow_duplicate=True),
@@ -10869,9 +10941,10 @@ def sync_golden_store_version_from_server(_n_intervals, client_version):
     Output("golden-store-version", "data", allow_duplicate=True), # 🔧 CRITICAL FIX: Update version store to trigger table refresh
     Input("load-tasks-btn", "n_clicks"),
     State("json-file-select", "value"),
+    State("load-pre-signal-minutes", "value"),
     prevent_initial_call=True
 )
-def load_tasks_from_json(n, filepath):
+def load_tasks_from_json(n, filepath, pre_signal_override):
     if not filepath or not os.path.exists(filepath):
         return "⚠️ Please select a valid JSON file.", [], 0, 0, 0, dash.no_update  # 🔧 Added 6th value
     try:
@@ -10883,6 +10956,35 @@ def load_tasks_from_json(n, filepath):
         return f"❌ JSON Syntax Error at line {e.lineno}, col {e.colno}: {e.msg}.", [], 0, 0, 0, dash.no_update  # 🔧 Added 6th value
     except Exception as e:
         return f"❌ Load failed: {str(e)}", [], 0, 0, 0, dash.no_update  # 🔧 Added 6th value
+
+    override_minutes = None
+    override_starts = {}
+    if pre_signal_override not in (None, ""):
+        try:
+            override_minutes = int(pre_signal_override)
+        except (TypeError, ValueError):
+            return "❌ One-time minutes before signal must be a whole number.", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        if override_minutes < 0:
+            return "❌ One-time minutes before signal cannot be negative.", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        unavailable = []
+        coverage_timestamp_cache = {}
+        for item in data:
+            if not isinstance(item, dict) or not item.get("task_id"):
+                continue
+            available, detail = check_pre_signal_database_coverage(
+                item, override_minutes, coverage_timestamp_cache
+            )
+            if not available:
+                unavailable.append(f"{str(item.get('task_id'))[:8]}: {detail}")
+            else:
+                override_starts[str(item.get("task_id"))] = int(detail)
+        if unavailable:
+            shown = "; ".join(unavailable[:5])
+            suffix = f"; and {len(unavailable) - 5} more" if len(unavailable) > 5 else ""
+            return (
+                f"❌ One-time override was not applied and JSON was not loaded: {shown}{suffix}",
+                dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            )
         
     snapshot_audit = audit_task_snapshot_compatibility(data, reason="json_load_raw")
 
@@ -10900,8 +11002,9 @@ def load_tasks_from_json(n, filepath):
     # 🔧 Use global _parse_timestamp for UTC-aware datetime parsing
     # This ensures all timestamps are converted to UTC-aware datetime objects
     
-    for d in data:
+    for source_item in data:
         try:
+            d = dict(source_item)
             # P3 IMPROVEMENT: Check for duplicate task IDs
             task_id_candidate = d.get('task_id')
             if not task_id_candidate:
@@ -10925,6 +11028,11 @@ def load_tasks_from_json(n, filepath):
                     init_kwargs[k] = _parse_timestamp(init_kwargs[k])
 
             task = DownloadTask(**init_kwargs)
+            if override_minutes is not None:
+                task._load_original_pre_buffer_minutes = task.pre_buffer_minutes
+                task.pre_buffer_minutes = override_minutes
+                task._load_pre_signal_override_minutes = override_minutes
+                task._load_chart_start_ms = override_starts[str(task.task_id)]
 
             # 2. Restore ALL Other Attributes from JSON
             for k, v in d.items():
@@ -10962,6 +11070,11 @@ def load_tasks_from_json(n, filepath):
         
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
+    if override_minutes is not None:
+        msg += (
+            f" with one-time {override_minutes}-minute pre-signal override "
+            "(RAM only; JSON unchanged; database coverage verified)"
+        )
     if skipped > 0:
         skip_parts = []
         if skipped_missing_id:
