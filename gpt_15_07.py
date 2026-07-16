@@ -6876,18 +6876,15 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
         if (trace.type === 'candlestick') {
             delete trace.hoverinfo;
             trace.hovertemplate = candleTemplate;
-        } else if (trace.name && String(trace.name).includes('%D')) {
-            trace.hoverinfo = 'skip';
-            trace.hovertemplate = null;
         } else if (trace.name && String(trace.name).includes('Volume')) {
             delete trace.hoverinfo;
             trace.hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
         } else if (trace.name && String(trace.name).includes('RSI')) {
             delete trace.hoverinfo;
             trace.hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
-        } else if (trace.name && String(trace.name).includes('%K')) {
+        } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
             delete trace.hoverinfo;
-            const cleanName = String(trace.name).replace(' %K', '');
+            const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
             trace.hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
         }
     });
@@ -7471,15 +7468,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         target_fig.update_yaxes(title_text="RSI", row=row, col=1, range=[0, 100])
 
     def add_stochastic_trace(target_fig, row, k_col, d_col, title, color):
-        target_fig.add_trace(go.Scatter(
-            x=df['x'], y=df[k_col], mode='lines', name=f'{title} %K',
-            line=dict(color=color, width=1.4), connectgaps=True,
-            hovertemplate=f'{title}: %{{y:.2f}}<extra></extra>'
-        ), row=row, col=1)
+        # Only the %D curve is visible and used for strategy checks.  Keep k_col
+        # in the signature so existing indicator_specs tuples remain readable.
         target_fig.add_trace(go.Scatter(
             x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
-            line=dict(color='#555', width=0.9, dash='dot'), connectgaps=True,
-            showlegend=False, hoverinfo='skip'
+            line=dict(color=color, width=1.4), connectgaps=True,
+            hovertemplate=f'{title} %D: %{{y:.2f}}<extra></extra>'
         ), row=row, col=1)
         target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
         target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
@@ -8511,10 +8505,10 @@ def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
 def build_oscillator_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, default_stoch_level=87.0, default_rsi_level=70.0):
     """Build normalized oscillator condition specs from UI values."""
     return [
-        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
-        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
-        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
-        {"label": "Stoch 300/1/10", "column": "stoch_k_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
+        {"label": "Stoch 14/1/3", "column": "stoch_d_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_d_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_d_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 300/1/10", "column": "stoch_d_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
         {"label": "RSI(14,14)", "column": "rsi_14_14", "level": float(rsi_level if rsi_level is not None else default_rsi_level), "condition": normalize_oscillator_condition(rsi_condition)},
     ]
 
@@ -8530,10 +8524,10 @@ def build_oscillator_spec_groups(up_inputs, down_inputs):
 def build_stochastic_exit_specs(stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, default_stoch_level):
     """Build normalized stochastic-only exit specs using the same curve style as oscillator entries."""
     return [
-        {"label": "Stoch 14/1/3", "column": "stoch_k_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
-        {"label": "Stoch 40/1/4", "column": "stoch_k_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
-        {"label": "Stoch 60/1/10", "column": "stoch_k_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
-        {"label": "Stoch 300/1/10", "column": "stoch_k_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
+        {"label": "Stoch 14/1/3", "column": "stoch_d_14_1_3", "level": float(stoch14_level if stoch14_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch14_condition)},
+        {"label": "Stoch 40/1/4", "column": "stoch_d_40_1_4", "level": float(stoch40_level if stoch40_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch40_condition)},
+        {"label": "Stoch 60/1/10", "column": "stoch_d_60_1_10", "level": float(stoch60_level if stoch60_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch60_condition)},
+        {"label": "Stoch 300/1/10", "column": "stoch_d_300_1_10", "level": float(stoch300_level if stoch300_level is not None else default_stoch_level), "condition": normalize_oscillator_condition(stoch300_condition)},
     ]
 
 
@@ -8581,7 +8575,7 @@ def format_oscillator_specs(specs):
 def make_oscillator_reversal_source_cache_key(task):
     """Return a stable cache key for oscillator source data derived from one task snapshot."""
     return (
-        "osc_source_v2_stoch300",
+        "osc_source_v3_stoch_d_only",
         getattr(task, "task_id", None),
         getattr(task, "signal_time", None),
         getattr(task, "signal_price", None),
@@ -8615,10 +8609,10 @@ def build_oscillator_reversal_source_uncached(task):
     df_sorted = df.sort_values("timestamp").reset_index(drop=True).copy()
     for col in ["high", "low", "close"]:
         df_sorted[col] = pd.to_numeric(df_sorted[col], errors="coerce")
-    df_sorted["stoch_k_14_1_3"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
-    df_sorted["stoch_k_40_1_4"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
-    df_sorted["stoch_k_60_1_10"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
-    df_sorted["stoch_k_300_1_10"], _ = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 10, 1)
+    df_sorted["stoch_k_14_1_3"], df_sorted["stoch_d_14_1_3"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
+    df_sorted["stoch_k_40_1_4"], df_sorted["stoch_d_40_1_4"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
+    df_sorted["stoch_k_60_1_10"], df_sorted["stoch_d_60_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
+    df_sorted["stoch_k_300_1_10"], df_sorted["stoch_d_300_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 10, 1)
     df_sorted["rsi_14_14"] = compute_dynamic_rsi_series(df_sorted["close"], 14).rolling(window=14, min_periods=1).mean()
 
     search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
@@ -8695,9 +8689,10 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
         "lows": path_df["low"].to_numpy(dtype=float, copy=False),
         "closes": path_df["close"].to_numpy(dtype=float, copy=False),
         "timestamps": path_df["timestamp"].to_numpy(dtype=float, copy=False),
-        "stoch_k_14_1_3": path_df["stoch_k_14_1_3"].to_numpy(dtype=float, copy=False),
-        "stoch_k_40_1_4": path_df["stoch_k_40_1_4"].to_numpy(dtype=float, copy=False),
-        "stoch_k_60_1_10": path_df["stoch_k_60_1_10"].to_numpy(dtype=float, copy=False),
+        "stoch_d_14_1_3": path_df["stoch_d_14_1_3"].to_numpy(dtype=float, copy=False),
+        "stoch_d_40_1_4": path_df["stoch_d_40_1_4"].to_numpy(dtype=float, copy=False),
+        "stoch_d_60_1_10": path_df["stoch_d_60_1_10"].to_numpy(dtype=float, copy=False),
+        "stoch_d_300_1_10": path_df["stoch_d_300_1_10"].to_numpy(dtype=float, copy=False),
         "entry_level_distance_pct": abs(entry_price - signal_price) / entry_price * 100,
         "level_cross_idx": cross_idx,
         "oscillator_idx": oscillator_idx,
