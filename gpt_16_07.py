@@ -10983,14 +10983,25 @@ def check_pre_signal_database_coverage(task_data, minutes, timestamp_cache=None)
         cache = timestamp_cache if timestamp_cache is not None else {}
         if fp not in cache:
             # During one JSON load, read each physical timestamp column once;
-            # many tasks often share the same symbol/timeframe file.
-            loaded = pd.read_parquet(fp, columns=["timestamp"])["timestamp"]
-            if loaded.dtype.name.startswith("datetime"):
-                loaded = (loaded.astype("int64") // 1_000_000).astype("int64")
-            else:
-                loaded = pd.to_numeric(loaded, errors="coerce")
-            cache[fp] = loaded
-        all_timestamps = cache[fp]
+            # many tasks often share the same symbol/timeframe file. Cache read
+            # failures too: repeatedly decompressing a damaged file wastes an
+            # old SSD and cannot make the next task safer.
+            try:
+                loaded = pd.read_parquet(fp, columns=["timestamp"])["timestamp"]
+                if loaded.dtype.name.startswith("datetime"):
+                    loaded = (loaded.astype("int64") // 1_000_000).astype("int64")
+                else:
+                    loaded = pd.to_numeric(loaded, errors="coerce")
+                cache[fp] = (loaded, None)
+            except Exception as exc:
+                cache[fp] = (
+                    None,
+                    f"unreadable market-data file for {symbol} {timeframe} "
+                    f"(preserved; not modified): {exc}",
+                )
+        all_timestamps, cached_error = cache[fp]
+        if cached_error:
+            return False, cached_error
         timestamps = all_timestamps[
             (all_timestamps >= first_candle) & (all_timestamps <= last_candle)
         ]
@@ -11261,6 +11272,7 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
 
     if override_minutes is not None:
         unavailable = []
+        unreadable_file_tasks = {}
         coverage_timestamp_cache = {}
         for item in data:
             if not isinstance(item, dict) or not item.get("task_id"):
@@ -11269,7 +11281,10 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
                 item, override_minutes, coverage_timestamp_cache
             )
             if not available:
-                unavailable.append(f"{str(item.get('task_id'))[:8]}: {detail}")
+                if str(detail).startswith("unreadable market-data file"):
+                    unreadable_file_tasks[detail] = unreadable_file_tasks.get(detail, 0) + 1
+                else:
+                    unavailable.append(f"{str(item.get('task_id'))[:8]}: {detail}")
             else:
                 deep_valid, deep_detail = validate_stored_candle_range(
                     (item.get("symbols") or [None])[0],
@@ -11283,11 +11298,27 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
                     )
                 else:
                     override_starts[str(item.get("task_id"))] = int(detail)
+        unavailable.extend(
+            f"{detail} ({task_count} task{'s' if task_count != 1 else ''} affected)"
+            for detail, task_count in unreadable_file_tasks.items()
+        )
         if unavailable:
             shown = "; ".join(unavailable[:5])
             suffix = f"; and {len(unavailable) - 5} more" if len(unavailable) > 5 else ""
+            has_unreadable_file = any(
+                "unreadable market-data file" in message for message in unavailable
+            )
+            safety_note = (
+                " Safety stop: at least one physical Parquet file is unreadable; this is not "
+                "a normal missing-candle condition. Files were preserved and no JSON was loaded. "
+                "Use Data Analysis verification, then restore a known-good backup or safely "
+                "redownload the affected market data. Enter 0 only to load the stored task "
+                "records without applying this override."
+                if has_unreadable_file else ""
+            )
             return (
-                f"❌ One-time override was not applied and JSON was not loaded: {shown}{suffix}",
+                f"❌ One-time override was not applied and JSON was not loaded: "
+                f"{shown}{suffix}.{safety_note}",
                 dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update,
             )
         
