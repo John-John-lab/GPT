@@ -4029,7 +4029,6 @@ def build_tasks_tab_layout():
                     min=0,
                     step=1,
                     placeholder="one-time min before signal",
-                    title="Optional runtime-only override for calculations and charts. The JSON file is not changed.",
                     style={"width": "205px", "marginRight": "10px"},
                 ),
                 html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
