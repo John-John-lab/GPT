@@ -1052,6 +1052,34 @@ def task_pre_signal_start_ms(task):
     start_date = getattr(task, "start_date", None)
     return int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000) if start_date else 0
 
+
+def slice_task_signal_window(task, frame, pre_signal_minutes=None):
+    """Return the established strategy/impulse window without changing its math.
+
+    Keeping this boundary calculation in one place prevents chart, rerun and
+    optimizer callbacks from drifting apart.  ``pre_signal_minutes`` remains an
+    explicit override for legacy callers that intentionally use
+    ``SIGNAL_BUFFER_MINUTES`` rather than the task's stored pre-buffer.
+    """
+    if frame is None or frame.empty or getattr(task, "signal_time", None) is None:
+        return frame.copy() if frame is not None else pd.DataFrame()
+    minutes = (
+        getattr(task, "pre_buffer_minutes", 0)
+        if pre_signal_minutes is None
+        else pre_signal_minutes
+    )
+    buffer_ms = minutes * 60 * 1000
+    start_ms = max(0, task.signal_time - buffer_ms)
+    mask = frame["timestamp"] >= start_ms
+    if task.start_date and task.end_date:
+        window_len_ms = (
+            int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            - int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        )
+        cutoff_time = task.signal_time + window_len_ms
+        mask &= frame["timestamp"] <= cutoff_time
+    return frame.loc[mask].copy()
+
 # ---------- Database Helpers ----------
 # symbol_timeframe_path is now imported from database module
 # get_database_info is now imported from database module
@@ -1422,14 +1450,7 @@ class DownloadTask:
             df_limited = None
             if os.path.exists(fp):
                 full_df = pd.read_parquet(fp)
-                buffer_ms = self.pre_buffer_minutes * 60 * 1000
-                start_ms = max(0, self.signal_time - buffer_ms)
-                if self.start_date and self.end_date:
-                    window_len_ms = int(self.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(self.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                    cutoff_time = self.signal_time + window_len_ms
-                    df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-                else:
-                    df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+                df_limited = slice_task_signal_window(self, full_df)
             # ----- Strategy detection -----
             if self.enable_strategy:
                 try:
@@ -1792,14 +1813,7 @@ class DownloadTask:
             self.add_log("Impulse detection: data file not found")
             return 0
         full_df = pd.read_parquet(fp)
-        buffer_ms = self.pre_buffer_minutes * 60 * 1000
-        start_ms = max(0, self.signal_time - buffer_ms)
-        if self.start_date and self.end_date:
-            window_len_ms = int(self.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(self.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-            cutoff_time = self.signal_time + window_len_ms
-            df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-        else:
-            df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+        df_limited = slice_task_signal_window(self, full_df)
         if df_limited.empty:
             self.add_log("Impulse detection: empty data after filtering")
             return 0
@@ -10056,14 +10070,7 @@ def apply_impulse_params(n_clicks, task_id, range_mult, vol_mult, body_ratio, wi
         if not os.path.exists(fp):
             return "Data file not found."
         full_df = pd.read_parquet(fp)
-        buffer_ms = task.pre_buffer_minutes * 60 * 1000
-        start_ms = max(0, task.signal_time - buffer_ms)
-        if task.start_date and task.end_date:
-            window_len_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-            cutoff_time = task.signal_time + window_len_ms
-            df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-        else:
-            df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+        df_limited = slice_task_signal_window(task, full_df)
         if df_limited.empty:
             return "No data in selected period."
         use_retrace = "retrace" in (use_retracement or [])
@@ -10294,13 +10301,9 @@ def run_grid_search_and_poll(n_clicks, poll_intervals, task_id, range_mult, vol_
             # 🔧 CRITICAL: Clear cache before loading to ensure fresh data after recalc
             clear_parquet_cache()
             full_df = load_task_data_cached(task)
-            buffer_ms = SIGNAL_BUFFER_MINUTES * 60 * 1000
-            start_ms = max(0, task.signal_time - buffer_ms)
-            if task.start_date and task.end_date:
-                window_len_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= task.signal_time + window_len_ms)].copy()
-            else:
-                df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+            df_limited = slice_task_signal_window(
+                task, full_df, pre_signal_minutes=SIGNAL_BUFFER_MINUTES
+            )
                 
             if df_limited.empty:
                 processing_ops.pop(op_key, None)
@@ -10433,14 +10436,9 @@ def run_walk_forward(n_clicks, task_id, range_mult, vol_mult, body_ratio, wick_r
         full_df = load_task_data_cached(task)
         if full_df.empty:
             return "Data file not found or empty."
-        buffer_ms = SIGNAL_BUFFER_MINUTES * 60 * 1000
-        start_ms = max(0, task.signal_time - buffer_ms)
-        if task.start_date and task.end_date:
-            window_len_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-            cutoff_time = task.signal_time + window_len_ms
-            df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-        else:
-            df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+        df_limited = slice_task_signal_window(
+            task, full_df, pre_signal_minutes=SIGNAL_BUFFER_MINUTES
+        )
         if df_limited.empty:
             return "No data in the selected period."
         # Run walk‑forward (percentage split works for any data length)
@@ -10498,14 +10496,9 @@ def rerun_strategy(n_clicks_list):
             task.add_log("Re‑run Strategy: data file not found")
             return no_update
         full_df = pd.read_parquet(fp)
-        buffer_ms = SIGNAL_BUFFER_MINUTES * 60 * 1000
-        start_ms = max(0, task.signal_time - buffer_ms)
-        if task.start_date and task.end_date:
-            window_len_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-            cutoff_time = task.signal_time + window_len_ms
-            df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-        else:
-            df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+        df_limited = slice_task_signal_window(
+            task, full_df, pre_signal_minutes=SIGNAL_BUFFER_MINUTES
+        )
         if df_limited.empty:
             task.add_log("Re‑run Strategy: no data after filtering")
             return no_update
@@ -10588,14 +10581,7 @@ def rerun_strategy_on_all(n_clicks, range_mult, vol_mult, body_ratio, wick_ratio
             if not os.path.exists(fp):
                 continue
             full_df = pd.read_parquet(fp)
-            buffer_ms = task.pre_buffer_minutes * 60 * 1000
-            start_ms = max(0, task.signal_time - buffer_ms)
-            if task.start_date and task.end_date:
-                window_len_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(task.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                cutoff_time = task.signal_time + window_len_ms
-                df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-            else:
-                df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+            df_limited = slice_task_signal_window(task, full_df)
             if df_limited.empty:
                 continue
             signals = detect_strategies(df_limited, task.signal_price, task.signal_direction, task.signal_time, verbose=False)
@@ -10797,15 +10783,7 @@ def bulk_rerun_all(ev_n, str_n, imp_n):
                 fp = os.path.join(path, "data.parquet")
                 if os.path.exists(fp):
                     full_df = pd.read_parquet(fp)
-                    buffer_ms = t.pre_buffer_minutes * 60 * 1000
-                    start_ms = max(0, t.signal_time - buffer_ms)
-                    
-                    if t.start_date and t.end_date:
-                        window_len_ms = int(t.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000) - int(t.start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                        cutoff_time = t.signal_time + window_len_ms
-                        df_limited = full_df[(full_df['timestamp'] >= start_ms) & (full_df['timestamp'] <= cutoff_time)].copy()
-                    else:
-                        df_limited = full_df[full_df['timestamp'] >= start_ms].copy()
+                    df_limited = slice_task_signal_window(t, full_df)
                         
                     if not df_limited.empty:
                         signals = detect_strategies(df_limited, t.signal_price, t.signal_direction, t.signal_time, verbose=False)
