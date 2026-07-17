@@ -3506,6 +3506,12 @@ def build_root_layout():
             "fontFamily": "monospace",
         },
     ),
+    html.Progress(
+        id="json-period-update-progress",
+        value="0",
+        max=100,
+        style={"width": "320px", "display": "block", "marginBottom": "6px"},
+    ),
     html.Div(
         id="recalc-status-bar",
         style={
@@ -11117,17 +11123,31 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                         f"{str(task.task_id)[:8]}: unable to make requested range continuous ({detail})"
                     )
                 signal_ms = int(float(task.signal_time))
+                interval_ms = INTERVAL_MS.get(str(task.timeframe))
+                if interval_ms is None:
+                    raise RuntimeError(
+                        f"{str(task.task_id)[:8]}: unsupported timeframe {task.timeframe}"
+                    )
+                # Stored periods contain candle-open timestamps. A signal may
+                # occur inside that candle, so anchor on its aligned candle open.
+                signal_candle_ms = (signal_ms // interval_ms) * interval_ms
+                _set_json_period_update_state(
+                    f"[{index}/{total}] Locating stored signal candle for "
+                    f"{task.symbols[0]} {task.timeframe}...",
+                    (index - 1) / total * 90,
+                )
                 info = get_database_info(force_refresh=True)
                 containing = next((
                     period for period in info["details"]
                     if period["symbol"] == task.symbols[0]
                     and str(period["timeframe"]) == str(task.timeframe)
-                    and period["start_ms"] <= signal_ms <= period["end_ms"]
+                    and period["start_ms"] <= signal_candle_ms <= period["end_ms"]
                 ), None)
                 if containing is None:
                     raise RuntimeError(
-                        f"{str(task.task_id)[:8]}: no stored period contains the signal candle; "
-                        "safe extension has no trusted anchor"
+                        f"{str(task.task_id)[:8]}: no contiguous stored period contains the "
+                        f"aligned signal candle {signal_candle_ms}; safe extension has no trusted "
+                        "anchor. Verify this symbol/timeframe in Data Analysis."
                     )
                 missing_minutes = max(
                     1,
@@ -11155,10 +11175,20 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                         raise RuntimeError(
                             f"{str(task.task_id)[:8]}: Bybit supplied no usable candles ({reason})"
                         )
+            _set_json_period_update_state(
+                f"[{index}/{total}] Verified {task.symbols[0]} {task.timeframe} "
+                f"for {minutes} minutes before signal.",
+                index / total * 90,
+            )
 
         # Recheck every task after all downloads before changing task metadata.
         coverage_cache = {}
-        for task in tasks:
+        for verify_index, task in enumerate(tasks, 1):
+            _set_json_period_update_state(
+                f"Final verification [{verify_index}/{total}] "
+                f"{task.symbols[0]} {task.timeframe}...",
+                90 + verify_index / total * 8,
+            )
             available, detail = check_pre_signal_database_coverage(
                 _task_coverage_dict(task), minutes, coverage_cache
             )
@@ -11257,6 +11287,7 @@ def start_json_period_update(_clicks, minutes_value):
 
 @app.callback(
     Output("update-json-pre-signal-status", "children", allow_duplicate=True),
+    Output("json-period-update-progress", "value"),
     Input("recalc-status-interval", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -11266,13 +11297,13 @@ def poll_json_period_update(_interval):
         message = json_period_update_state["message"]
         progress = json_period_update_state["progress"]
         if not running and message == "Idle.":
-            return no_update
+            return no_update, no_update
     if running:
         _em_running, em_progress, em_status, _em_log = em.get_state()
         if em_status and em_status != "Starting JSON period update...":
             message = f"{message} | {em_status}"
         progress = max(progress, em_progress)
-    return f"{message} [{progress:.1f}%]"
+    return f"{message} [{progress:.1f}%]", str(progress)
 
 
 @app.callback(
