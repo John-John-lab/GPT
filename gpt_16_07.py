@@ -4040,25 +4040,25 @@ def build_tasks_tab_layout():
             ],
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "8px"},
             ),
-            html.H5("Prepare persistent period values for a NEW JSON", style={"margin": "10px 0 5px"}),
+            html.H5("Add persistent left-side minutes for a NEW JSON", style={"margin": "10px 0 5px"}),
             html.Div([
                 dcc.Input(
                     id="update-json-pre-signal-minutes",
                     type="number",
                     min=0,
                     step=1,
-                    placeholder="new min before signal",
+                    placeholder="extra minutes to add",
                     style={"width": "205px", "marginRight": "10px"},
                 ),
                 html.Button(
-                    "⬇️ Prepare loaded tasks for new JSON",
+                    "⬅️ Add minutes and prepare new JSON",
                     id="update-json-pre-signal-btn",
                     n_clicks=0,
-                    title="Verify/download missing pre-signal candles, then update loaded task periods in RAM. Use Save Tasks to write a new file.",
+                    title="Add this many earlier minutes to each task; verify/download safely, then use Save Tasks with a new filename.",
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
             html.Div(
-                "This safety-first operation may download missing candles using validated backup + atomic-write logic. It updates only tasks loaded from JSON and never overwrites the selected source file. After Finished, rerun Events, Strategy and Impulse so saved derived results use the new history; then choose a new filename and press Save Tasks.",
+                "The number is additional, not the new total: a task with 120 minutes plus 30 becomes 150. For each task, existing candles are reused; missing earlier candles are safely downloaded. If Bybit has no usable history or no trusted period exists, that task is skipped and keeps its original minutes. After Finished, rerun Events, Strategy and Impulse, then save under a new filename.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
             ),
             html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
@@ -11101,119 +11101,125 @@ def _task_coverage_dict(task):
     }
 
 
-def _prepare_loaded_tasks_for_new_json(tasks, minutes):
-    """Download verified missing history, then atomically update task periods in RAM."""
+def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
+    """Add extra left-side minutes per task; safely skip tasks that cannot be extended."""
+    total = len(tasks)
+    prepared = []
+    skipped = []
     try:
-        total = len(tasks)
         for index, task in enumerate(tasks, 1):
+            label = f"{str(task.task_id)[:8]} {task.symbols[0]} {task.timeframe}"
             task_data = _task_coverage_dict(task)
-            requested_start = max(0, int(float(task.signal_time)) - minutes * 60_000)
-            _set_json_period_update_state(
-                f"[{index}/{total}] Checking {task.symbols[0]} {task.timeframe}...",
-                (index - 1) / total * 90,
-            )
-            attempts = 0
-            while True:
-                available, detail = check_pre_signal_database_coverage(task_data, minutes)
-                if available:
-                    break
-                attempts += 1
-                if attempts > 20:
-                    raise RuntimeError(
-                        f"{str(task.task_id)[:8]}: unable to make requested range continuous ({detail})"
-                    )
-                signal_ms = int(float(task.signal_time))
-                interval_ms = INTERVAL_MS.get(str(task.timeframe))
-                if interval_ms is None:
-                    raise RuntimeError(
-                        f"{str(task.task_id)[:8]}: unsupported timeframe {task.timeframe}"
-                    )
-                # Stored periods contain candle-open timestamps. A signal may
-                # occur inside that candle, so anchor on its aligned candle open.
-                signal_candle_ms = (signal_ms // interval_ms) * interval_ms
+            original_minutes = max(0, int(getattr(task, "pre_buffer_minutes", 0) or 0))
+            target_minutes = original_minutes + extra_minutes
+            requested_start = max(0, int(float(task.signal_time)) - target_minutes * 60_000)
+            try:
                 _set_json_period_update_state(
-                    f"[{index}/{total}] Locating stored signal candle for "
-                    f"{task.symbols[0]} {task.timeframe}...",
+                    f"[{index}/{total}] Checking {label}...",
                     (index - 1) / total * 90,
                 )
-                info = get_database_info(force_refresh=True)
-                containing = next((
-                    period for period in info["details"]
-                    if period["symbol"] == task.symbols[0]
-                    and str(period["timeframe"]) == str(task.timeframe)
-                    and period["start_ms"] <= signal_candle_ms <= period["end_ms"]
-                ), None)
-                if containing is None:
-                    raise RuntimeError(
-                        f"{str(task.task_id)[:8]}: no contiguous stored period contains the "
-                        f"aligned signal candle {signal_candle_ms}; safe extension has no trusted "
-                        "anchor. Verify this symbol/timeframe in Data Analysis."
-                    )
-                missing_minutes = max(
-                    1,
-                    int(math.ceil((containing["start_ms"] - requested_start) / 60_000)),
-                )
-                fp = os.path.join(
-                    symbol_timeframe_path(task.symbols[0], str(task.timeframe)), "data.parquet"
-                )
-                before = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
-                _set_json_period_update_state(
-                    f"[{index}/{total}] Downloading verified missing history for "
-                    f"{task.symbols[0]} {task.timeframe} (up to {missing_minutes} minutes)..."
-                )
-                em.extend_left_safely(
-                    task.symbols[0], str(task.timeframe), missing_minutes,
-                    progress_base=(index - 1) / total * 90,
-                    progress_span=90 / total,
-                    period_start=containing["start_ms"],
-                )
-                after = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
-                clear_parquet_cache()
-                if after == before:
-                    available, reason = check_pre_signal_database_coverage(task_data, minutes)
-                    if not available:
-                        raise RuntimeError(
-                            f"{str(task.task_id)[:8]}: Bybit supplied no usable candles ({reason})"
-                        )
-            _set_json_period_update_state(
-                f"[{index}/{total}] Verified {task.symbols[0]} {task.timeframe} "
-                f"for {minutes} minutes before signal.",
-                index / total * 90,
-            )
+                for attempt in range(1, 21):
+                    available, detail = check_pre_signal_database_coverage(task_data, target_minutes)
+                    if available:
+                        prepared.append((task, target_minutes))
+                        break
+                    if str(detail).startswith((
+                        "unreadable market-data file", "busy/changing market-data file"
+                    )):
+                        raise RuntimeError(detail)
 
-        # Recheck every task after all downloads before changing task metadata.
+                    signal_ms = int(float(task.signal_time))
+                    interval_ms = INTERVAL_MS.get(str(task.timeframe))
+                    if interval_ms is None:
+                        raise RuntimeError(f"unsupported timeframe {task.timeframe}")
+                    signal_candle_ms = (signal_ms // interval_ms) * interval_ms
+                    _set_json_period_update_state(
+                        f"[{index}/{total}] Locating stored signal candle for {label}...",
+                        (index - 1) / total * 90,
+                    )
+                    info = get_database_info(force_refresh=True)
+                    containing = next((
+                        period for period in info["details"]
+                        if period["symbol"] == task.symbols[0]
+                        and str(period["timeframe"]) == str(task.timeframe)
+                        and period["start_ms"] <= signal_candle_ms <= period["end_ms"]
+                    ), None)
+                    if containing is None:
+                        raise RuntimeError(
+                            "no contiguous stored period contains the aligned signal candle; "
+                            "there is no trusted existing period to extend"
+                        )
+
+                    missing_minutes = max(
+                        1,
+                        int(math.ceil((containing["start_ms"] - requested_start) / 60_000)),
+                    )
+                    fp = os.path.join(
+                        symbol_timeframe_path(task.symbols[0], str(task.timeframe)),
+                        "data.parquet",
+                    )
+                    before = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
+                    _set_json_period_update_state(
+                        f"[{index}/{total}] Downloading {label}: up to "
+                        f"{missing_minutes} missing minutes (attempt {attempt}/20)...",
+                        (index - 1) / total * 90,
+                    )
+                    em.extend_left_safely(
+                        task.symbols[0], str(task.timeframe), missing_minutes,
+                        progress_base=(index - 1) / total * 90,
+                        progress_span=90 / total,
+                        period_start=containing["start_ms"],
+                    )
+                    after = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
+                    clear_parquet_cache()
+                    if after == before:
+                        available, reason = check_pre_signal_database_coverage(task_data, target_minutes)
+                        if not available:
+                            raise RuntimeError(
+                                f"Bybit returned no usable earlier candles ({reason})"
+                            )
+                else:
+                    raise RuntimeError("requested range was still incomplete after 20 attempts")
+            except Exception as exc:
+                skipped.append(f"{label}: {exc}")
+            finally:
+                _set_json_period_update_state(
+                    f"[{index}/{total}] Prepared {len(prepared)}, skipped {len(skipped)}. "
+                    f"Last: {label}",
+                    index / total * 90,
+                )
+
+        # Deeply verify only candidates that obtained complete timestamp coverage.
+        verified = []
         coverage_cache = {}
-        for verify_index, task in enumerate(tasks, 1):
+        for verify_index, (task, target_minutes) in enumerate(prepared, 1):
+            label = f"{str(task.task_id)[:8]} {task.symbols[0]} {task.timeframe}"
             _set_json_period_update_state(
-                f"Final verification [{verify_index}/{total}] "
-                f"{task.symbols[0]} {task.timeframe}...",
-                90 + verify_index / total * 8,
+                f"Final verification [{verify_index}/{len(prepared)}] {label}...",
+                90 + verify_index / max(1, len(prepared)) * 8,
             )
             available, detail = check_pre_signal_database_coverage(
-                _task_coverage_dict(task), minutes, coverage_cache
+                _task_coverage_dict(task), target_minutes, coverage_cache
             )
             if not available:
-                raise RuntimeError(f"{str(task.task_id)[:8]} final verification failed: {detail}")
+                skipped.append(f"{label}: final coverage failed ({detail})")
+                continue
             deep_valid, deep_detail = validate_stored_candle_range(
                 task.symbols[0], str(task.timeframe), detail, task.signal_time
             )
             if not deep_valid:
-                raise RuntimeError(
-                    f"{str(task.task_id)[:8]} final OHLCV verification failed: {deep_detail}"
-                )
+                skipped.append(f"{label}: final OHLCV verification failed ({deep_detail})")
+                continue
+            verified.append((task, target_minutes))
 
+        updated = []
         with tm.lock:
-            stale = [
-                str(task.task_id)[:8] for task in tasks
-                if tm.tasks.get(task.task_id) is not task
-            ]
-            if stale:
-                raise RuntimeError(
-                    "loaded task set changed while download was running; refusing metadata update "
-                    f"({', '.join(stale[:5])})"
-                )
-            for task in tasks:
-                task.pre_buffer_minutes = minutes
+            for task, target_minutes in verified:
+                label = f"{str(task.task_id)[:8]} {task.symbols[0]} {task.timeframe}"
+                if tm.tasks.get(task.task_id) is not task:
+                    skipped.append(f"{label}: task changed while preparation was running")
+                    continue
+                task.pre_buffer_minutes = target_minutes
                 task._prepared_for_new_json = True
                 for attr in (
                     "_load_pre_signal_override_minutes", "_load_chart_start_ms",
@@ -11223,18 +11229,31 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
                         delattr(task, attr)
                 if hasattr(task, "_chart_cache"):
                     task._chart_cache.clear()
+                updated.append(task)
             snapshot = list(tm.tasks.values())
-        publish_golden_task_snapshot(snapshot, reason="json_period_update")
-        _set_json_period_update_state(
-            f"✅ Finished. Updated {len(tasks)} loaded tasks to {minutes} minutes before signal. "
-            "Database coverage is continuous and verified. The chart now uses the new start. "
-            "Before saving, rerun Events, Strategy and Impulse so derived results use the new history.",
-            100,
-        )
+        if updated:
+            publish_golden_task_snapshot(snapshot, reason="json_period_update")
+
+        skipped_preview = "; ".join(skipped[:8])
+        skipped_suffix = f"; and {len(skipped) - 8} more" if len(skipped) > 8 else ""
+        if updated:
+            message = (
+                f"✅ Finished. Added {extra_minutes} left-side minutes to "
+                f"{len(updated)}/{total} tasks. Rerun Events, Strategy and Impulse, "
+                "then save a new JSON."
+            )
+        else:
+            message = "⚠️ Finished safely, but no task could be updated."
+        if skipped:
+            message += (
+                f" Skipped {len(skipped)} task(s); their original period values were kept: "
+                f"{skipped_preview}{skipped_suffix}."
+            )
+        _set_json_period_update_state(message, 100)
     except Exception as exc:
         _set_json_period_update_state(
-            f"❌ Stopped safely: {exc}. Task period metadata was not updated; any successfully "
-            "validated candle downloads remain available with backups.",
+            f"❌ Preparation stopped unexpectedly: {exc}. Existing market data and task "
+            "period values were preserved.",
         )
     finally:
         with em.lock:
@@ -11254,11 +11273,11 @@ def start_json_period_update(_clicks, minutes_value):
     if not _clicks:
         return no_update
     try:
-        minutes = int(minutes_value)
+        extra_minutes = int(minutes_value)
     except (TypeError, ValueError):
-        return "❌ Enter a whole number of minutes before signal."
-    if minutes < 0:
-        return "❌ Minutes cannot be negative."
+        return "❌ Enter a whole number of extra minutes to add."
+    if extra_minutes <= 0:
+        return "❌ Extra minutes must be greater than zero."
     tasks = [task for task in tm.get_all_tasks() if getattr(task, "_loaded_from_json", False)]
     if not tasks:
         return "⚠️ No JSON-loaded tasks are present. Load a JSON before preparing a new one."
@@ -11273,16 +11292,19 @@ def start_json_period_update(_clicks, minutes_value):
         em.status = "Starting JSON period update..."
         em.log = []
     _set_json_period_update_state(
-        f"▶️ Starting verification/download for {len(tasks)} loaded tasks...",
+        f"▶️ Adding {extra_minutes} left-side minutes to {len(tasks)} loaded tasks...",
         0,
         True,
     )
     threading.Thread(
         target=_prepare_loaded_tasks_for_new_json,
-        args=(list(tasks), minutes),
+        args=(list(tasks), extra_minutes),
         daemon=True,
     ).start()
-    return f"▶️ Started for {len(tasks)} tasks. Progress updates below."
+    return (
+        f"▶️ Started adding {extra_minutes} minutes for {len(tasks)} tasks. "
+        "Unavailable tasks will be skipped and listed."
+    )
 
 
 @app.callback(
