@@ -3495,28 +3495,22 @@ def build_root_layout():
     html.Div(
         id="bulk-rerun-status",
         style={
-            "marginBottom": "10px",
             "color": "#1565c0",
             "fontFamily": "monospace",
-            "minHeight": "20px",
         },
     ),
     html.Div(
         id="update-json-pre-signal-status",
         style={
-            "minHeight": "20px",
             "color": "#1565c0",
             "fontFamily": "monospace",
-            "marginBottom": "8px",
         },
     ),
     html.Div(
         id="recalc-status-bar",
         style={
-            "marginBottom": "10px",
             "color": "#d84315",
             "fontFamily": "monospace",
-            "minHeight": "20px",
             "fontWeight": "bold",
         },
     ),
@@ -10808,6 +10802,10 @@ def redownload_all_existing(n_clicks):
     prevent_initial_call=True
 )
 def bulk_rerun_all(ev_n, str_n, imp_n):
+    # Dynamic tab insertion can initialize these buttons with 0 even though no
+    # user action occurred. Never turn component creation into a bulk operation.
+    if not any(int(value or 0) > 0 for value in (ev_n, str_n, imp_n)):
+        return no_update
     triggered = ctx.triggered_id
     if not triggered:
         return no_update
@@ -11165,6 +11163,10 @@ def _prepare_loaded_tasks_for_new_json(tasks, minutes):
     prevent_initial_call=True,
 )
 def start_json_period_update(_clicks, minutes_value):
+    # The button lives in dynamic tab-content. Dash may invoke the callback when
+    # that component is mounted; only a positive click is a user request.
+    if not _clicks:
+        return no_update
     try:
         minutes = int(minutes_value)
     except (TypeError, ValueError):
@@ -11692,7 +11694,9 @@ def update_status_bar(n):
         current_count = recalc_bg.get("count", 0) if recalc_bg.get("running", False) else recalc_progress_count
         return f"⚙️ Checking: {current_count} / {recalc_total_tasks} tasks..."
     else:
-        return "Ready"
+        # Keep the permanent cross-tab target visually quiet while no operation
+        # is active. The controls themselves already communicate readiness.
+        return ""
 
 @app.callback(
     Output("bulk-rerun-status", "children", allow_duplicate=True),
