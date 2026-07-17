@@ -4058,7 +4058,7 @@ def build_tasks_tab_layout():
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
             html.Div(
-                "The number is additional, not the new total: a task with 120 minutes plus 30 becomes 150. For each task, existing candles are reused; missing earlier candles are safely downloaded. If Bybit has no usable history or no trusted period exists, that task is skipped and keeps its original minutes. After Finished, rerun Events, Strategy and Impulse, then save under a new filename.",
+                "The number is additional, not the new total: a task with 120 minutes plus 30 becomes 150. Existing task results are not declared incorrect or re-parsed. Only the requested pre-signal candle range is checked; existing candles are reused and missing earlier candles are safely downloaded. If that range cannot be prepared, the task is listed as not prepared and keeps its original minutes. After Finished, rerun Events, Strategy and Impulse, then save under a new filename.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
             ),
             html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
@@ -11102,7 +11102,12 @@ def _task_coverage_dict(task):
 
 
 def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
-    """Add extra left-side minutes per task; safely skip tasks that cannot be extended."""
+    """Add left history without reclassifying previously saved task results.
+
+    Validation here answers only whether the requested pre-signal candle range is
+    safe and complete. A task that cannot be prepared keeps its original period;
+    it is not marked invalid and its existing derived results are not modified.
+    """
     total = len(tasks)
     prepared = []
     skipped = []
@@ -11204,6 +11209,9 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
             if not available:
                 skipped.append(f"{label}: final coverage failed ({detail})")
                 continue
+            # ``detail`` is the requested pre-signal start returned by the
+            # coverage check. Validate only that added/required range through
+            # the signal; do not reinterpret the saved task's later results.
             deep_valid, deep_detail = validate_stored_candle_range(
                 task.symbols[0], str(task.timeframe), detail, task.signal_time
             )
@@ -11246,7 +11254,8 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
             message = "⚠️ Finished safely, but no task could be updated."
         if skipped:
             message += (
-                f" Skipped {len(skipped)} task(s); their original period values were kept: "
+                f" Not prepared: {len(skipped)} task(s). They were not marked incorrect, and "
+                "their original period values/results were kept: "
                 f"{skipped_preview}{skipped_suffix}."
             )
         _set_json_period_update_state(message, 100)
