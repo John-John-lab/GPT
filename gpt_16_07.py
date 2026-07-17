@@ -3489,6 +3489,37 @@ def build_root_layout():
         dcc.Tab(label="Tasks", value="tab-tasks"),
         dcc.Tab(label="Data Analysis", value="tab-analysis"),
     ]),
+    # Permanent callback target: a background rerun/recalculation may finish
+    # after the user has switched dynamic tabs. Do not place this target inside
+    # tab-content, where Dash would remove it during the switch.
+    html.Div(
+        id="bulk-rerun-status",
+        style={
+            "marginBottom": "10px",
+            "color": "#1565c0",
+            "fontFamily": "monospace",
+            "minHeight": "20px",
+        },
+    ),
+    html.Div(
+        id="update-json-pre-signal-status",
+        style={
+            "minHeight": "20px",
+            "color": "#1565c0",
+            "fontFamily": "monospace",
+            "marginBottom": "8px",
+        },
+    ),
+    html.Div(
+        id="recalc-status-bar",
+        style={
+            "marginBottom": "10px",
+            "color": "#d84315",
+            "fontFamily": "monospace",
+            "minHeight": "20px",
+            "fontWeight": "bold",
+        },
+    ),
     html.Div(id="tab-content"),
     # Inline chart panel. It intentionally follows tab-content in document flow
     # so a cold chart load never covers the task and summary tables.
@@ -4031,10 +4062,7 @@ def build_tasks_tab_layout():
                 "This safety-first operation may download missing candles using validated backup + atomic-write logic. It updates only tasks loaded from JSON and never overwrites the selected source file. After Finished, rerun Events, Strategy and Impulse so saved derived results use the new history; then choose a new filename and press Save Tasks.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
             ),
-            html.Div(id="update-json-pre-signal-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "8px"}),
             html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
-        html.Div(id="bulk-rerun-status", style={"marginBottom": "10px", "color": "#1565c0", "fontFamily": "monospace", "minHeight": "20px"}),
-        html.Div(id="recalc-status-bar", style={"marginBottom": "10px", "color": "#d84315", "fontFamily": "monospace", "minHeight": "20px", "fontWeight": "bold"}),
         # ----- Impulse Parameters Panel (collapsible) -----
         html.Details([
             html.Summary("⚡ Impulse Parameters (click to expand)", style={"fontWeight": "bold", "cursor": "pointer", "marginTop": "20px"}),
