@@ -4022,7 +4022,7 @@ def build_tasks_tab_layout():
                     type="number",
                     min=0,
                     step=1,
-                    placeholder="one-time min before signal",
+                    placeholder="optional one-time minutes",
                     style={"width": "205px", "marginRight": "10px"},
                 ),
                 html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
@@ -4030,7 +4030,7 @@ def build_tasks_tab_layout():
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "marginTop": "10px"}),
             html.Div([
                 html.Strong("Temporary load override: "),
-                "the field beside Load Selected changes calculations/chart history only in RAM. It never downloads candles and refuses the load unless every requested range already exists continuously in the database.",
+                "leave the field empty or enter 0 to load the JSON normally. A positive value changes calculations/chart history only in RAM. It never downloads candles and refuses the load unless every requested range already exists continuously in the database.",
             ],
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "8px"},
             ),
@@ -11253,6 +11253,13 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
             return "❌ One-time minutes before signal must be a whole number.", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         if override_minutes < 0:
             return "❌ One-time minutes before signal cannot be negative.", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        # Zero means "do not override". Treating it as a zero-length range can
+        # produce an empty interval when signal_time is between timeframe candle
+        # boundaries, incorrectly refusing an otherwise valid JSON load.
+        if override_minutes == 0:
+            override_minutes = None
+
+    if override_minutes is not None:
         unavailable = []
         coverage_timestamp_cache = {}
         for item in data:
