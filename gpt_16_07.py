@@ -3513,6 +3513,31 @@ def build_root_layout():
         style={"width": "320px", "display": "block", "marginBottom": "6px"},
     ),
     html.Div(
+        [
+            html.Label("Prepared JSON filename: ", htmlFor="prepared-json-filename"),
+            dcc.Input(
+                id="prepared-json-filename",
+                type="text",
+                value="tasks_extended.json",
+                placeholder="new_tasks_filename.json",
+                debounce=True,
+                style={"width": "250px", "marginRight": "8px"},
+            ),
+            html.Button(
+                "💾 Save prepared JSON",
+                id="save-prepared-json-btn",
+                n_clicks=0,
+                disabled=True,
+                style={"backgroundColor": "#e8f5e9"},
+            ),
+        ],
+        style={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+    ),
+    html.Div(
+        id="prepared-json-save-status",
+        style={"color": "#1565c0", "fontFamily": "monospace", "marginBottom": "6px"},
+    ),
+    html.Div(
         id="recalc-status-bar",
         style={
             "color": "#d84315",
@@ -4058,7 +4083,7 @@ def build_tasks_tab_layout():
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
             html.Div(
-                "The number is additional, not the new total: a task with 120 minutes plus 30 becomes 150. Existing task results are not declared incorrect or re-parsed. Only the requested pre-signal candle range is checked; existing candles are reused and missing earlier candles are safely downloaded. If that range cannot be prepared, the task is listed as not prepared and keeps its original minutes. After Finished, rerun Events, Strategy and Impulse, then save under a new filename.",
+                "The number is additional, not the new total: a task with 120 minutes plus 30 becomes 150. Existing task results are not declared incorrect or re-parsed. Only the requested pre-signal candle range is checked; existing candles are reused and missing earlier candles are safely downloaded. If that range cannot be prepared, the task is listed as not prepared and keeps its original minutes. After Finished, rerun Events, Strategy and Impulse if wanted, then use the separate Prepared JSON filename and Save prepared JSON controls above. The button is enabled only after at least one task was prepared.",
                 style={"fontSize": "12px", "color": "#666", "marginBottom": "5px"},
             ),
             html.Div(id="save-load-status", style={"minHeight": "20px", "color": "#1565c0", "fontFamily": "monospace", "marginBottom": "10px"}),
@@ -11078,11 +11103,12 @@ json_period_update_state = {
     "running": False,
     "progress": 0.0,
     "message": "Idle.",
+    "ready_to_save": False,
     "lock": threading.Lock(),
 }
 
 
-def _set_json_period_update_state(message=None, progress=None, running=None):
+def _set_json_period_update_state(message=None, progress=None, running=None, ready_to_save=None):
     with json_period_update_state["lock"]:
         if message is not None:
             json_period_update_state["message"] = message
@@ -11090,6 +11116,8 @@ def _set_json_period_update_state(message=None, progress=None, running=None):
             json_period_update_state["progress"] = float(progress)
         if running is not None:
             json_period_update_state["running"] = bool(running)
+        if ready_to_save is not None:
+            json_period_update_state["ready_to_save"] = bool(ready_to_save)
 
 
 def _task_coverage_dict(task):
@@ -11111,6 +11139,10 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
     total = len(tasks)
     prepared = []
     skipped = []
+    # Tasks commonly share symbol/timeframe files. Reuse one timestamp column
+    # per physical file instead of rereading/decompressing it for every task.
+    coverage_cache = {}
+    inventory_info = None
     try:
         for index, task in enumerate(tasks, 1):
             label = f"{str(task.task_id)[:8]} {task.symbols[0]} {task.timeframe}"
@@ -11124,7 +11156,9 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
                     (index - 1) / total * 90,
                 )
                 for attempt in range(1, 21):
-                    available, detail = check_pre_signal_database_coverage(task_data, target_minutes)
+                    available, detail = check_pre_signal_database_coverage(
+                        task_data, target_minutes, coverage_cache
+                    )
                     if available:
                         prepared.append((task, target_minutes))
                         break
@@ -11142,9 +11176,10 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
                         f"[{index}/{total}] Locating stored signal candle for {label}...",
                         (index - 1) / total * 90,
                     )
-                    info = get_database_info(force_refresh=True)
+                    if inventory_info is None:
+                        inventory_info = get_database_info(force_refresh=True)
                     containing = next((
-                        period for period in info["details"]
+                        period for period in inventory_info["details"]
                         if period["symbol"] == task.symbols[0]
                         and str(period["timeframe"]) == str(task.timeframe)
                         and period["start_ms"] <= signal_candle_ms <= period["end_ms"]
@@ -11177,8 +11212,13 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
                     )
                     after = (os.path.getsize(fp), os.stat(fp).st_mtime_ns)
                     clear_parquet_cache()
+                    coverage_cache.pop(fp, None)
+                    if after != before:
+                        inventory_info = None
                     if after == before:
-                        available, reason = check_pre_signal_database_coverage(task_data, target_minutes)
+                        available, reason = check_pre_signal_database_coverage(
+                            task_data, target_minutes, coverage_cache
+                        )
                         if not available:
                             raise RuntimeError(
                                 f"Bybit returned no usable earlier candles ({reason})"
@@ -11197,6 +11237,7 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
         # Deeply verify only candidates that obtained complete timestamp coverage.
         verified = []
         coverage_cache = {}
+        deep_validation_cache = {}
         for verify_index, (task, target_minutes) in enumerate(prepared, 1):
             label = f"{str(task.task_id)[:8]} {task.symbols[0]} {task.timeframe}"
             _set_json_period_update_state(
@@ -11212,9 +11253,14 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
             # ``detail`` is the requested pre-signal start returned by the
             # coverage check. Validate only that added/required range through
             # the signal; do not reinterpret the saved task's later results.
-            deep_valid, deep_detail = validate_stored_candle_range(
-                task.symbols[0], str(task.timeframe), detail, task.signal_time
+            validation_key = (
+                task.symbols[0], str(task.timeframe), int(detail), int(float(task.signal_time))
             )
+            if validation_key not in deep_validation_cache:
+                deep_validation_cache[validation_key] = validate_stored_candle_range(
+                    task.symbols[0], str(task.timeframe), detail, task.signal_time
+                )
+            deep_valid, deep_detail = deep_validation_cache[validation_key]
             if not deep_valid:
                 skipped.append(f"{label}: final OHLCV verification failed ({deep_detail})")
                 continue
@@ -11248,7 +11294,7 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
             message = (
                 f"✅ Finished. Added {extra_minutes} left-side minutes to "
                 f"{len(updated)}/{total} tasks. Rerun Events, Strategy and Impulse, "
-                "then save a new JSON."
+                "then use the now-enabled Save prepared JSON button."
             )
         else:
             message = "⚠️ Finished safely, but no task could be updated."
@@ -11258,11 +11304,12 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
                 "their original period values/results were kept: "
                 f"{skipped_preview}{skipped_suffix}."
             )
-        _set_json_period_update_state(message, 100)
+        _set_json_period_update_state(message, 100, ready_to_save=bool(updated))
     except Exception as exc:
         _set_json_period_update_state(
             f"❌ Preparation stopped unexpectedly: {exc}. Existing market data and task "
             "period values were preserved.",
+            ready_to_save=False,
         )
     finally:
         with em.lock:
@@ -11304,6 +11351,7 @@ def start_json_period_update(_clicks, minutes_value):
         f"▶️ Adding {extra_minutes} left-side minutes to {len(tasks)} loaded tasks...",
         0,
         True,
+        False,
     )
     threading.Thread(
         target=_prepare_loaded_tasks_for_new_json,
@@ -11319,6 +11367,7 @@ def start_json_period_update(_clicks, minutes_value):
 @app.callback(
     Output("update-json-pre-signal-status", "children", allow_duplicate=True),
     Output("json-period-update-progress", "value"),
+    Output("save-prepared-json-btn", "disabled", allow_duplicate=True),
     Input("recalc-status-interval", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -11327,14 +11376,45 @@ def poll_json_period_update(_interval):
         running = json_period_update_state["running"]
         message = json_period_update_state["message"]
         progress = json_period_update_state["progress"]
+        ready_to_save = json_period_update_state["ready_to_save"]
         if not running and message == "Idle.":
-            return no_update, no_update
+            return no_update, no_update, True
     if running:
         _em_running, em_progress, em_status, _em_log = em.get_state()
         if em_status and em_status != "Starting JSON period update...":
             message = f"{message} | {em_status}"
         progress = max(progress, em_progress)
-    return f"{message} [{progress:.1f}%]", str(progress)
+    return f"{message} [{progress:.1f}%]", str(progress), not ready_to_save
+
+
+@app.callback(
+    Output("prepared-json-save-status", "children"),
+    Output("save-prepared-json-btn", "disabled", allow_duplicate=True),
+    Input("save-prepared-json-btn", "n_clicks"),
+    State("prepared-json-filename", "value"),
+    prevent_initial_call=True,
+)
+def save_prepared_tasks_to_json(n_clicks, filename):
+    """Save a completed period preparation through an explicit guarded action."""
+    if not n_clicks:
+        return no_update, no_update
+    with json_period_update_state["lock"]:
+        if json_period_update_state["running"]:
+            return "⏳ Preparation is still running; saving remains disabled.", True
+        if not json_period_update_state["ready_to_save"]:
+            return "⚠️ Nothing newly prepared is ready to save.", True
+
+    message, normalized_filename = save_tasks_to_json(n_clicks, filename)
+    if not str(message).startswith("✅"):
+        return message, False
+
+    with json_period_update_state["lock"]:
+        json_period_update_state["ready_to_save"] = False
+    return (
+        f"{message}. Prepared task periods were written to {normalized_filename}; "
+        "the loaded source JSON was not overwritten.",
+        True,
+    )
 
 
 @app.callback(
