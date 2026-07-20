@@ -459,10 +459,6 @@ def task_to_serializable_dict(task):
         if k in RUNTIME_TASK_FIELDS:
             continue
 
-        # A JSON-load pre-signal override is explicitly runtime-only. Even if
-        # the user later presses Save, preserve the value from the loaded JSON.
-        if k == "pre_buffer_minutes" and hasattr(task, "_load_original_pre_buffer_minutes"):
-            v = task._load_original_pre_buffer_minutes
         # Apply sanitize_for_json to ALL values (handles datetime, NumPy, NaN, etc.)
         d[k] = sanitize_for_json(v)
 
@@ -630,8 +626,7 @@ UI_TASK_FIELDS = {"log_events", "hide_logs"}
 # backward compatibility or runtime persistence behavior.
 RUNTIME_TASK_FIELDS = {
     "stop_event", "pause_event", "state_lock", "raw_batches",
-    "_chart_cache", "symbol_ranges", "_load_pre_signal_override_minutes",
-    "_load_chart_start_ms", "_load_original_pre_buffer_minutes",
+    "_chart_cache", "symbol_ranges",
     "_loaded_from_json", "_loaded_source_json", "_prepared_for_new_json",
 }
 
@@ -1043,9 +1038,6 @@ def clear_parquet_cache():
 # ---------- Canonical task-window policy (chart, events, strategies, optimizers) ----------
 def task_pre_signal_start_ms(task):
     """Return the requested history start without changing the task's end window."""
-    runtime_start = getattr(task, "_load_chart_start_ms", None)
-    if runtime_start is not None:
-        return max(0, int(runtime_start))
     signal_time = getattr(task, "signal_time", None)
     if signal_time is not None:
         minutes = max(0, int(getattr(task, "pre_buffer_minutes", 0) or 0))
@@ -4048,23 +4040,9 @@ def build_tasks_tab_layout():
                 html.Button("💾 Save Tasks", id="save-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
                 dcc.Dropdown(id="json-file-select", options=[], placeholder="Select saved file to load...",
                              style={"width": "280px", "marginRight": "10px"}),
-                dcc.Input(
-                    id="load-pre-signal-minutes",
-                    type="number",
-                    min=0,
-                    step=1,
-                    placeholder="optional one-time minutes",
-                    style={"width": "205px", "marginRight": "10px"},
-                ),
                 html.Button("📂 Load Selected", id="load-tasks-btn", n_clicks=0, style={"marginRight": "10px"}),
                 html.Button("⚡ Recalc Table Flags", id="recalc-table-flags-btn", n_clicks=0, style={"marginRight": "10px"}),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px", "marginTop": "10px"}),
-            html.Div([
-                html.Strong("Temporary load override: "),
-                "leave the field empty or enter 0 to load the JSON normally. A positive value changes calculations/chart history only in RAM. It never downloads candles and refuses the load unless every requested range already exists continuously in the database.",
-            ],
-                style={"fontSize": "12px", "color": "#666", "marginBottom": "8px"},
-            ),
             html.H5("Add persistent left-side minutes for a NEW JSON", style={"margin": "10px 0 5px"}),
             html.Div([
                 dcc.Input(
@@ -4079,7 +4057,7 @@ def build_tasks_tab_layout():
                     "⬅️ Add minutes and prepare new JSON",
                     id="update-json-pre-signal-btn",
                     n_clicks=0,
-                    title="Add this many earlier minutes to each task; verify/download safely, then use Save Tasks with a new filename.",
+                    title="Add this many earlier minutes to each task; verify/download safely, then use Save prepared JSON with a new filename.",
                 ),
             ], style={"display": "flex", "alignItems": "center", "marginBottom": "6px"}),
             html.Div(
@@ -9040,7 +9018,6 @@ def make_oscillator_reversal_source_cache_key(task):
         getattr(task, "start_date", None),
         getattr(task, "end_date", None),
         getattr(task, "pre_buffer_minutes", None),
-        getattr(task, "_load_chart_start_ms", None),
         getattr(task, "status", None),
     )
 
@@ -11036,7 +11013,7 @@ def _read_stable_parquet_timestamps(file_path, attempts=3):
 
 
 def check_pre_signal_database_coverage(task_data, minutes, timestamp_cache=None):
-    """Verify continuous stored candles for a runtime-only JSON load override."""
+    """Verify continuous stored candles before preparing persistent JSON history."""
     try:
         symbols = task_data.get("symbols") or []
         symbol = symbols[0]
@@ -11275,12 +11252,6 @@ def _prepare_loaded_tasks_for_new_json(tasks, extra_minutes):
                     continue
                 task.pre_buffer_minutes = target_minutes
                 task._prepared_for_new_json = True
-                for attr in (
-                    "_load_pre_signal_override_minutes", "_load_chart_start_ms",
-                    "_load_original_pre_buffer_minutes",
-                ):
-                    if hasattr(task, attr):
-                        delattr(task, attr)
                 if hasattr(task, "_chart_cache"):
                     task._chart_cache.clear()
                 updated.append(task)
@@ -11426,10 +11397,9 @@ def save_prepared_tasks_to_json(n_clicks, filename):
     Output("golden-store-version", "data", allow_duplicate=True), # 🔧 CRITICAL FIX: Update version store to trigger table refresh
     Input("load-tasks-btn", "n_clicks"),
     State("json-file-select", "value"),
-    State("load-pre-signal-minutes", "value"),
     prevent_initial_call=True
 )
-def load_tasks_from_json(n, filepath, pre_signal_override):
+def load_tasks_from_json(n, filepath):
     if not filepath or not os.path.exists(filepath):
         return "⚠️ Please select a valid JSON file.", [], 0, 0, 0, dash.no_update  # 🔧 Added 6th value
     try:
@@ -11442,101 +11412,6 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
     except Exception as e:
         return f"❌ Load failed: {str(e)}", [], 0, 0, 0, dash.no_update  # 🔧 Added 6th value
 
-    override_minutes = None
-    override_starts = {}
-    if pre_signal_override not in (None, ""):
-        try:
-            override_minutes = int(pre_signal_override)
-        except (TypeError, ValueError):
-            return "❌ One-time minutes before signal must be a whole number.", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-        if override_minutes < 0:
-            return "❌ One-time minutes before signal cannot be negative.", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-        # Zero means "do not override". Treating it as a zero-length range can
-        # produce an empty interval when signal_time is between timeframe candle
-        # boundaries, incorrectly refusing an otherwise valid JSON load.
-        if override_minutes == 0:
-            override_minutes = None
-
-    if override_minutes is not None:
-        active_downloads = [
-            task for task in tm.get_all_tasks() if getattr(task, "status", None) == "running"
-        ]
-        with em.lock:
-            extension_running = em.running
-        if active_downloads or extension_running:
-            return (
-                "⚠️ One-time override verification did not start because market-data "
-                "downloads/extensions are active. Wait for them to finish, then load again. "
-                "The JSON and market-data files were not changed.",
-                dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update,
-            )
-        unavailable = []
-        unreadable_file_tasks = {}
-        busy_file_tasks = {}
-        coverage_timestamp_cache = {}
-        for item in data:
-            if not isinstance(item, dict) or not item.get("task_id"):
-                continue
-            available, detail = check_pre_signal_database_coverage(
-                item, override_minutes, coverage_timestamp_cache
-            )
-            if not available:
-                if str(detail).startswith("unreadable market-data file"):
-                    unreadable_file_tasks[detail] = unreadable_file_tasks.get(detail, 0) + 1
-                elif str(detail).startswith("busy/changing market-data file"):
-                    busy_file_tasks[detail] = busy_file_tasks.get(detail, 0) + 1
-                else:
-                    unavailable.append(f"{str(item.get('task_id'))[:8]}: {detail}")
-            else:
-                deep_valid, deep_detail = validate_stored_candle_range(
-                    (item.get("symbols") or [None])[0],
-                    str(item.get("timeframe")),
-                    detail,
-                    item.get("signal_time"),
-                )
-                if not deep_valid:
-                    unavailable.append(
-                        f"{str(item.get('task_id'))[:8]}: OHLCV validation failed ({deep_detail})"
-                    )
-                else:
-                    override_starts[str(item.get("task_id"))] = int(detail)
-        unavailable.extend(
-            f"{detail} ({task_count} task{'s' if task_count != 1 else ''} affected)"
-            for detail, task_count in unreadable_file_tasks.items()
-        )
-        unavailable.extend(
-            f"{detail} ({task_count} task{'s' if task_count != 1 else ''} affected)"
-            for detail, task_count in busy_file_tasks.items()
-        )
-        if unavailable:
-            shown = "; ".join(unavailable[:5])
-            suffix = f"; and {len(unavailable) - 5} more" if len(unavailable) > 5 else ""
-            has_unreadable_file = any(
-                "unreadable market-data file" in message for message in unavailable
-            )
-            has_busy_file = any(
-                "busy/changing market-data file" in message for message in unavailable
-            )
-            safety_note = (
-                " Safety stop: at least one physical Parquet file is unreadable; this is not "
-                "a normal missing-candle condition. Files were preserved and no JSON was loaded. "
-                "Use Data Analysis verification, then restore a known-good backup or safely "
-                "redownload the affected market data. Enter 0 only to load the stored task "
-                "records without applying this override."
-                if has_unreadable_file else ""
-            )
-            if has_busy_file:
-                safety_note += (
-                    " At least one file changed while it was being checked. Wait for all "
-                    "downloaders or other app instances to finish and retry; it has not been "
-                    "classified as corrupted."
-                )
-            return (
-                f"❌ One-time override was not applied and JSON was not loaded: "
-                f"{shown}{suffix}.{safety_note}",
-                dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update,
-            )
-        
     snapshot_audit = audit_task_snapshot_compatibility(data, reason="json_load_raw")
 
     loaded_ids = []
@@ -11581,12 +11456,6 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
             task = DownloadTask(**init_kwargs)
             task._loaded_from_json = True
             task._loaded_source_json = os.path.abspath(filepath)
-            if override_minutes is not None:
-                task._load_original_pre_buffer_minutes = task.pre_buffer_minutes
-                task.pre_buffer_minutes = override_minutes
-                task._load_pre_signal_override_minutes = override_minutes
-                task._load_chart_start_ms = override_starts[str(task.task_id)]
-
             # 2. Restore ALL Other Attributes from JSON
             for k, v in d.items():
                 if hasattr(task, k) and k not in init_kwargs:
@@ -11623,13 +11492,6 @@ def load_tasks_from_json(n, filepath, pre_signal_override):
         
     count = len(loaded_ids)
     msg = f"✅ Loaded {count} tasks from {os.path.basename(filepath)}"
-    if override_minutes is not None:
-        msg += (
-            f" with one-time {override_minutes}-minute pre-signal override "
-            "(RAM only; JSON unchanged; database coverage and OHLCV verified). "
-            "Chart history uses it immediately; rerun Events, Strategy and Impulse "
-            "before relying on derived results"
-        )
     if skipped > 0:
         skip_parts = []
         if skipped_missing_id:
