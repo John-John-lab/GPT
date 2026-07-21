@@ -3249,6 +3249,7 @@ const chartToggleStores = {
     'toggle-oscillator-sync-info-btn': ['oscillator-sync-info-store', false],
     'toggle-chart-extend-x-btn': ['chart-extend-x-store', false],
     'toggle-chart-focus-entry-btn': ['chart-focus-entry-store', false],
+    'toggle-measure-oscillator-range-btn': ['measure-oscillator-range-store', false],
     'toggle-measure-anchor-btn': ['measure-anchor-store', false],
     'toggle-measure-hover-btn': ['measure-hover-store', true],
     'toggle-impulses-btn': ['impulse-visible-store', true],
@@ -3304,6 +3305,7 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-oscillator-sync-info-btn') chartToggleState[button.id] = label.indexOf('Osc All: On') >= 0;
     if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
     if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
+    if (button.id === 'toggle-measure-oscillator-range-btn') chartToggleState[button.id] = label.indexOf('Osc Range: On') >= 0;
     if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
@@ -3321,6 +3323,11 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
     if (button.id === 'toggle-oscillator-sync-info-btn') button.textContent = active ? 'Osc All: On' : 'Osc All: Off';
     if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
+    if (button.id === 'toggle-measure-oscillator-range-btn') {
+        button.textContent = active ? 'Osc Range: On' : 'Osc Range: Off';
+        window.__taskChartOscillatorRangeEnabled = active;
+        if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup();
+    }
     if (chartToggleLabels[button.id]) button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
     return true;
 }
@@ -3412,6 +3419,38 @@ function showNativeMeasureResultAfterMouseup() {
                 pointer.style.left = pointX + 'px'; pointer.style.top = pointY + 'px'; pointer.style.width = length + 'px'; pointer.style.transform = 'rotate(' + Math.atan2(dy, dx) + 'rad)';
             });
             root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { if (!activeIds[node.id]) node.remove(); });
+
+            // A DOM overlay (rather than a Plotly shape) keeps oscillator range
+            // highlighting separate from user measure rectangles. It therefore
+            // cannot be deleted by Clear/Backspace or mistaken for a measure.
+            const activeRangeIds = {};
+            if (window.__taskChartOscillatorRangeEnabled) {
+                const oscillatorAxes = Object.keys(plot._fullLayout || {}).map(function(key) {
+                    return plot._fullLayout[key];
+                }).filter(function(axis) {
+                    return axis && axis._id && axis._id !== 'y' && /^y[0-9]+$/.test(axis._id) && axis.visible !== false && axis._length > 0;
+                });
+                shapes.forEach(function(measureShape, measureIndex) {
+                    if (measureIndex < baseCount || !measureShape || (measureShape.type && measureShape.type !== 'rect')) return;
+                    const leftValue = xaxis.l2p(xaxis.d2l(measureShape.x0));
+                    const rightValue = xaxis.l2p(xaxis.d2l(measureShape.x1));
+                    if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) return;
+                    const left = svgRect.left - rootRect.left + xaxis._offset + Math.min(leftValue, rightValue);
+                    const width = Math.abs(rightValue - leftValue);
+                    oscillatorAxes.forEach(function(axis) {
+                        const rangeId = 'task-chart-measure-osc-range-' + measureIndex + '-' + axis._id;
+                        activeRangeIds[rangeId] = true;
+                        const range = document.getElementById(rangeId) || root.appendChild(document.createElement('div'));
+                        range.id = rangeId;
+                        range.style.cssText = 'position:absolute;z-index:10020;pointer-events:none;background:rgba(158,158,158,.20);border-left:1px solid rgba(117,117,117,.60);border-right:1px solid rgba(117,117,117,.60);';
+                        range.style.left = left + 'px';
+                        range.style.top = (svgRect.top - rootRect.top + axis._offset) + 'px';
+                        range.style.width = Math.max(1, width) + 'px';
+                        range.style.height = axis._length + 'px';
+                    });
+                });
+            }
+            root.querySelectorAll('[id^="task-chart-measure-osc-range-"]').forEach(function(node) { if (!activeRangeIds[node.id]) node.remove(); });
         }
     }, 80);
 }
@@ -3451,7 +3490,7 @@ document.addEventListener('click', function(e) {
             window.Plotly.relayout(plot, {shapes: (plot.layout.shapes || []).slice(0, keep)});
             window.__taskChartMeasureShapes = [];
         }
-        chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
+        chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
         return;
     }
 
@@ -3742,6 +3781,7 @@ def build_root_layout():
     dcc.Store(id="measure-mode-store", data=False),
     dcc.Store(id="measure-anchor-store", data=False),
     dcc.Store(id="measure-hover-store", data=True),
+    dcc.Store(id="measure-oscillator-range-store", data=False),
     dcc.Store(id="chart-info-box-store", data=False),
     dcc.Store(id="oscillator-info-box-store", data=True),
     dcc.Store(id="oscillator-sync-info-store", data=False),
@@ -3957,6 +3997,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Osc Range: Off", id="toggle-measure-oscillator-range-btn", title="Shade every visible oscillator over each measured time range", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "104px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Snap: Off", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
@@ -7265,6 +7315,27 @@ def update_measure_hover_button(hover_enabled):
     }
     return ("Hover: On" if hover_enabled else "Hover: Off"), base_style
 
+
+@app.callback(
+    Output("toggle-measure-oscillator-range-btn", "children"),
+    Output("toggle-measure-oscillator-range-btn", "style"),
+    Input("measure-oscillator-range-store", "data"),
+    prevent_initial_call=False,
+)
+def update_measure_oscillator_range_button(enabled):
+    style = {
+        "background": "#eceff1" if enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #78909c" if enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "104px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if enabled else "normal",
+    }
+    return ("Osc Range: On" if enabled else "Osc Range: Off"), style
+
 @app.callback(
     Output("toggle-chart-info-box-btn", "children"),
     Output("toggle-chart-info-box-btn", "style"),
@@ -7408,13 +7479,14 @@ def update_chart_focus_entry_button(focus_enabled):
 
 clientside_callback(
     """
-function(measureMode, measureHover, candleInfo, oscillatorInfo, oscillatorSyncInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
+function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo, oscillatorSyncInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (!plot || !window.Plotly) return window.dash_clientside.no_update;
+    window.__taskChartOscillatorRangeEnabled = Boolean(oscillatorRange);
     if (window.attachNativeMeasureOverlayListeners) window.attachNativeMeasureOverlayListeners(plot);
     // Remember shapes supplied by the figure itself. User measurements are
     // appended after these, so Clear/Backspace cannot delete Signal Level.
@@ -7535,12 +7607,14 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, oscillatorSyncIn
             applyHoverVisibility(currentPlot);
         }, delay);
     });
+    if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup();
     return {ts: Date.now(), measure: Boolean(measureMode), hover: Boolean(showHover)};
 }
 """,
     Output("chart-dragmode-enforcer-store", "data"),
     Input("measure-mode-store", "data"),
     Input("measure-hover-store", "data"),
+    Input("measure-oscillator-range-store", "data"),
     Input("chart-info-box-store", "data"),
     Input("oscillator-info-box-store", "data"),
     Input("oscillator-sync-info-store", "data"),
