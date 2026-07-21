@@ -3320,20 +3320,29 @@ function showNativeMeasureResultAfterMouseup() {
             const svgRect = svg.getBoundingClientRect();
             const rootRect = root.getBoundingClientRect();
             root.style.position = 'relative';
-            const label = document.getElementById('task-chart-measure-label') || root.appendChild(document.createElement('div'));
-            label.id = 'task-chart-measure-label';
-            label.textContent = (delta >= 0 ? '▲ ' : '▼ ') + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '% | ' + timeText;
-            label.style.cssText = 'position:absolute;z-index:10051;pointer-events:none;background:rgba(25,118,210,.92);color:#fff;padding:3px 6px;border-radius:3px;font:11px sans-serif;white-space:nowrap;';
-            const pointX = svgRect.left - rootRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(shape.x1));
-            const pointY = svgRect.top - rootRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(shape.y1));
-            label.style.left = (pointX + 18) + 'px';
-            label.style.top = (pointY - 30) + 'px';
-            const pointer = document.getElementById('task-chart-measure-pointer') || root.appendChild(document.createElement('div'));
-            pointer.id = 'task-chart-measure-pointer';
-            const dx = 18, dy = -16, length = Math.sqrt(dx * dx + dy * dy);
-            pointer.style.cssText = 'position:absolute;z-index:10050;pointer-events:none;height:1px;background:#1976d2;transform-origin:0 0;';
-            pointer.style.left = pointX + 'px'; pointer.style.top = pointY + 'px';
-            pointer.style.width = length + 'px'; pointer.style.transform = 'rotate(' + Math.atan2(dy, dx) + 'rad)';
+            const baseCount = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+            const activeIds = {};
+            shapes.forEach(function(measureShape, index) {
+                if (index < baseCount || !measureShape || (measureShape.type && measureShape.type !== 'rect')) return;
+                const my0 = Number(measureShape.y0), my1 = Number(measureShape.y1);
+                if (!Number.isFinite(my0) || !Number.isFinite(my1)) return;
+                const md = my1 - my0, mp = my0 ? md / my0 * 100 : 0;
+                const ms = Date.parse(measureShape.x0), me = Date.parse(measureShape.x1);
+                const mt = Number.isFinite(ms) && Number.isFinite(me) ? (Math.abs(me - ms) / 1000 < 60 ? Math.round(Math.abs(me - ms) / 1000) + 's' : (Math.abs(me - ms) / 60000).toFixed(1) + 'm') : 'time n/a';
+                const labelId = 'task-chart-measure-label-' + index, pointerId = 'task-chart-measure-pointer-' + index;
+                activeIds[labelId] = true; activeIds[pointerId] = true;
+                const pointX = svgRect.left - rootRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(measureShape.x1));
+                const pointY = svgRect.top - rootRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(measureShape.y1));
+                const label = document.getElementById(labelId) || root.appendChild(document.createElement('div'));
+                label.id = labelId; label.textContent = (md >= 0 ? '▲ ' : '▼ ') + (mp >= 0 ? '+' : '') + mp.toFixed(2) + '% | ' + mt;
+                label.style.cssText = 'position:absolute;z-index:10051;pointer-events:none;background:rgba(25,118,210,.92);color:#fff;padding:3px 6px;border-radius:3px;font:11px sans-serif;white-space:nowrap;';
+                label.style.left = (pointX + 18) + 'px'; label.style.top = (pointY - 30) + 'px';
+                const pointer = document.getElementById(pointerId) || root.appendChild(document.createElement('div'));
+                pointer.id = pointerId; const dx = 18, dy = -16, length = Math.sqrt(dx * dx + dy * dy);
+                pointer.style.cssText = 'position:absolute;z-index:10050;pointer-events:none;height:1px;background:#1976d2;transform-origin:0 0;';
+                pointer.style.left = pointX + 'px'; pointer.style.top = pointY + 'px'; pointer.style.width = length + 'px'; pointer.style.transform = 'rotate(' + Math.atan2(dy, dx) + 'rad)';
+            });
+            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { if (!activeIds[node.id]) node.remove(); });
         }
     }, 80);
 }
@@ -3367,10 +3376,7 @@ document.addEventListener('click', function(e) {
             const keep = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
             window.Plotly.relayout(plot, {shapes: (plot.layout.shapes || []).slice(0, keep)});
         }
-        const measureLabel = document.getElementById('task-chart-measure-label');
-        if (measureLabel) measureLabel.remove();
-        const measurePointer = document.getElementById('task-chart-measure-pointer');
-        if (measurePointer) measurePointer.remove();
+        chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
         return;
     }
 
@@ -3468,10 +3474,7 @@ document.addEventListener('keydown', function(e) {
     e.preventDefault();
     window.Plotly.relayout(plot, {shapes: shapes.slice(0, -1)});
     if (shapes.length - 1 <= base) {
-        const label = document.getElementById('task-chart-measure-label');
-        if (label) label.remove();
-        const pointer = document.getElementById('task-chart-measure-pointer');
-        if (pointer) pointer.remove();
+        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
     }
 }, true);
 // Toggle column highlight on header click
