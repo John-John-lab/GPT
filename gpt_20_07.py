@@ -7529,7 +7529,6 @@ def _extract_measure_box(relayout_data):
 
 @app.callback(
     Output("measure-points-store", "data", allow_duplicate=True),
-    Output("measure-result-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
     State("measure-mode-store", "data"),
     State("chart-task-id", "data"),
@@ -7537,38 +7536,24 @@ def _extract_measure_box(relayout_data):
 )
 def capture_measure_box(relayout_data, measure_mode, task_id):
     if not measure_mode or not relayout_data:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     box = _extract_measure_box(relayout_data)
     if not box:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     try:
         y0 = float(box["y0"])
         y1 = float(box["y1"])
     except (TypeError, ValueError):
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     first = {"x": box["x0"], "y": y0}
     second = {"x": box["x1"], "y": y1}
-    price_diff = y1 - y0
-    pct_change = (price_diff / y0) * 100 if y0 else 0
-    direction = "Up" if price_diff >= 0 else "Down"
-    task = tm.get_task(task_id) if task_id else None
-    timeframe = task.timeframe if task else None
-    time_text, bars_text = _format_measure_time_delta(first["x"], second["x"], timeframe)
-    result = {
-        "text": f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
-        "task_id": task_id,
-        "first": first,
-        "second": second,
-        "shape": box,
-        "price_diff": price_diff,
-        "pct_change": pct_change,
-        "time_text": time_text,
-        "bars_text": bars_text,
-    }
-    return {"task_id": task_id, "first": first, "second": second}, result
+    # The result itself is calculated in the matching clientside callback so
+    # it is visible immediately. Keep this server callback only for point
+    # state, avoiding two callbacks with the same relayout input/output pair.
+    return {"task_id": task_id, "first": first, "second": second}
 
 
 @app.callback(
@@ -7652,14 +7637,29 @@ def clear_measure(_):
 @app.callback(
     Output("measure-result", "children"),
     Input("measure-result-store", "data"),
-    prevent_initial_call=False
+    Input("task-chart", "relayoutData"),
+    State("measure-mode-store", "data"),
+    State("chart-task-id", "data"),
+    prevent_initial_call=False,
 )
-def show_measure_result(result):
+def render_measure_result(result, relayout_data, measure_mode, task_id):
+    """Render point and rectangle measurements through one reliable Dash output."""
+    if ctx.triggered_id == "task-chart" and measure_mode:
+        box = _extract_measure_box(relayout_data)
+        if box:
+            try:
+                y0, y1 = float(box["y0"]), float(box["y1"])
+            except (TypeError, ValueError):
+                return "📏 Measure box could not read its price values. Draw it again inside the candle pane."
+            price_diff = y1 - y0
+            pct_change = price_diff / y0 * 100 if y0 else 0
+            task = tm.get_task(task_id) if task_id else None
+            time_text, bars_text = _format_measure_time_delta(box["x0"], box["x1"], task.timeframe if task else None)
+            direction = "Up" if price_diff >= 0 else "Down"
+            return f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}"
     if isinstance(result, dict):
         return result.get("text", "")
-    if result:
-        return result
-    return ""
+    return result or ""
 
 @app.callback(
     Output("measure-hint", "children"),
@@ -8277,6 +8277,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         meta={
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
+            "timeframe": task.timeframe,
         },
         # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
         # or marker overlays rebuild this figure.  The key changes only when a
