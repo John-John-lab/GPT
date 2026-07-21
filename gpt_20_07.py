@@ -794,13 +794,74 @@ last_rendered_stats = {} # Cache for summary tables to prevent disappearance
 # read-only views of the current Golden Store task/data snapshot. Keep these
 # bounded: diagnostics should get faster on repeated parameter runs without
 # becoming an unbounded in-memory database.
-OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 1500
+OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 32
+OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX_BYTES = 192 * 1024 * 1024
 oscillator_reversal_source_cache = OrderedDict()
+oscillator_reversal_source_cache_bytes = 0
 
-# Keep enough recently opened chart sources for quick left/right navigation.
-# The cache is still bounded and invalidated by parquet mtime/size.
-CHART_PARQUET_CACHE_MAX = 24
+# Conservative chart caches for older machines: source entries are limited by
+# both count and total DataFrame memory, never just by number of coin pairs.
+# Entries are still invalidated by parquet mtime/size.
+CHART_PARQUET_CACHE_MAX = 6
+CHART_PARQUET_CACHE_MAX_BYTES = 192 * 1024 * 1024
 chart_parquet_cache = OrderedDict()
+chart_parquet_cache_bytes = 0
+CHART_FILE_END_CACHE_MAX = 48
+chart_file_end_cache = OrderedDict()
+CHART_TASK_INDICATOR_CACHE_MAX = 2
+chart_task_indicator_cache = OrderedDict()
+# Warm one neighbouring range while the user studies the current chart. The
+# source cache is byte-bounded, so this is safe on older Macs and makes the
+# first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
+CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
+chart_prefetch_pending = set()
+chart_prefetch_lock = threading.Lock()
+
+def _chart_dataframe_bytes(df):
+    """Return an accurate-enough in-memory size for a cached DataFrame."""
+    try:
+        return int(df.memory_usage(index=True, deep=True).sum())
+    except Exception:
+        return 0
+
+def retain_chart_task_indicator_cache(task):
+    """Keep lazy indicator data for only the active chart and one recent chart."""
+    task_id = str(getattr(task, "task_id", ""))
+    if not task_id:
+        return
+    chart_task_indicator_cache[task_id] = task
+    chart_task_indicator_cache.move_to_end(task_id)
+    while len(chart_task_indicator_cache) > CHART_TASK_INDICATOR_CACHE_MAX:
+        _, evicted_task = chart_task_indicator_cache.popitem(last=False)
+        if evicted_task is not task and hasattr(evicted_task, "_chart_cache"):
+            evicted_task._chart_cache.clear()
+
+def get_chart_file_end_timestamp(fp):
+    """Return a parquet file's latest timestamp without rescanning it per task.
+
+    Tasks for the same pair/timeframe often have no explicit end date.  The old
+    chart path read the timestamp column every time the user pressed Next,
+    even though the answer only changes when the parquet file changes.
+    """
+    stat = os.stat(fp)
+    cache_key = (fp, stat.st_mtime_ns, stat.st_size)
+    cached = chart_file_end_cache.get(cache_key)
+    if cached is not None:
+        chart_file_end_cache.move_to_end(cache_key)
+        return cached
+
+    # Retire cached bounds for an older version of this file.
+    for old_key in [key for key in chart_file_end_cache if key[0] == fp and key != cache_key]:
+        chart_file_end_cache.pop(old_key, None)
+    timestamps = pd.read_parquet(fp, columns=["timestamp"])
+    if timestamps.empty:
+        return None
+    latest = int(timestamps["timestamp"].max())
+    chart_file_end_cache[cache_key] = latest
+    chart_file_end_cache.move_to_end(cache_key)
+    while len(chart_file_end_cache) > CHART_FILE_END_CACHE_MAX:
+        chart_file_end_cache.popitem(last=False)
+    return latest
 
 def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
     """Read only the chart period, with a bounded mtime-aware cache.
@@ -811,6 +872,7 @@ def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
     the chart read-only and preserve the exact same inclusive time bounds while
     allowing PyArrow to skip unrelated row groups.
     """
+    global chart_parquet_cache_bytes
     stat = os.stat(fp)
     cache_key = (fp, stat.st_mtime_ns, stat.st_size, start_ms, end_ms)
     cached = chart_parquet_cache.get(cache_key)
@@ -824,7 +886,8 @@ def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
         key for key in chart_parquet_cache
         if key[0] == fp and (key[1] != stat.st_mtime_ns or key[2] != stat.st_size)
     ]:
-        chart_parquet_cache.pop(old_key, None)
+        stale_df = chart_parquet_cache.pop(old_key, None)
+        chart_parquet_cache_bytes -= _chart_dataframe_bytes(stale_df) if stale_df is not None else 0
 
     filters = []
     if start_ms is not None:
@@ -832,11 +895,56 @@ def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
     if end_ms is not None:
         filters.append(("timestamp", "<=", int(end_ms)))
     df = pd.read_parquet(fp, filters=filters or None)
-    chart_parquet_cache[cache_key] = df
-    chart_parquet_cache.move_to_end(cache_key)
-    while len(chart_parquet_cache) > CHART_PARQUET_CACHE_MAX:
-        chart_parquet_cache.popitem(last=False)
+    df_bytes = _chart_dataframe_bytes(df)
+    # A single oversized range is returned to the current chart but is not
+    # retained, preventing one long history window from exhausting RAM.
+    if df_bytes <= CHART_PARQUET_CACHE_MAX_BYTES:
+        chart_parquet_cache[cache_key] = df
+        chart_parquet_cache_bytes += df_bytes
+        chart_parquet_cache.move_to_end(cache_key)
+        while (len(chart_parquet_cache) > CHART_PARQUET_CACHE_MAX or
+               chart_parquet_cache_bytes > CHART_PARQUET_CACHE_MAX_BYTES):
+            _, evicted_df = chart_parquet_cache.popitem(last=False)
+            chart_parquet_cache_bytes -= _chart_dataframe_bytes(evicted_df)
     return df
+
+def prefetch_chart_source(task):
+    """Warm one neighbouring task's source data without blocking the UI."""
+    if not task or not getattr(task, "signal_time", None):
+        return
+    try:
+        fp = os.path.join(symbol_timeframe_path(task.symbols[0], task.timeframe), "data.parquet")
+        if not os.path.exists(fp):
+            return
+        start_ms = task_pre_signal_start_ms(task)
+        end_ms = (int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                  if task.end_date else get_chart_file_end_timestamp(fp))
+        if end_ms is not None:
+            read_chart_parquet_cached(fp, start_ms, end_ms)
+    except Exception:
+        # Prefetch is optional; it must never affect foreground navigation.
+        return
+
+def prefetch_chart_source_async(task):
+    """Start at most one background warm-up for each task id."""
+    if not CHART_PREFETCH_ENABLED:
+        return
+    task_id = str(getattr(task, "task_id", ""))
+    if not task_id:
+        return
+    with chart_prefetch_lock:
+        if task_id in chart_prefetch_pending:
+            return
+        chart_prefetch_pending.add(task_id)
+
+    def _warm():
+        try:
+            prefetch_chart_source(task)
+        finally:
+            with chart_prefetch_lock:
+                chart_prefetch_pending.discard(task_id)
+
+    threading.Thread(target=_warm, name="ChartPrefetch", daemon=True).start()
 
 STRATEGY_SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_settings")
 OSCILLATOR_SETTINGS_IDS = [
@@ -884,7 +992,7 @@ stats_cache_version = -1         # Version of data these stats belong to
 
 def reset_display_caches(reason=""):
     """Clear UI-only rendered page, summary, and diagnostic source caches."""
-    global _cached_golden_version, cached_signal_stats_html, cached_toward_strategy_stats_html, cached_small_stats_data, stats_cache_version
+    global _cached_golden_version, cached_signal_stats_html, cached_toward_strategy_stats_html, cached_small_stats_data, stats_cache_version, oscillator_reversal_source_cache_bytes
     if "_page_html_cache" in globals():
         _page_html_cache.clear()
     _cached_golden_version = None
@@ -894,6 +1002,7 @@ def reset_display_caches(reason=""):
     stats_cache_version = -1
     if "oscillator_reversal_source_cache" in globals():
         oscillator_reversal_source_cache.clear()
+        oscillator_reversal_source_cache_bytes = 0
     if reason:
         print(f"🔄 [GOLDEN] Display caches reset: {reason}")
 
@@ -3135,7 +3244,8 @@ const chartToggleStores = {
     'toggle-macd-btn': ['macd-visible-store', false],
     'toggle-disparity-btn': ['disparity-visible-store', false],
     'toggle-strategy-btn': ['strategy-visible-store', false],
-    'toggle-chart-info-box-btn': ['chart-info-box-store', true],
+    'toggle-chart-info-box-btn': ['chart-info-box-store', false],
+    'toggle-oscillator-info-box-btn': ['oscillator-info-box-store', true],
     'toggle-chart-extend-x-btn': ['chart-extend-x-store', false],
     'toggle-measure-anchor-btn': ['measure-anchor-store', false],
     'toggle-measure-hover-btn': ['measure-hover-store', true],
@@ -3156,7 +3266,8 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-measure-btn') chartToggleState[button.id] = label.indexOf('Measuring') >= 0;
     if (button.id === 'toggle-measure-anchor-btn') chartToggleState[button.id] = label.indexOf('Snap: On') >= 0;
     if (button.id === 'toggle-measure-hover-btn') chartToggleState[button.id] = label.indexOf('Hover: On') >= 0;
-    if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Info Box: On') >= 0;
+    if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
+    if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
     if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
@@ -3167,11 +3278,105 @@ function applyChartToggleImmediately(button) {
     button.style.background = active ? (warm ? '#fff8e1' : (green ? '#e8f5e9' : '#e3f2fd')) : 'transparent';
     button.style.borderWidth = active ? '2px' : '1px';
     if (button.id === 'toggle-measure-btn') {
-        button.textContent = active ? '📏 Measuring' : 'Measure';
+        button.textContent = active ? '📐 Measuring' : '📐 Measure';
         button.style.fontWeight = active ? 'bold' : 'normal';
     }
+    if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
+    if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
     return true;
 }
+// Chrome/Plotly compatibility fallback: older Plotly bundles can paint a
+// drawrect shape before Dash publishes relayoutData. Read Plotly's own layout
+// after mouseup and update the already-rendered result element immediately.
+function refreshNativeMeasureResultSoon() {
+    window.clearTimeout(window.__taskChartMeasureRefreshTimer);
+    window.__taskChartMeasureRefreshTimer = window.setTimeout(function() {
+        showNativeMeasureResultAfterMouseup();
+    }, 40);
+}
+
+function attachNativeMeasureOverlayListeners(plot) {
+    if (!plot || plot.__dashMeasureOverlayListenersAttached) return;
+    plot.__dashMeasureOverlayListenersAttached = true;
+    // Plotly shapes are data-anchored and move correctly by themselves. The
+    // HTML labels are pixel-anchored, so redraw them after every zoom, pan,
+    // and Extend X relayout to keep each label and pointer on its rectangle.
+    if (typeof plot.on === 'function') {
+        plot.on('plotly_relayout', refreshNativeMeasureResultSoon);
+    }
+    if (typeof window.ResizeObserver === 'function') {
+        plot.__dashMeasureResizeObserver = new window.ResizeObserver(refreshNativeMeasureResultSoon);
+        plot.__dashMeasureResizeObserver.observe(plot);
+    } else {
+        window.addEventListener('resize', refreshNativeMeasureResultSoon);
+    }
+}
+
+function showNativeMeasureResultAfterMouseup() {
+    window.setTimeout(function() {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (!plot || !plot.layout) return;
+        attachNativeMeasureOverlayListeners(plot);
+        const shapes = (plot.layout && plot.layout.shapes) || (plot._fullLayout && plot._fullLayout.shapes) || [];
+        const baseCount = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+        // Preserve only user rectangles across indicator figure rebuilds.
+        const userShapes = shapes.slice(baseCount).filter(function(item) {
+            return item && (!item.type || item.type === 'rect') && item.x0 != null && item.x1 != null && item.y0 != null && item.y1 != null;
+        });
+        window.__taskChartMeasureShapes = userShapes.map(function(item) { return Object.assign({}, item); });
+        const shape = userShapes[userShapes.length - 1];
+        if (!shape) {
+            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
+            return;
+        }
+        const y0 = Number(shape.y0), y1 = Number(shape.y1);
+        if (!Number.isFinite(y0) || !Number.isFinite(y1)) return;
+        const delta = y1 - y0, pct = y0 ? delta / y0 * 100 : 0;
+        const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
+        let timeText = 'time n/a';
+        if (Number.isFinite(start) && Number.isFinite(end)) {
+            const seconds = Math.abs(end - start) / 1000;
+            timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
+        }
+        const result = document.getElementById('measure-result');
+        const text = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText;
+        if (result) result.textContent = text;
+        // Attach the label to the chart container, not the browser viewport,
+        // so it scrolls and moves with the measured rectangle.
+        const xaxis = plot._fullLayout && plot._fullLayout.xaxis, yaxis = plot._fullLayout && plot._fullLayout.yaxis;
+        const svg = plot.querySelector('.main-svg');
+        if (xaxis && yaxis && svg && xaxis.d2l && yaxis.d2l && xaxis.l2p && yaxis.l2p) {
+            const svgRect = svg.getBoundingClientRect();
+            const rootRect = root.getBoundingClientRect();
+            root.style.position = 'relative';
+            const baseCount = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+            const activeIds = {};
+            shapes.forEach(function(measureShape, index) {
+                if (index < baseCount || !measureShape || (measureShape.type && measureShape.type !== 'rect')) return;
+                const my0 = Number(measureShape.y0), my1 = Number(measureShape.y1);
+                if (!Number.isFinite(my0) || !Number.isFinite(my1)) return;
+                const md = my1 - my0, mp = my0 ? md / my0 * 100 : 0;
+                const ms = Date.parse(measureShape.x0), me = Date.parse(measureShape.x1);
+                const mt = Number.isFinite(ms) && Number.isFinite(me) ? (Math.abs(me - ms) / 1000 < 60 ? Math.round(Math.abs(me - ms) / 1000) + 's' : (Math.abs(me - ms) / 60000).toFixed(1) + 'm') : 'time n/a';
+                const labelId = 'task-chart-measure-label-' + index, pointerId = 'task-chart-measure-pointer-' + index;
+                activeIds[labelId] = true; activeIds[pointerId] = true;
+                const pointX = svgRect.left - rootRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(measureShape.x1));
+                const pointY = svgRect.top - rootRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(measureShape.y1));
+                const label = document.getElementById(labelId) || root.appendChild(document.createElement('div'));
+                label.id = labelId; label.textContent = (md >= 0 ? '▲ ' : '▼ ') + (mp >= 0 ? '+' : '') + mp.toFixed(2) + '% | ' + mt;
+                label.style.cssText = 'position:absolute;z-index:10051;pointer-events:none;background:rgba(25,118,210,.92);color:#fff;padding:3px 6px;border-radius:3px;font:11px sans-serif;white-space:nowrap;';
+                label.style.left = (pointX + 18) + 'px'; label.style.top = (pointY - 30) + 'px';
+                const pointer = document.getElementById(pointerId) || root.appendChild(document.createElement('div'));
+                pointer.id = pointerId; const dx = 18, dy = -16, length = Math.sqrt(dx * dx + dy * dy);
+                pointer.style.cssText = 'position:absolute;z-index:10050;pointer-events:none;height:1px;background:#1976d2;transform-origin:0 0;';
+                pointer.style.left = pointX + 'px'; pointer.style.top = pointY + 'px'; pointer.style.width = length + 'px'; pointer.style.transform = 'rotate(' + Math.atan2(dy, dx) + 'rad)';
+            });
+            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { if (!activeIds[node.id]) node.remove(); });
+        }
+    }, 80);
+}
+document.addEventListener('mouseup', showNativeMeasureResultAfterMouseup, true);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
@@ -3190,6 +3395,21 @@ document.addEventListener('click', function(e) {
     // registered clientside callback lookup, which older Dash renderers can
     // fail with "undefined (reading apply)" after hot reloads/cache changes.
     if (applyChartToggleImmediately(button)) return;
+
+    if (button.id === 'clear-measure-btn') {
+        const chartRoot = document.getElementById('task-chart');
+        const plot = chartRoot ? (chartRoot.querySelector('.js-plotly-plot') || chartRoot) : null;
+        // Clear native drawrect shapes locally.  The server callback below only
+        // clears the small result Stores, so this cannot reload or reposition
+        // the candle chart.
+        if (plot && window.Plotly) {
+            const keep = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+            window.Plotly.relayout(plot, {shapes: (plot.layout.shapes || []).slice(0, keep)});
+            window.__taskChartMeasureShapes = [];
+        }
+        chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
+        return;
+    }
 
     if (button.id === 'close-chart-modal') {
         applyChartRowHighlight(null);
@@ -3273,6 +3493,22 @@ document.addEventListener('click', function(e) {
             console.error('Button click handler error:', e, 'Target:', button);
         }
 });
+// Backspace removes the newest user-drawn rectangle while preserving figure
+// shapes (notably the yellow Signal Level). Do not intercept text editing.
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Backspace' || e.target.matches('input, textarea, [contenteditable="true"]')) return;
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    const shapes = plot && plot.layout ? (plot.layout.shapes || []) : [];
+    const base = Math.max(0, Number(plot && plot.__dashBaseShapeCount || 0));
+    if (!plot || !window.Plotly || shapes.length <= base) return;
+    e.preventDefault();
+    window.Plotly.relayout(plot, {shapes: shapes.slice(0, -1)});
+    window.__taskChartMeasureShapes = shapes.slice(base, -1).map(function(item) { return Object.assign({}, item); });
+    if (shapes.length - 1 <= base) {
+        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
+    }
+}, true);
 // Toggle column highlight on header click
 // Toggle row highlight on ANY cell click (not a button, not a header, not an interactive-button DIV)
 // CRITICAL FIX: Must check if click originated from inside a table cell, not just any element
@@ -3462,7 +3698,8 @@ def build_root_layout():
     dcc.Store(id="measure-mode-store", data=False),
     dcc.Store(id="measure-anchor-store", data=False),
     dcc.Store(id="measure-hover-store", data=True),
-    dcc.Store(id="chart-info-box-store", data=True),
+    dcc.Store(id="chart-info-box-store", data=False),
+    dcc.Store(id="oscillator-info-box-store", data=True),
     dcc.Store(id="chart-extend-x-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
@@ -3666,7 +3903,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Measure", id="toggle-measure-btn", style={
+                            html.Button("📐 Measure", id="toggle-measure-btn", title="Measure price and time by drawing a rectangle", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3696,8 +3933,8 @@ def build_root_layout():
                                 "minWidth": "78px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Info Box: On", id="toggle-chart-info-box-btn", title="Toggle the candle hover information box while keeping the vertical crosshair line", style={
-                                "background": "#fff8e1",
+                            html.Button("Candle Info: Off", id="toggle-chart-info-box-btn", title="Toggle exact OHLC information for the main candle chart", style={
+                                "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid #f9a825",
                                 "padding": "6px 10px",
@@ -3705,6 +3942,10 @@ def build_root_layout():
                                 "fontSize": "12px",
                                 "minWidth": "94px",
                                 "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Osc Info: On", id="toggle-oscillator-info-box-btn", title="Toggle exact hover values in every visible oscillator pane", style={
+                                "background": "#fff8e1", "color": "black", "border": "1px solid #f9a825",
+                                "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap"
                             }),
                             html.Button("Extend X: Off", id="toggle-chart-extend-x-btn", title="Add TradingView-style empty space to the right side of the chart", style={
                                 "background": "transparent",
@@ -6613,6 +6854,23 @@ def get_chartable_tasks_for_navigation():
     chartable = [t for t in tasks if getattr(t, 'status', None) == "completed"]
     return tasks, chartable
 
+def prefetch_chart_neighbors(task_id):
+    """Warm immediate previous/next chart sources after a chart opens."""
+    if not task_id or not CHART_PREFETCH_ENABLED:
+        return
+    _, chartable = get_chartable_tasks_for_navigation()
+    ids = [str(t.task_id) for t in chartable]
+    try:
+        index = ids.index(str(task_id))
+    except ValueError:
+        return
+    # A single adjacent source gives the best old-SSD tradeoff. Prefer Next,
+    # because it is the common navigation direction.
+    if index + 1 < len(chartable):
+        prefetch_chart_source_async(chartable[index + 1])
+    elif index > 0:
+        prefetch_chart_source_async(chartable[index - 1])
+
 def page_for_task(task_id, tasks):
     for idx, task in enumerate(tasks):
         if str(getattr(task, 'task_id', '')) == str(task_id):
@@ -6688,6 +6946,9 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
         # rows.  Do not force the task table to jump pages here; that expensive
         # table rebuild made left/right chart navigation feel very slow.
         updated_context = dict(event_context, index=next_idx)
+        warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
+        if 0 <= warm_idx < len(events):
+            prefetch_chart_source_async(tm.get_task(str(events[warm_idx].get("task_id") or "")))
         return target_id, no_update, {f"{target_id}_chart": time.time()}, updated_context, carry_chart_view_state_to_task(chart_view_state, target_id)
 
     _, chartable = get_chartable_tasks_for_navigation()
@@ -6704,6 +6965,9 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
     # Keep chart navigation independent from the main task table.  Jumping the
     # table page here triggers an expensive table rebuild and makes the chart's
     # left/right buttons feel delayed on large task sets.
+    warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
+    if 0 <= warm_idx < len(chartable):
+        prefetch_chart_source_async(chartable[warm_idx])
     return target_id, no_update, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
 clientside_callback(
@@ -6760,6 +7024,7 @@ def set_chart_task_id(trigger_data, click_store):
     if current_time - float(click_store.get(key, 0) or 0) < 0.5:
         return no_update, no_update, no_update
     click_store[key] = current_time
+    prefetch_chart_neighbors(str(task_id))
     return str(task_id), click_store, {"events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
@@ -6898,7 +7163,7 @@ def update_measure_button(active):
         "whiteSpace": "nowrap",
         "fontWeight": "bold" if active else "normal"
     }
-    return ("📏 Measuring" if active else "Measure"), base_style
+    return ("📐 Measuring" if active else "📐 Measure"), base_style
 
 @app.callback(
     Output("toggle-measure-anchor-btn", "children"),
@@ -6958,7 +7223,20 @@ def update_chart_info_box_button(info_enabled):
         "whiteSpace": "nowrap",
         "fontWeight": "bold" if info_enabled else "normal"
     }
-    return ("Info Box: On" if info_enabled else "Info Box: Off"), base_style
+    return ("Candle Info: On" if info_enabled else "Candle Info: Off"), base_style
+
+@app.callback(
+    Output("toggle-oscillator-info-box-btn", "children"),
+    Output("toggle-oscillator-info-box-btn", "style"),
+    Input("oscillator-info-box-store", "data"),
+    prevent_initial_call=False
+)
+def update_oscillator_info_box_button(info_enabled):
+    style = {"background": "#fff8e1" if info_enabled else "transparent", "color": "black",
+             "border": "2px solid #f9a825" if info_enabled else "1px solid #999", "padding": "6px 10px",
+             "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap",
+             "fontWeight": "bold" if info_enabled else "normal"}
+    return ("Osc Info: On" if info_enabled else "Osc Info: Off"), style
 
 @app.callback(
     Output("toggle-chart-extend-x-btn", "children"),
@@ -6983,13 +7261,17 @@ def update_chart_extend_x_button(extend_enabled):
 
 clientside_callback(
     """
-function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTaskId) {
+function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (!plot || !window.Plotly) return window.dash_clientside.no_update;
+    if (window.attachNativeMeasureOverlayListeners) window.attachNativeMeasureOverlayListeners(plot);
+    // Remember shapes supplied by the figure itself. User measurements are
+    // appended after these, so Clear/Backspace cannot delete Signal Level.
+    plot.__dashBaseShapeCount = ((figure.layout && figure.layout.shapes) || []).length;
 
     // Do not deep-clone and return the complete chart. Large candle figures
     // made that old path serialize/reconcile every point for a UI-only toggle.
@@ -7030,19 +7312,37 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
         });
     }
     window.Plotly.relayout(plot, layoutUpdate);
+    const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
+    if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
+        window.__taskChartMeasureShapes = [];
+    }
+    window.__taskChartMeasureTaskId = figureTaskId;
+    const savedMeasureShapes = window.__taskChartMeasureShapes || [];
+    if (savedMeasureShapes.length) {
+        const baseShapes = (plot.layout.shapes || []).slice(0, plot.__dashBaseShapeCount);
+        window.Plotly.relayout(plot, {shapes: baseShapes.concat(savedMeasureShapes)});
+        window.setTimeout(function() { if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup(); }, 40);
+    }
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
     (figure.data || []).forEach(function(trace, index) {
         const traceName = trace.name ? String(trace.name) : '';
         const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
         const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
+        // Main-pane entry/exit markers are candle information, not oscillator
+        // information. Keep the two toggles independent even at an entry x.
+        const isMainPane = !trace.yaxis || trace.yaxis === 'y';
         let hoverinfo = null;
         let hovertemplate = null;
         if (!showHover || isHelper) {
             hoverinfo = 'skip';
         } else if (isSpikeHoverHelper) {
-            hovertemplate = infoBox ? '%{x|%Y-%m-%d %H:%M}<extra></extra>' : '<extra></extra>';
-        } else if (!infoBox) {
+            // The dark gray crosshair already shows time. Suppress this
+            // transparent helper's duplicate white timestamp tooltip.
+            hoverinfo = 'skip';
+        } else if (isMainPane && !candleInfo) {
+            hoverinfo = 'skip';
+        } else if (!isMainPane && !oscillatorInfo) {
             hoverinfo = 'skip';
         } else if (trace.type === 'candlestick') {
             hovertemplate = candleTemplate;
@@ -7063,6 +7363,7 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     Input("measure-mode-store", "data"),
     Input("measure-hover-store", "data"),
     Input("chart-info-box-store", "data"),
+    Input("oscillator-info-box-store", "data"),
     Input("chart-extend-x-store", "data"),
     State("task-chart", "figure"),
     State("chart-view-state-store", "data"),
@@ -7204,13 +7505,8 @@ function(figure) {
 
 clientside_callback(
     """
-function(relayoutData, figure, measureMode) {
-    if (!measureMode) {
-        return window.dash_clientside.no_update;
-    }
-    if (relayoutData && relayoutData.dragmode === 'drawrect') {
-        return window.dash_clientside.no_update;
-    }
+function(figure, measureMode) {
+    if (!measureMode) return window.dash_clientside.no_update;
     function forceMeasureMode() {
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
@@ -7218,19 +7514,38 @@ function(relayoutData, figure, measureMode) {
             window.Plotly.relayout(plot, {dragmode: 'drawrect'});
         }
     }
-    // A server-rendered indicator/measurement figure arrives after the Store
-    // has already said Measure is active. Reassert drawrect after Plotly has
-    // reconciled that figure so its default pan mode cannot win the race.
+    // A server-rendered indicator figure can arrive after the Store has already
+    // said Measure is active. Reassert drawrect only after that reconciliation.
+    // Do not listen to relayoutData here: doing so would override a deliberate
+    // click on Plotly's Pan tool and make Measure impossible to deselect.
     window.setTimeout(forceMeasureMode, 0);
     window.setTimeout(forceMeasureMode, 60);
     window.setTimeout(forceMeasureMode, 200);
-    return {ts: Date.now(), forced: 'drawrect', previous: relayoutData ? relayoutData.dragmode : null};
+    return {ts: Date.now(), forced: 'drawrect'};
 }
 """,
     Output("chart-dragmode-enforcer-store", "data"),
-    Input("task-chart", "relayoutData"),
     Input("task-chart", "figure"),
     State("measure-mode-store", "data"),
+    prevent_initial_call=True,
+)
+
+# Keep the Measure button and Plotly's Pan / draw-rectangle modebar tools in
+# agreement.  This is deliberately client-side so a modebar click never sends
+# the candle figure back to Python or changes the current zoom/pan ranges.
+clientside_callback(
+    """
+function(relayoutData) {
+    if (!relayoutData || !Object.prototype.hasOwnProperty.call(relayoutData, 'dragmode')) {
+        return window.dash_clientside.no_update;
+    }
+    if (relayoutData.dragmode === 'drawrect') return true;
+    if (relayoutData.dragmode === 'pan') return false;
+    return window.dash_clientside.no_update;
+}
+""",
+    Output("measure-mode-store", "data", allow_duplicate=True),
+    Input("task-chart", "relayoutData"),
     prevent_initial_call=True,
 )
 
@@ -7305,7 +7620,10 @@ def _extract_measure_point(click_data, anchor_enabled=True):
     x_val = point.get('x')
     y_val = point.get('y')
 
-    if not anchor_enabled and point.get('curveNumber') is not None and point.get('y') is None:
+    # The close-price helper is the second trace (after OHLC).  With Snap Off,
+    # reject clicks on that helper so the preference has a real effect without
+    # requiring a chart rebuild to add/remove the trace.
+    if not anchor_enabled and point.get('curveNumber') == 1:
         return None
 
     if y_val is None:
@@ -7366,6 +7684,19 @@ def _extract_measure_box(relayout_data):
             if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
                 return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
 
+    # Plotly versions differ: a completed draw can arrive as the complete
+    # shapes list, separate ``shapes[0].x0`` keys, or one ``shapes[0]`` dict.
+    # Support the latter explicitly; without it the chart shows the rectangle
+    # but the measurement callback has no box to calculate.
+    indexed_shape_objects = []
+    for key, value in relayout_data.items():
+        match = re.match(r"^shapes\[(\d+)\]$", str(key))
+        if match and isinstance(value, dict):
+            indexed_shape_objects.append((int(match.group(1)), value))
+    for _, shape in sorted(indexed_shape_objects, reverse=True):
+        if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
+            return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
+
     shape_indexes = []
     for key in relayout_data:
         match = re.match(r"shapes\[(\d+)\]\.", str(key))
@@ -7387,7 +7718,6 @@ def _extract_measure_box(relayout_data):
 
 @app.callback(
     Output("measure-points-store", "data", allow_duplicate=True),
-    Output("measure-result-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
     State("measure-mode-store", "data"),
     State("chart-task-id", "data"),
@@ -7395,38 +7725,24 @@ def _extract_measure_box(relayout_data):
 )
 def capture_measure_box(relayout_data, measure_mode, task_id):
     if not measure_mode or not relayout_data:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     box = _extract_measure_box(relayout_data)
     if not box:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     try:
         y0 = float(box["y0"])
         y1 = float(box["y1"])
     except (TypeError, ValueError):
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     first = {"x": box["x0"], "y": y0}
     second = {"x": box["x1"], "y": y1}
-    price_diff = y1 - y0
-    pct_change = (price_diff / y0) * 100 if y0 else 0
-    direction = "Up" if price_diff >= 0 else "Down"
-    task = tm.get_task(task_id) if task_id else None
-    timeframe = task.timeframe if task else None
-    time_text, bars_text = _format_measure_time_delta(first["x"], second["x"], timeframe)
-    result = {
-        "text": f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
-        "task_id": task_id,
-        "first": first,
-        "second": second,
-        "shape": box,
-        "price_diff": price_diff,
-        "pct_change": pct_change,
-        "time_text": time_text,
-        "bars_text": bars_text,
-    }
-    return {"task_id": task_id, "first": first, "second": second}, result
+    # The result itself is calculated in the matching clientside callback so
+    # it is visible immediately. Keep this server callback only for point
+    # state, avoiding two callbacks with the same relayout input/output pair.
+    return {"task_id": task_id, "first": first, "second": second}
 
 
 @app.callback(
@@ -7510,14 +7826,31 @@ def clear_measure(_):
 @app.callback(
     Output("measure-result", "children"),
     Input("measure-result-store", "data"),
-    prevent_initial_call=False
+    Input("task-chart", "relayoutData"),
+    State("chart-task-id", "data"),
+    prevent_initial_call=False,
 )
-def show_measure_result(result):
+def render_measure_result(result, relayout_data, task_id):
+    """Render point and rectangle measurements through one reliable Dash output."""
+    # Do not gate this on measure-mode-store. Plotly can emit a dragmode
+    # relayout after a completed shape; that async Store update may briefly say
+    # ``False`` even though the visible rectangle is valid.
+    if ctx.triggered_id == "task-chart":
+        box = _extract_measure_box(relayout_data)
+        if box:
+            try:
+                y0, y1 = float(box["y0"]), float(box["y1"])
+            except (TypeError, ValueError):
+                return "📏 Measure box could not read its price values. Draw it again inside the candle pane."
+            price_diff = y1 - y0
+            pct_change = price_diff / y0 * 100 if y0 else 0
+            task = tm.get_task(task_id) if task_id else None
+            time_text, bars_text = _format_measure_time_delta(box["x0"], box["x1"], task.timeframe if task else None)
+            direction = "Up" if price_diff >= 0 else "Down"
+            return f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}"
     if isinstance(result, dict):
         return result.get("text", "")
-    if result:
-        return result
-    return ""
+    return result or ""
 
 @app.callback(
     Output("measure-hint", "children"),
@@ -7674,15 +8007,12 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
-    Input("measure-anchor-store", "data"),
-    Input("measure-points-store", "data"),
-    Input("measure-result-store", "data"),
     Input("chart-event-context-store", "data"),
     State("chart-view-state-store", "data"),
     State("measure-mode-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state, measure_mode):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, chart_view_state, measure_mode):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -7700,10 +8030,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     if task.end_date:
         end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
     else:
-        timestamp_only = pd.read_parquet(fp, columns=["timestamp"], filters=[("timestamp", ">=", start_ms)])
-        if timestamp_only.empty:
+        end_ms = get_chart_file_end_timestamp(fp)
+        if end_ms is None or end_ms < start_ms:
             return go.Figure()
-        end_ms = int(timestamp_only["timestamp"].max())
     df_source = read_chart_parquet_cached(fp, start_ms, end_ms)
     if df_source.empty:
         return go.Figure()
@@ -7782,15 +8111,14 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                 "<extra></extra>"
             )
         ), row=1, col=1)
-        if measure_anchor:
-            # Invisible close-price points make the Measure tool reliable because
-            # candlestick clickData can omit a usable y/price value.  The Snap
-            # toggle hides these helper points when users do not want anchoring.
-            target_fig.add_trace(go.Scatter(
-                x=df['x'], y=df['close'], mode='markers',
-                name='_measure_click_points', showlegend=False, hoverinfo='skip',
-                marker=dict(size=18, color='rgba(0,0,0,0)')
-            ), row=1, col=1)
+        # Keep the invisible close-price helper in every figure.  This makes
+        # Snap a capture-only preference rather than a reason to rebuild a
+        # potentially large candle chart.
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df['close'], mode='markers',
+            name='_measure_click_points', showlegend=False, hoverinfo='skip',
+            marker=dict(size=18, color='rgba(0,0,0,0)')
+        ), row=1, col=1)
 
     def add_hover_spike_bar(target_fig, row, y0, y1, name):
         """Transparent full-pane hover target so x-spikes work anywhere in a subplot."""
@@ -7891,6 +8219,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     df = task._chart_cache[cache_key]
+    retain_chart_task_indicator_cache(task)
 
     if volume_visible and has_volume:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
@@ -8033,14 +8362,28 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                 exit_price = active_event.get("exit_price")
                 event_label = active_event.get("label") or active_event.get("category") or "Dynamic strategy event"
                 nav_label = f"{event_index + 1}/{len(events)}"
+                direction_label = str(active_event.get("direction") or "").upper()
+                exit_reason = str(active_event.get("exit_reason") or "open")
+                exit_reason_label = {
+                    "oscillator_close": "Stochastic close",
+                    "stop": "Stop loss",
+                    "max_adverse_dd": "Max adverse DD",
+                    "open": "Still open",
+                }.get(exit_reason, exit_reason.replace("_", " ").title())
+                return_pct = active_event.get("return_pct")
+                try:
+                    return_text = f"{float(return_pct):+.2f}%"
+                except (TypeError, ValueError):
+                    return_text = "n/a"
+                is_tp_checkpoint = str(active_event.get("category") or "").startswith("tp_")
                 if entry_time is not None and entry_price is not None:
                     entry_dt = ms_to_utc_datetime(float(entry_time))
                     fig.add_trace(go.Scatter(
                         x=[entry_dt], y=[float(entry_price)], mode='markers+text',
-                        text=[f"ENTRY {nav_label}"], textposition='top center',
+                        text=[f"ENTRY {direction_label} {nav_label}".strip()], textposition='top center',
                         marker=dict(size=14, color='#00c853', symbol='triangle-up', line=dict(width=2, color='white')),
                         name='Dynamic strategy entry', showlegend=False,
-                        hovertemplate=f"{event_label}<br>Entry: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                        hovertemplate=f"{event_label}<br>Entry {direction_label or 'trade'}: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
                     ), row=1, col=1)
                     fig.add_trace(go.Scatter(
                         x=[entry_dt, entry_dt], y=[y_min, y_max], mode='lines',
@@ -8049,12 +8392,18 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     ), row=1, col=1)
                 if exit_time is not None and exit_price is not None:
                     exit_dt = ms_to_utc_datetime(float(exit_time))
+                    exit_text = (f"TP CHECKPOINT {nav_label}" if is_tp_checkpoint
+                                 else f"EXIT {exit_reason_label}: {return_text}")
+                    exit_color = '#ff9800' if is_tp_checkpoint else ('#00c853' if return_text.startswith('+') else '#d50000')
+                    exit_hover = (f"{event_label}<br>TP checkpoint: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}"
+                                  if is_tp_checkpoint else
+                                  f"{event_label}<br>Exit reason: {exit_reason_label}<br>Return: {return_text}<br>Exit: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}")
                     fig.add_trace(go.Scatter(
                         x=[exit_dt], y=[float(exit_price)], mode='markers+text',
-                        text=["EXIT"], textposition='bottom center',
-                        marker=dict(size=14, color='#d50000', symbol='x', line=dict(width=2, color='white')),
+                        text=[exit_text], textposition='bottom center',
+                        marker=dict(size=14, color=exit_color, symbol='x', line=dict(width=2, color='white')),
                         name='Dynamic strategy exit', showlegend=False,
-                        hovertemplate=f"{event_label}<br>Exit: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                        hovertemplate=exit_hover + "<extra></extra>"
                     ), row=1, col=1)
                     fig.add_trace(go.Scatter(
                         x=[exit_dt, exit_dt], y=[y_min, y_max], mode='lines',
@@ -8094,60 +8443,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     text=sig.get('extra_info', ''),
                     hoverinfo='skip'
                 ), row=1, col=1)
-    # TradingView-style measurement overlay: first click marker, then a ruler
-    # line with a compact result label after the second click.
-    measure_first = None
-    measure_second = None
-    measure_text = ""
-    measure_shape = None
-    if isinstance(measure_result, dict) and measure_result.get('task_id') == task_id:
-        measure_first = measure_result.get('first')
-        measure_second = measure_result.get('second')
-        measure_text = measure_result.get('text', '')
-        measure_shape = measure_result.get('shape')
-    if isinstance(measure_points, dict) and measure_points.get('task_id') == task_id:
-        measure_first = measure_points.get('first') or measure_first
-        measure_second = measure_points.get('second') or measure_second
-
-    if measure_shape:
-        fig.add_shape(
-            type="rect",
-            x0=measure_shape["x0"], x1=measure_shape["x1"],
-            y0=measure_shape["y0"], y1=measure_shape["y1"],
-            xref="x", yref="y",
-            line=dict(color="#1976d2", width=2, dash="dot"),
-            fillcolor="rgba(25,118,210,0.08)",
-        )
-        short_text = measure_text.replace('📦 ', '')
-        fig.add_annotation(
-            x=measure_shape["x1"], y=measure_shape["y1"], xref='x', yref='y',
-            text=short_text, showarrow=True, arrowhead=2, ax=40, ay=-40,
-            bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
-            font=dict(color='white', size=11)
-        )
-    elif measure_first and not measure_second:
-        fig.add_trace(go.Scatter(
-            x=[measure_first['x']], y=[measure_first['y']],
-            mode='markers', showlegend=False, name='Measure start',
-            marker=dict(size=12, color='#1976d2', symbol='circle', line=dict(width=2, color='white')),
-            hovertemplate='Measure start<br>%{x}<br>%{y}<extra></extra>'
-        ), row=1, col=1)
-    elif measure_first and measure_second:
-        fig.add_trace(go.Scatter(
-            x=[measure_first['x'], measure_second['x']],
-            y=[measure_first['y'], measure_second['y']],
-            mode='lines+markers', showlegend=False, name='Measure',
-            line=dict(color='#1976d2', width=2, dash='dot'),
-            marker=dict(size=10, color='#1976d2', line=dict(width=2, color='white')),
-            hovertemplate='Measure<br>%{x}<br>%{y}<extra></extra>'
-        ), row=1, col=1)
-        short_text = measure_text.replace('📏 ', '')
-        fig.add_annotation(
-            x=measure_second['x'], y=measure_second['y'], xref='x', yref='y',
-            text=short_text, showarrow=True, arrowhead=2, ax=40, ay=-40,
-            bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
-            font=dict(color='white', size=11)
-        )
+    # The native Plotly rectangle remains in the browser, and measurement text
+    # is updated independently.  Keeping it out of this callback avoids a full
+    # parquet/figure rebuild for every drag or point measurement.
 
     # Layout (light theme)
     fig.update_layout(
@@ -8170,6 +8468,8 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         meta={
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
+            "timeframe": task.timeframe,
+            "task_id": str(task_id),
         },
         # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
         # or marker overlays rebuild this figure.  The key changes only when a
@@ -8922,16 +9222,21 @@ def oscillator_condition_met_within_window(values, idx, level, condition, window
     return any(oscillator_condition_met(values, check_idx, level, condition) for check_idx in range(start_idx, idx + 1))
 
 
-def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
-    """Require every enabled oscillator spec to have matched within the same past/current window."""
+def oscillator_specs_met_within_window(values_by_column, specs, idx, window=1, min_idx=0):
+    """Require every enabled oscillator spec to have matched within the same past/current window.
+
+    ``values_by_column`` is prebuilt once per task source. Repeatedly calling
+    DataFrame.to_numpy() inside the candle scan made long histories effectively
+    quadratic and was the main reason the dynamic stochastic checkup stalled.
+    """
     for spec in specs:
         condition = normalize_oscillator_condition(spec.get("condition"))
         if condition == "disabled":
             continue
         column = spec.get("column")
-        if column not in df:
+        values = values_by_column.get(column) if isinstance(values_by_column, dict) else None
+        if values is None:
             return False
-        values = df[column].to_numpy(dtype=float)
         if not oscillator_condition_met_within_window(values, idx, spec["level"], condition, window, min_idx=min_idx):
             return False
     return True
@@ -9031,19 +9336,27 @@ def build_oscillator_reversal_source_uncached(task):
     if getattr(task, "signal_direction", None) not in ("resistance", "support"):
         return None
 
-    df = load_task_data_cached(task)
-    if df is None or df.empty:
-        return None
-    required = {"timestamp", "high", "low", "close"}
-    if not required.issubset(df.columns):
-        return None
-
-    # ``load_task_data_cached`` deliberately reads a defensive outer window for
-    # event analysis. Dynamic indicators must use the exact same requested
-    # pre-signal boundary as the chart, otherwise an old task start can silently
-    # contribute extra warm-up candles after pre_buffer_minutes is changed.
+    # Read only this task's needed candle window.  The generic task-data helper
+    # caches a complete pair/timeframe parquet file, which made a first dynamic
+    # stochastic checkup slow on older SSDs even when the task uses a short
+    # period.  This mtime-aware predicate read shares the bounded chart cache.
     history_start_ms = task_pre_signal_start_ms(task)
-    df = df[pd.to_numeric(df["timestamp"], errors="coerce") >= history_start_ms].copy()
+    fp = os.path.join(symbol_timeframe_path(task.symbols[0], task.timeframe), "data.parquet")
+    if not os.path.exists(fp):
+        return None
+    if task.end_date:
+        history_end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    else:
+        history_end_ms = get_chart_file_end_timestamp(fp)
+    if history_end_ms is None or history_end_ms < history_start_ms:
+        return None
+    df = read_chart_parquet_cached(fp, history_start_ms, history_end_ms).copy()
+    required = {"timestamp", "high", "low", "close"}
+    if df.empty or not required.issubset(df.columns):
+        return None
+    # Preserve the inclusive boundary defensively even though the parquet read
+    # already uses the same predicates.
+    df = df[(df["timestamp"] >= history_start_ms) & (df["timestamp"] <= history_end_ms)]
     if df.empty:
         return None
 
@@ -9067,6 +9380,10 @@ def build_oscillator_reversal_source_uncached(task):
     if path_df.empty:
         return None
 
+    oscillator_columns = [
+        "stoch_d_14_1_3", "stoch_d_40_1_4", "stoch_d_60_1_10",
+        "stoch_d_300_1_10", "rsi_14_14",
+    ]
     return {
         "task_id": str(getattr(task, "task_id", "")),
         "level_kind": task.signal_direction,
@@ -9074,20 +9391,37 @@ def build_oscillator_reversal_source_uncached(task):
         "direction": "sell" if task.signal_direction == "resistance" else "buy",
         "signal_price": signal_price,
         "df": path_df,
+        "oscillator_values": {
+            column: path_df[column].to_numpy(dtype=float, copy=False)
+            for column in oscillator_columns
+        },
     }
 
 
+def _oscillator_source_bytes(source):
+    if not source or not isinstance(source, dict):
+        return 0
+    return _chart_dataframe_bytes(source.get("df"))
+
 def build_oscillator_reversal_source(task):
     """Return a bounded cached oscillator source for fast repeated checkup runs."""
+    global oscillator_reversal_source_cache_bytes
     cache_key = make_oscillator_reversal_source_cache_key(task)
     if cache_key in oscillator_reversal_source_cache:
         oscillator_reversal_source_cache.move_to_end(cache_key)
         return oscillator_reversal_source_cache[cache_key]
     source = build_oscillator_reversal_source_uncached(task)
-    oscillator_reversal_source_cache[cache_key] = source
-    oscillator_reversal_source_cache.move_to_end(cache_key)
-    while len(oscillator_reversal_source_cache) > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX:
-        oscillator_reversal_source_cache.popitem(last=False)
+    source_bytes = _oscillator_source_bytes(source)
+    # Return a large source to this calculation, but do not retain it across
+    # runs on a low-memory machine.
+    if source_bytes <= OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX_BYTES:
+        oscillator_reversal_source_cache[cache_key] = source
+        oscillator_reversal_source_cache_bytes += source_bytes
+        oscillator_reversal_source_cache.move_to_end(cache_key)
+        while (len(oscillator_reversal_source_cache) > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX or
+               oscillator_reversal_source_cache_bytes > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX_BYTES):
+            _, evicted_source = oscillator_reversal_source_cache.popitem(last=False)
+            oscillator_reversal_source_cache_bytes -= _oscillator_source_bytes(evicted_source)
     return source
 
 
@@ -9109,7 +9443,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
     selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
     oscillator_idx = None
     for idx in range(cross_idx, len(df)):
-        if oscillator_specs_met_within_window(df, selected_specs, idx, entry_condition_window, min_idx=cross_idx):
+        if oscillator_specs_met_within_window(source["oscillator_values"], selected_specs, idx, entry_condition_window, min_idx=cross_idx):
             oscillator_idx = idx
             break
     if oscillator_idx is None:
@@ -9190,6 +9524,7 @@ def build_chart_event_record(path, result, category, label):
         "task_id": path.get("task_id"),
         "category": category,
         "label": label,
+        "direction": path.get("direction"),
         "entry_time": path.get("entry_time"),
         "entry_price": path.get("entry_price"),
         "exit_time": exit_time,
