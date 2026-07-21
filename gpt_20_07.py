@@ -3294,6 +3294,9 @@ function showNativeMeasureResultAfterMouseup() {
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
         if (!plot || !plot.layout || plot.layout.dragmode !== 'drawrect') return;
         const shapes = (plot.layout && plot.layout.shapes) || (plot._fullLayout && plot._fullLayout.shapes) || [];
+        const baseCount = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+        // Preserve only user rectangles across indicator figure rebuilds.
+        window.__taskChartMeasureShapes = shapes.slice(baseCount).map(function(item) { return Object.assign({}, item); });
         let shape = null;
         for (let i = shapes.length - 1; i >= 0; i -= 1) {
             const candidate = shapes[i] || {};
@@ -3375,6 +3378,7 @@ document.addEventListener('click', function(e) {
         if (plot && window.Plotly) {
             const keep = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
             window.Plotly.relayout(plot, {shapes: (plot.layout.shapes || []).slice(0, keep)});
+            window.__taskChartMeasureShapes = [];
         }
         chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
         return;
@@ -3473,6 +3477,7 @@ document.addEventListener('keydown', function(e) {
     if (!plot || !window.Plotly || shapes.length <= base) return;
     e.preventDefault();
     window.Plotly.relayout(plot, {shapes: shapes.slice(0, -1)});
+    window.__taskChartMeasureShapes = shapes.slice(base, -1).map(function(item) { return Object.assign({}, item); });
     if (shapes.length - 1 <= base) {
         root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
     }
@@ -7261,6 +7266,17 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure,
         });
     }
     window.Plotly.relayout(plot, layoutUpdate);
+    const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
+    if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
+        window.__taskChartMeasureShapes = [];
+    }
+    window.__taskChartMeasureTaskId = figureTaskId;
+    const savedMeasureShapes = window.__taskChartMeasureShapes || [];
+    if (savedMeasureShapes.length) {
+        const baseShapes = (plot.layout.shapes || []).slice(0, plot.__dashBaseShapeCount);
+        window.Plotly.relayout(plot, {shapes: baseShapes.concat(savedMeasureShapes)});
+        window.setTimeout(function() { if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup(); }, 40);
+    }
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
     (figure.data || []).forEach(function(trace, index) {
@@ -8402,6 +8418,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
             "timeframe": task.timeframe,
+            "task_id": str(task_id),
         },
         # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
         # or marker overlays rebuild this figure.  The key changes only when a
