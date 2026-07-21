@@ -3232,9 +3232,7 @@ function pushDashStore(storeId, payload, fallbackEventName) {
         window.dash_clientside.set_props(storeId, {data: eventPayload});
         return;
     }
-
-    const event = new CustomEvent(fallbackEventName, {detail: eventPayload});
-    document.dispatchEvent(event);
+    console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
 }
 const chartToggleStores = {
     'toggle-rsi-btn': ['rsi-visible-store', false],
@@ -5353,99 +5351,12 @@ def remove_task(_, stored_ids):
 # Note: The JavaScript event listener at line 2578 handles DIV button clicks globally
 # No need for a separate clientside_callback for remove-task buttons
 
-# 🔧 CRITICAL: Clientside callback to handle DIV button clicks and trigger server-side callbacks
-# This converts DIV clicks into store updates that server callbacks can listen to
-clientside_callback(
-    """
-function(clickData) {
-    // This is a dummy callback to enable DIV click handling via the existing JS event listener
-    // The actual work is done by the JavaScript event listener at line 2578
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("div-click-dummy-store", "data"),
-    Input("div-click-trigger-store", "data"),
-    prevent_initial_call=False
-)
+# Dash 4's ``set_props`` is used directly by the global click handler above.
+# Do not retain legacy dummy clientside callbacks here: an inline callback that
+# is not present after a hot reload is exactly what produces renderer-side
+# ``undefined.apply`` errors in older Dash/Chrome combinations.
 
-# 🔧 CRITICAL: Clientside callback to capture CustomEvent 'dash-chart-trigger' and update chart-button-trigger store
-# This is the missing link that allows the chart button to work!
-clientside_callback(
-    """
-function(n) {
-    // This callback is triggered by the custom event via the window event listener below
-    // The event detail is passed through the global window.dashChartEventData
-    if (window.dashChartEventData) {
-        return window.dashChartEventData;
-    }
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("chart-button-trigger", "data"),
-    Input("chart-event-dummy", "n_clicks"),  # Dummy button that gets incremented by event listener
-    prevent_initial_call=True
-)
-
-# 🔧 CRITICAL: Global event listeners for CustomEvents - these capture event details and update dummy counters
-app.index_string = app.index_string.replace(
-    '{%renderer%}',
-    '''{%renderer%}
-<script>
-// Global event listeners for CustomEvents dispatched by button clicks
-document.addEventListener('dash-chart-trigger', function(e) {
-    window.dashChartEventData = e.detail;
-    // Trigger a click on the hidden button to activate the clientside callback
-    const dummyBtn = document.getElementById('chart-event-dummy');
-    if (dummyBtn) dummyBtn.click();
-});
-document.addEventListener('dash-details-trigger', function(e) {
-    window.dashDetailsEventData = e.detail;
-    const dummyBtn = document.getElementById('details-event-dummy');
-    if (dummyBtn) dummyBtn.click();
-});
-document.addEventListener('dash-impulse-trigger', function(e) {
-    window.dashImpulseEventData = e.detail;
-    const dummyBtn = document.getElementById('impulse-event-dummy');
-    if (dummyBtn) dummyBtn.click();
-});
-</script>'''
-)
-
-# 🔧 CRITICAL: Clientside callback to capture CustomEvent 'dash-details-trigger' and update strategy-details-trigger store
-# This enables the Details button to work
-clientside_callback(
-    """
-function(n) {
-    // This callback is triggered by the custom event via the window event listener
-    // The event detail is passed through the global window.dashDetailsEventData
-    if (window.dashDetailsEventData) {
-        return window.dashDetailsEventData;
-    }
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("strategy-details-trigger", "data"),
-    Input("details-event-dummy", "n_clicks"),  # Dummy button that gets incremented by event listener
-    prevent_initial_call=True
-)
-
-# 🔧 CRITICAL: Clientside callback to capture CustomEvent 'dash-impulse-trigger' and update impulse-button-trigger store
-# This enables the Impulse button to work
-clientside_callback(
-    """
-function(n) {
-    // This callback is triggered by the custom event via the window event listener
-    // The event detail is passed through the global window.dashImpulseEventData
-    if (window.dashImpulseEventData) {
-        return window.dashImpulseEventData;
-    }
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("impulse-button-trigger", "data"),
-    Input("impulse-event-dummy", "n_clicks"),  # Dummy button that gets incremented by event listener
-    prevent_initial_call=True
-)
+# Details and Impulse use the same direct ``set_props`` path as Chart.
 
 @app.callback(
     Output({"type": "log", "index": ALL}, "value"),
@@ -7155,7 +7066,7 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
-    Output("chart-button-trigger", "data", allow_duplicate=True),
+    Output("chart-button-trigger", "data"),
     Output("chart-click-store", "data", allow_duplicate=True),
     Output("chart-event-context-store", "data", allow_duplicate=True),
     Input("close-chart-modal", "n_clicks"),
