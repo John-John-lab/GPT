@@ -7634,53 +7634,32 @@ def reset_measure_on_mode_exit(mode):
 def clear_measure(_):
     return {"first": None, "second": None}, None
 
-# One clientside owner renders all measurement text.  Rectangle results come
-# straight from Plotly relayout data; point-click results come from the Store.
-# This avoids duplicate callback outputs and avoids direct DOM mutation/polling.
-clientside_callback(
-    """
-function(result, relayoutData, measureMode, figure) {
-    function storedText(value) {
-        return value && typeof value === 'object' ? (value.text || '') : (value || '');
-    }
-    if (!measureMode || !relayoutData) return storedText(result);
-    let shape = null;
-    if (Array.isArray(relayoutData.shapes)) {
-        for (let i = relayoutData.shapes.length - 1; i >= 0; i -= 1) {
-            const candidate = relayoutData.shapes[i] || {};
-            if ((!candidate.type || candidate.type === 'rect') && candidate.x0 != null && candidate.x1 != null && candidate.y0 != null && candidate.y1 != null) { shape = candidate; break; }
-        }
-    }
-    if (!shape) {
-        const indexes = Object.keys(relayoutData).map(function(key) { const match = key.match(/^shapes\\[(\\d+)\\]\\./); return match ? Number(match[1]) : null; }).filter(function(index) { return index !== null; }).sort(function(a, b) { return b - a; });
-        for (let i = 0; i < indexes.length; i += 1) {
-            const prefix = 'shapes[' + indexes[i] + '].';
-            if ((relayoutData[prefix + 'type'] || 'rect') === 'rect' && relayoutData[prefix + 'x0'] != null && relayoutData[prefix + 'x1'] != null && relayoutData[prefix + 'y0'] != null && relayoutData[prefix + 'y1'] != null) { shape = {x0: relayoutData[prefix + 'x0'], x1: relayoutData[prefix + 'x1'], y0: relayoutData[prefix + 'y0'], y1: relayoutData[prefix + 'y1']}; break; }
-        }
-    }
-    if (!shape) return storedText(result);
-    const y0 = Number(shape.y0), y1 = Number(shape.y1);
-    if (!Number.isFinite(y0) || !Number.isFinite(y1)) return storedText(result);
-    const delta = y1 - y0, pct = y0 ? delta / y0 * 100 : 0;
-    const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
-    let timeText = 'time n/a', barsText = 'bars n/a';
-    if (Number.isFinite(start) && Number.isFinite(end)) {
-        const elapsed = Math.abs(end - start), seconds = elapsed / 1000;
-        timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
-        const timeframe = figure && figure.layout && figure.layout.meta ? figure.layout.meta.timeframe : null;
-        const intervals = {'1': 60000, '3': 180000, '5': 300000, '10': 600000, '15': 900000, '30': 1800000, '60': 3600000, '120': 7200000, '240': 14400000, 'D': 86400000, 'W': 604800000};
-        if (intervals[timeframe]) barsText = (elapsed / intervals[timeframe]).toFixed(1) + ' candles';
-    }
-    return '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText + ' | Δ Candles: ' + barsText;
-}
-""",
+@app.callback(
     Output("measure-result", "children"),
     Input("measure-result-store", "data"),
     Input("task-chart", "relayoutData"),
     State("measure-mode-store", "data"),
-    State("task-chart", "figure"),
+    State("chart-task-id", "data"),
     prevent_initial_call=False,
 )
+def render_measure_result(result, relayout_data, measure_mode, task_id):
+    """Render point and rectangle measurements through one reliable Dash output."""
+    if ctx.triggered_id == "task-chart" and measure_mode:
+        box = _extract_measure_box(relayout_data)
+        if box:
+            try:
+                y0, y1 = float(box["y0"]), float(box["y1"])
+            except (TypeError, ValueError):
+                return "📏 Measure box could not read its price values. Draw it again inside the candle pane."
+            price_diff = y1 - y0
+            pct_change = price_diff / y0 * 100 if y0 else 0
+            task = tm.get_task(task_id) if task_id else None
+            time_text, bars_text = _format_measure_time_delta(box["x0"], box["x1"], task.timeframe if task else None)
+            direction = "Up" if price_diff >= 0 else "Down"
+            return f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}"
+    if isinstance(result, dict):
+        return result.get("text", "")
+    return result or ""
 
 @app.callback(
     Output("measure-hint", "children"),
