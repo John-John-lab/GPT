@@ -9143,19 +9143,27 @@ def build_oscillator_reversal_source_uncached(task):
     if getattr(task, "signal_direction", None) not in ("resistance", "support"):
         return None
 
-    df = load_task_data_cached(task)
-    if df is None or df.empty:
-        return None
-    required = {"timestamp", "high", "low", "close"}
-    if not required.issubset(df.columns):
-        return None
-
-    # ``load_task_data_cached`` deliberately reads a defensive outer window for
-    # event analysis. Dynamic indicators must use the exact same requested
-    # pre-signal boundary as the chart, otherwise an old task start can silently
-    # contribute extra warm-up candles after pre_buffer_minutes is changed.
+    # Read only this task's needed candle window.  The generic task-data helper
+    # caches a complete pair/timeframe parquet file, which made a first dynamic
+    # stochastic checkup slow on older SSDs even when the task uses a short
+    # period.  This mtime-aware predicate read shares the bounded chart cache.
     history_start_ms = task_pre_signal_start_ms(task)
-    df = df[pd.to_numeric(df["timestamp"], errors="coerce") >= history_start_ms].copy()
+    fp = os.path.join(symbol_timeframe_path(task.symbols[0], task.timeframe), "data.parquet")
+    if not os.path.exists(fp):
+        return None
+    if task.end_date:
+        history_end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    else:
+        history_end_ms = get_chart_file_end_timestamp(fp)
+    if history_end_ms is None or history_end_ms < history_start_ms:
+        return None
+    df = read_chart_parquet_cached(fp, history_start_ms, history_end_ms).copy()
+    required = {"timestamp", "high", "low", "close"}
+    if df.empty or not required.issubset(df.columns):
+        return None
+    # Preserve the inclusive boundary defensively even though the parquet read
+    # already uses the same predicates.
+    df = df[(df["timestamp"] >= history_start_ms) & (df["timestamp"] <= history_end_ms)]
     if df.empty:
         return None
 
