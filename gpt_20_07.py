@@ -3247,6 +3247,7 @@ const chartToggleStores = {
     'toggle-chart-info-box-btn': ['chart-info-box-store', false],
     'toggle-oscillator-info-box-btn': ['oscillator-info-box-store', true],
     'toggle-chart-extend-x-btn': ['chart-extend-x-store', false],
+    'toggle-chart-focus-entry-btn': ['chart-focus-entry-store', false],
     'toggle-measure-anchor-btn': ['measure-anchor-store', false],
     'toggle-measure-hover-btn': ['measure-hover-store', true],
     'toggle-impulses-btn': ['impulse-visible-store', true],
@@ -3269,7 +3270,8 @@ const measureExclusiveButtons = new Set([
     'toggle-rsi-btn', 'toggle-stochastic-btn', 'toggle-volume-btn',
     'toggle-adx-btn', 'toggle-macd-btn', 'toggle-disparity-btn',
     'toggle-strategy-btn', 'toggle-impulses-btn', 'toggle-events-btn',
-    'toggle-chart-extend-x-btn', 'toggle-chart-event-marks-btn'
+    'toggle-chart-extend-x-btn', 'toggle-chart-focus-entry-btn',
+    'toggle-chart-event-marks-btn'
 ]);
 Object.keys(chartToggleStores).forEach(function(buttonId) {
     chartToggleState[buttonId] = chartToggleStores[buttonId][1];
@@ -3299,6 +3301,7 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
     if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
     if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
+    if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
     if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
@@ -3314,6 +3317,7 @@ function applyChartToggleImmediately(button) {
     }
     if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
+    if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
     if (chartToggleLabels[button.id]) button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
     return true;
 }
@@ -3738,6 +3742,7 @@ def build_root_layout():
     dcc.Store(id="chart-info-box-store", data=False),
     dcc.Store(id="oscillator-info-box-store", data=True),
     dcc.Store(id="chart-extend-x-store", data=False),
+    dcc.Store(id="chart-focus-entry-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
@@ -3992,6 +3997,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "94px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Focus Entry: Off", id="toggle-chart-focus-entry-btn", title="Center each newly opened chart on its signal entry with a practical zoom", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "104px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Clear Measure", id="clear-measure-btn", style={
@@ -7348,9 +7363,30 @@ def update_chart_extend_x_button(extend_enabled):
     return ("Extend X: On" if extend_enabled else "Extend X: Off"), base_style
 
 
+@app.callback(
+    Output("toggle-chart-focus-entry-btn", "children"),
+    Output("toggle-chart-focus-entry-btn", "style"),
+    Input("chart-focus-entry-store", "data"),
+    prevent_initial_call=False,
+)
+def update_chart_focus_entry_button(focus_enabled):
+    style = {
+        "background": "#e3f2fd" if focus_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if focus_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "104px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if focus_enabled else "normal",
+    }
+    return ("Focus Entry: On" if focus_enabled else "Focus Entry: Off"), style
+
+
 clientside_callback(
     """
-function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure, viewState, chartTaskId) {
+function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
@@ -7370,7 +7406,7 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure,
     layoutUpdate.hoversubplots = showHover ? 'axis' : false;
 
     const meta = figure.layout.meta || {};
-    const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
+    const targetRange = focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange);
     Object.keys(figure.layout).forEach(function(key) {
         if (/^xaxis[0-9]*$/.test(key)) {
             layoutUpdate[key + '.showspikes'] = false;
@@ -7379,7 +7415,7 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure,
             layoutUpdate[key + '.spikethickness'] = 1;
             layoutUpdate[key + '.spikedash'] = 'dash';
             layoutUpdate[key + '.spikesnap'] = 'cursor';
-            if (extendX && targetRange && targetRange.length === 2) {
+            if ((extendX || focusEntry) && targetRange && targetRange.length === 2) {
                 layoutUpdate[key + '.range'] = targetRange;
                 layoutUpdate[key + '.autorange'] = false;
             }
@@ -7388,7 +7424,7 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure,
             layoutUpdate[key + '.showspikes'] = false;
         }
     });
-    if (!extendX && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
+    if (!extendX && !focusEntry && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
         const axes = viewState.axes || {};
         Object.keys(axes).forEach(function(axisName) {
             const axisState = axes[axisName] || {};
@@ -7454,6 +7490,7 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure,
     Input("chart-info-box-store", "data"),
     Input("oscillator-info-box-store", "data"),
     Input("chart-extend-x-store", "data"),
+    Input("chart-focus-entry-store", "data"),
     # A newly selected chart or a newly opened oscillator replaces the Plotly
     # figure. Listen to that replacement as well, otherwise its fresh traces
     # can briefly restore candle hover boxes despite Candle Info being off.
@@ -8102,11 +8139,12 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
     Input("chart-event-context-store", "data"),
+    Input("chart-focus-entry-store", "data"),
     State("chart-view-state-store", "data"),
     State("measure-mode-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, chart_view_state, measure_mode):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, chart_view_state, measure_mode):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -8406,6 +8444,33 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     y_min -= y_padding
     y_max += y_padding
 
+    # Optional per-task entry focus. Use a balanced local candle window and a
+    # symmetric price range around the recorded signal price so switching to a
+    # different coin never reuses an unrelated coin's zoom or y-position.
+    entry_focus_xrange = None
+    entry_focus_yrange = None
+    if focus_entry and len(df):
+        timestamps = df['timestamp'].to_numpy()
+        signal_ms = int(float(task.signal_time))
+        entry_idx = int(np.searchsorted(timestamps, signal_ms, side='left'))
+        entry_idx = max(0, min(entry_idx, len(df) - 1))
+        # About 100 candles gives context without showing an entire history.
+        left_idx = max(0, entry_idx - 50)
+        right_idx = min(len(df) - 1, entry_idx + 50)
+        entry_focus_xrange = [df['x'].iloc[left_idx], df['x'].iloc[right_idx]]
+        focus_low = float(df['low'].iloc[left_idx:right_idx + 1].min())
+        focus_high = float(df['high'].iloc[left_idx:right_idx + 1].max())
+        try:
+            entry_price = float(task.signal_price)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if np.isfinite(entry_price) and entry_price > 0:
+            half_span = max(abs(entry_price - focus_low), abs(focus_high - entry_price), entry_price * 0.01) * 1.12
+            entry_focus_yrange = [entry_price - half_span, entry_price + half_span]
+        else:
+            focus_padding = max((focus_high - focus_low) * 0.06, 1e-12)
+            entry_focus_yrange = [focus_low - focus_padding, focus_high + focus_padding]
+
     # Do not place a transparent hover trace over the candle pane: it can steal
     # the OHLC hover label from candles. A browser-side crosshair overlay below
     # provides the always-visible vertical guide across the full chart instead.
@@ -8562,6 +8627,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         meta={
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
+            "entry_focus_xrange": entry_focus_xrange,
             "timeframe": task.timeframe,
             "task_id": str(task_id),
         },
@@ -8594,7 +8660,11 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         fig.update_layout(hoversubplots="axis")
     except ValueError:
         pass
-    apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
+    if focus_entry and entry_focus_xrange and entry_focus_yrange:
+        fig.update_xaxes(range=entry_focus_xrange, autorange=False)
+        fig.update_yaxes(range=entry_focus_yrange, autorange=False, row=1, col=1)
+    else:
+        apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
     return fig
 
 # =============================================================================
