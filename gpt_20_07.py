@@ -7584,7 +7584,6 @@ def _extract_measure_box(relayout_data):
 
 @app.callback(
     Output("measure-points-store", "data", allow_duplicate=True),
-    Output("measure-result-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
     State("measure-mode-store", "data"),
     State("chart-task-id", "data"),
@@ -7592,38 +7591,24 @@ def _extract_measure_box(relayout_data):
 )
 def capture_measure_box(relayout_data, measure_mode, task_id):
     if not measure_mode or not relayout_data:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     box = _extract_measure_box(relayout_data)
     if not box:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     try:
         y0 = float(box["y0"])
         y1 = float(box["y1"])
     except (TypeError, ValueError):
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     first = {"x": box["x0"], "y": y0}
     second = {"x": box["x1"], "y": y1}
-    price_diff = y1 - y0
-    pct_change = (price_diff / y0) * 100 if y0 else 0
-    direction = "Up" if price_diff >= 0 else "Down"
-    task = tm.get_task(task_id) if task_id else None
-    timeframe = task.timeframe if task else None
-    time_text, bars_text = _format_measure_time_delta(first["x"], second["x"], timeframe)
-    result = {
-        "text": f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
-        "task_id": task_id,
-        "first": first,
-        "second": second,
-        "shape": box,
-        "price_diff": price_diff,
-        "pct_change": pct_change,
-        "time_text": time_text,
-        "bars_text": bars_text,
-    }
-    return {"task_id": task_id, "first": first, "second": second}, result
+    # The result itself is calculated in the matching clientside callback so
+    # it is visible immediately. Keep this server callback only for point
+    # state, avoiding two callbacks with the same relayout input/output pair.
+    return {"task_id": task_id, "first": first, "second": second}
 
 
 @app.callback(
