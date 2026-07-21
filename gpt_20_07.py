@@ -810,10 +810,10 @@ CHART_FILE_END_CACHE_MAX = 48
 chart_file_end_cache = OrderedDict()
 CHART_TASK_INDICATOR_CACHE_MAX = 2
 chart_task_indicator_cache = OrderedDict()
-# Background reads can contend with the foreground chart request on an older
-# Mac's SSD. They are off by default on macOS, but can be explicitly enabled
-# with GPT_CHART_PREFETCH=1.
-CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "0" if sys.platform == "darwin" else "1") == "1"
+# Warm one neighbouring range while the user studies the current chart. The
+# source cache is byte-bounded, so this is safe on older Macs and makes the
+# first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
+CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
 chart_prefetch_pending = set()
 chart_prefetch_lock = threading.Lock()
 
@@ -6827,6 +6827,23 @@ def get_chartable_tasks_for_navigation():
     chartable = [t for t in tasks if getattr(t, 'status', None) == "completed"]
     return tasks, chartable
 
+def prefetch_chart_neighbors(task_id):
+    """Warm immediate previous/next chart sources after a chart opens."""
+    if not task_id or not CHART_PREFETCH_ENABLED:
+        return
+    _, chartable = get_chartable_tasks_for_navigation()
+    ids = [str(t.task_id) for t in chartable]
+    try:
+        index = ids.index(str(task_id))
+    except ValueError:
+        return
+    # A single adjacent source gives the best old-SSD tradeoff. Prefer Next,
+    # because it is the common navigation direction.
+    if index + 1 < len(chartable):
+        prefetch_chart_source_async(chartable[index + 1])
+    elif index > 0:
+        prefetch_chart_source_async(chartable[index - 1])
+
 def page_for_task(task_id, tasks):
     for idx, task in enumerate(tasks):
         if str(getattr(task, 'task_id', '')) == str(task_id):
@@ -6980,6 +6997,7 @@ def set_chart_task_id(trigger_data, click_store):
     if current_time - float(click_store.get(key, 0) or 0) < 0.5:
         return no_update, no_update, no_update
     click_store[key] = current_time
+    prefetch_chart_neighbors(str(task_id))
     return str(task_id), click_store, {"events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
