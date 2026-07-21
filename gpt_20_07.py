@@ -3373,7 +3373,7 @@ function showNativeMeasureResultAfterMouseup() {
         window.__taskChartMeasureShapes = userShapes.map(function(item) { return Object.assign({}, item); });
         const shape = userShapes[userShapes.length - 1];
         if (!shape) {
-            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
+            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
             return;
         }
         const y0 = Number(shape.y0), y1 = Number(shape.y1);
@@ -3589,7 +3589,7 @@ document.addEventListener('keydown', function(e) {
     window.Plotly.relayout(plot, {shapes: shapes.slice(0, -1)});
     window.__taskChartMeasureShapes = shapes.slice(base, -1).map(function(item) { return Object.assign({}, item); });
     if (shapes.length - 1 <= base) {
-        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { node.remove(); });
+        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
     }
 }, true);
 // Toggle column highlight on header click
