@@ -3281,37 +3281,6 @@ function applyChartToggleImmediately(button) {
     }
     return true;
 }
-// Last-resort native measurement renderer. Plotly always keeps completed draw
-// shapes in layout.shapes, so polling this tiny layout object also works in
-// Dash/Plotly combinations that do not forward plotly_relayout to callbacks.
-function refreshNativeMeasureResult() {
-    const root = document.getElementById('task-chart');
-    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
-    if (!plot || !plot.layout || plot.layout.dragmode !== 'drawrect') return;
-    const shapes = plot.layout.shapes || [];
-    let shape = null;
-    for (let i = shapes.length - 1; i >= 0; i -= 1) {
-        const candidate = shapes[i] || {};
-        if ((!candidate.type || candidate.type === 'rect') && candidate.x0 != null && candidate.x1 != null && candidate.y0 != null && candidate.y1 != null) {
-            shape = candidate;
-            break;
-        }
-    }
-    if (!shape) return;
-    const y0 = Number(shape.y0), y1 = Number(shape.y1);
-    if (!Number.isFinite(y0) || !Number.isFinite(y1)) return;
-    const delta = y1 - y0;
-    const pct = y0 ? delta / y0 * 100 : 0;
-    const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
-    let duration = 'time n/a';
-    if (Number.isFinite(start) && Number.isFinite(end)) {
-        const seconds = Math.abs(end - start) / 1000;
-        duration = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
-    }
-    const result = document.getElementById('measure-result');
-    if (result) result.textContent = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + duration;
-}
-window.setInterval(refreshNativeMeasureResult, 150);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
@@ -7346,50 +7315,8 @@ function(figure) {
         line.style.display = 'block';
         syncedHoverAt(event, rect);
     }
-    function showNativeMeasureResult(relayoutData) {
-        if (!relayoutData || !plot.layout || plot.layout.dragmode !== 'drawrect') return;
-        let box = null;
-        if (Array.isArray(relayoutData.shapes)) {
-            for (let i = relayoutData.shapes.length - 1; i >= 0; i -= 1) {
-                const shape = relayoutData.shapes[i] || {};
-                if ((!shape.type || shape.type === 'rect') && shape.x0 != null && shape.x1 != null && shape.y0 != null && shape.y1 != null) {
-                    box = shape;
-                    break;
-                }
-            }
-        }
-        if (!box) {
-            const indexes = Object.keys(relayoutData).map(function(key) {
-                const match = key.match(/^shapes\\[(\\d+)\\]\\./);
-                return match ? Number(match[1]) : null;
-            }).filter(function(index) { return index !== null; }).sort(function(a, b) { return b - a; });
-            for (let i = 0; i < indexes.length; i += 1) {
-                const prefix = 'shapes[' + indexes[i] + '].';
-                if ((relayoutData[prefix + 'type'] || 'rect') === 'rect' && relayoutData[prefix + 'x0'] != null && relayoutData[prefix + 'x1'] != null && relayoutData[prefix + 'y0'] != null && relayoutData[prefix + 'y1'] != null) {
-                    box = {x0: relayoutData[prefix + 'x0'], x1: relayoutData[prefix + 'x1'], y0: relayoutData[prefix + 'y0'], y1: relayoutData[prefix + 'y1']};
-                    break;
-                }
-            }
-        }
-        if (!box) return;
-        const y0 = Number(box.y0), y1 = Number(box.y1);
-        if (!Number.isFinite(y0) || !Number.isFinite(y1)) return;
-        const delta = y1 - y0;
-        const pct = y0 ? delta / y0 * 100 : 0;
-        const firstMs = Date.parse(box.x0), secondMs = Date.parse(box.x1);
-        let timeText = 'time n/a';
-        if (Number.isFinite(firstMs) && Number.isFinite(secondMs)) {
-            const seconds = Math.abs(secondMs - firstMs) / 1000;
-            timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
-        }
-        const result = document.getElementById('measure-result');
-        if (result) result.textContent = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText;
-    }
     plot.addEventListener('mousemove', moveLine);
     plot.addEventListener('mouseleave', hideLine);
-    // Dash Store callbacks are asynchronous; this native Plotly event is the
-    // final fallback that writes the visible result immediately on every draw.
-    if (typeof plot.on === 'function') plot.on('plotly_relayout', showNativeMeasureResult);
     window.addEventListener('scroll', hideLine, true);
     window.addEventListener('resize', hideLine);
     return {installed: true, ts: Date.now()};
@@ -7443,61 +7370,6 @@ function(relayoutData) {
 """,
     Output("measure-mode-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
-    prevent_initial_call=True,
-)
-
-# Drawn rectangles are a browser-native Plotly operation. Calculate and render
-# their basic result in the browser too, so the user gets feedback immediately
-# even when a Python callback is busy with another long-running diagnostic.
-clientside_callback(
-    """
-function(relayoutData, measureMode, figure) {
-    if (!measureMode || !relayoutData) return window.dash_clientside.no_update;
-    let box = null;
-    if (Array.isArray(relayoutData.shapes)) {
-        for (let i = relayoutData.shapes.length - 1; i >= 0; i -= 1) {
-            const shape = relayoutData.shapes[i] || {};
-            if ((!shape.type || shape.type === 'rect') && shape.x0 != null && shape.x1 != null && shape.y0 != null && shape.y1 != null) {
-                box = shape;
-                break;
-            }
-        }
-    }
-    if (!box) {
-        const indexes = Object.keys(relayoutData)
-            .map(function(key) { const match = key.match(/^shapes\\[(\\d+)\\]\\./); return match ? Number(match[1]) : null; })
-            .filter(function(index) { return index !== null; })
-            .sort(function(a, b) { return b - a; });
-        for (let i = 0; i < indexes.length; i += 1) {
-            const prefix = 'shapes[' + indexes[i] + '].';
-            const type = relayoutData[prefix + 'type'] || 'rect';
-            if (type === 'rect' && relayoutData[prefix + 'x0'] != null && relayoutData[prefix + 'x1'] != null && relayoutData[prefix + 'y0'] != null && relayoutData[prefix + 'y1'] != null) {
-                box = {x0: relayoutData[prefix + 'x0'], x1: relayoutData[prefix + 'x1'], y0: relayoutData[prefix + 'y0'], y1: relayoutData[prefix + 'y1']};
-                break;
-            }
-        }
-    }
-    if (!box) return window.dash_clientside.no_update;
-    const y0 = Number(box.y0), y1 = Number(box.y1);
-    if (!Number.isFinite(y0) || !Number.isFinite(y1)) return window.dash_clientside.no_update;
-    const priceDiff = y1 - y0;
-    const pctChange = y0 ? priceDiff / y0 * 100 : 0;
-    const firstMs = Date.parse(box.x0), secondMs = Date.parse(box.x1);
-    let timeText = 'time n/a', barsText = 'bars n/a';
-    if (Number.isFinite(firstMs) && Number.isFinite(secondMs)) {
-        const seconds = Math.abs(secondMs - firstMs) / 1000;
-        timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
-        const timeframe = figure && figure.layout && figure.layout.meta ? figure.layout.meta.timeframe : null;
-        const intervals = {'1': 60000, '3': 180000, '5': 300000, '10': 600000, '15': 900000, '30': 1800000, '60': 3600000, '120': 7200000, '240': 14400000, 'D': 86400000, 'W': 604800000};
-        if (intervals[timeframe]) barsText = (Math.abs(secondMs - firstMs) / intervals[timeframe]).toFixed(1) + ' candles';
-    }
-    return {text: '📦 Box ' + (priceDiff >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (priceDiff >= 0 ? '+' : '') + priceDiff.toPrecision(6) + ' (' + (pctChange >= 0 ? '+' : '') + pctChange.toFixed(2) + '%) | Δ Time: ' + timeText + ' | Δ Candles: ' + barsText};
-}
-""",
-    Output("measure-result-store", "data", allow_duplicate=True),
-    Input("task-chart", "relayoutData"),
-    State("measure-mode-store", "data"),
-    State("task-chart", "figure"),
     prevent_initial_call=True,
 )
 
@@ -7762,17 +7634,53 @@ def reset_measure_on_mode_exit(mode):
 def clear_measure(_):
     return {"first": None, "second": None}, None
 
-@app.callback(
+# One clientside owner renders all measurement text.  Rectangle results come
+# straight from Plotly relayout data; point-click results come from the Store.
+# This avoids duplicate callback outputs and avoids direct DOM mutation/polling.
+clientside_callback(
+    """
+function(result, relayoutData, measureMode, figure) {
+    function storedText(value) {
+        return value && typeof value === 'object' ? (value.text || '') : (value || '');
+    }
+    if (!measureMode || !relayoutData) return storedText(result);
+    let shape = null;
+    if (Array.isArray(relayoutData.shapes)) {
+        for (let i = relayoutData.shapes.length - 1; i >= 0; i -= 1) {
+            const candidate = relayoutData.shapes[i] || {};
+            if ((!candidate.type || candidate.type === 'rect') && candidate.x0 != null && candidate.x1 != null && candidate.y0 != null && candidate.y1 != null) { shape = candidate; break; }
+        }
+    }
+    if (!shape) {
+        const indexes = Object.keys(relayoutData).map(function(key) { const match = key.match(/^shapes\\[(\\d+)\\]\\./); return match ? Number(match[1]) : null; }).filter(function(index) { return index !== null; }).sort(function(a, b) { return b - a; });
+        for (let i = 0; i < indexes.length; i += 1) {
+            const prefix = 'shapes[' + indexes[i] + '].';
+            if ((relayoutData[prefix + 'type'] || 'rect') === 'rect' && relayoutData[prefix + 'x0'] != null && relayoutData[prefix + 'x1'] != null && relayoutData[prefix + 'y0'] != null && relayoutData[prefix + 'y1'] != null) { shape = {x0: relayoutData[prefix + 'x0'], x1: relayoutData[prefix + 'x1'], y0: relayoutData[prefix + 'y0'], y1: relayoutData[prefix + 'y1']}; break; }
+        }
+    }
+    if (!shape) return storedText(result);
+    const y0 = Number(shape.y0), y1 = Number(shape.y1);
+    if (!Number.isFinite(y0) || !Number.isFinite(y1)) return storedText(result);
+    const delta = y1 - y0, pct = y0 ? delta / y0 * 100 : 0;
+    const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
+    let timeText = 'time n/a', barsText = 'bars n/a';
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+        const elapsed = Math.abs(end - start), seconds = elapsed / 1000;
+        timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
+        const timeframe = figure && figure.layout && figure.layout.meta ? figure.layout.meta.timeframe : null;
+        const intervals = {'1': 60000, '3': 180000, '5': 300000, '10': 600000, '15': 900000, '30': 1800000, '60': 3600000, '120': 7200000, '240': 14400000, 'D': 86400000, 'W': 604800000};
+        if (intervals[timeframe]) barsText = (elapsed / intervals[timeframe]).toFixed(1) + ' candles';
+    }
+    return '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText + ' | Δ Candles: ' + barsText;
+}
+""",
     Output("measure-result", "children"),
     Input("measure-result-store", "data"),
-    prevent_initial_call=False
+    Input("task-chart", "relayoutData"),
+    State("measure-mode-store", "data"),
+    State("task-chart", "figure"),
+    prevent_initial_call=False,
 )
-def show_measure_result(result):
-    if isinstance(result, dict):
-        return result.get("text", "")
-    if result:
-        return result
-    return ""
 
 @app.callback(
     Output("measure-hint", "children"),
