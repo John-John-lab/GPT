@@ -7365,7 +7365,10 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, figure,
     Input("chart-info-box-store", "data"),
     Input("oscillator-info-box-store", "data"),
     Input("chart-extend-x-store", "data"),
-    State("task-chart", "figure"),
+    # A newly selected chart or a newly opened oscillator replaces the Plotly
+    # figure. Listen to that replacement as well, otherwise its fresh traces
+    # can briefly restore candle hover boxes despite Candle Info being off.
+    Input("task-chart", "figure"),
     State("chart-view-state-store", "data"),
     State("chart-task-id", "data"),
     prevent_initial_call=True
