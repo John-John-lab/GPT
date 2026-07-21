@@ -7437,6 +7437,19 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
         });
     }
     window.Plotly.relayout(plot, layoutUpdate);
+    if (measureMode) {
+        // A server-rendered figure can arrive just after the Store becomes
+        // active. Reassert drawrect after Plotly has reconciled that figure,
+        // without registering a second callback for the same Dash output.
+        function enforceDrawRect() {
+            if (plot.layout && plot.layout.dragmode !== 'drawrect') {
+                window.Plotly.relayout(plot, {dragmode: 'drawrect'});
+            }
+        }
+        window.setTimeout(enforceDrawRect, 0);
+        window.setTimeout(enforceDrawRect, 60);
+        window.setTimeout(enforceDrawRect, 200);
+    }
     const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
     if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
         window.__taskChartMeasureShapes = [];
@@ -7484,7 +7497,7 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
     return {ts: Date.now(), measure: Boolean(measureMode), hover: Boolean(showHover)};
 }
 """,
-    Output("chart-dragmode-enforcer-store", "data", allow_duplicate=True),
+    Output("chart-dragmode-enforcer-store", "data"),
     Input("measure-mode-store", "data"),
     Input("measure-hover-store", "data"),
     Input("chart-info-box-store", "data"),
@@ -7631,34 +7644,6 @@ function(figure) {
     Input("task-chart", "figure"),
     prevent_initial_call=True,
 )
-
-clientside_callback(
-    """
-function(figure, measureMode) {
-    if (!measureMode) return window.dash_clientside.no_update;
-    function forceMeasureMode() {
-        const root = document.getElementById('task-chart');
-        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
-        if (plot && window.Plotly && plot.layout && plot.layout.dragmode !== 'drawrect') {
-            window.Plotly.relayout(plot, {dragmode: 'drawrect'});
-        }
-    }
-    // A server-rendered indicator figure can arrive after the Store has already
-    // said Measure is active. Reassert drawrect only after that reconciliation.
-    // Do not listen to relayoutData here: doing so would override a deliberate
-    // click on Plotly's Pan tool and make Measure impossible to deselect.
-    window.setTimeout(forceMeasureMode, 0);
-    window.setTimeout(forceMeasureMode, 60);
-    window.setTimeout(forceMeasureMode, 200);
-    return {ts: Date.now(), forced: 'drawrect'};
-}
-""",
-    Output("chart-dragmode-enforcer-store", "data"),
-    Input("task-chart", "figure"),
-    State("measure-mode-store", "data"),
-    prevent_initial_call=True,
-)
-
 # Keep the Measure button and Plotly's Pan / draw-rectangle modebar tools in
 # agreement.  This is deliberately client-side so a modebar click never sends
 # the candle figure back to Python or changes the current zoom/pan ranges.
