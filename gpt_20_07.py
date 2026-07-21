@@ -7432,6 +7432,7 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     if (!extendX && !focusEntry && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
         const axes = viewState.axes || {};
         Object.keys(axes).forEach(function(axisName) {
+            if (/^yaxis[0-9]+$/.test(axisName)) return;
             const axisState = axes[axisName] || {};
             if (axisState.range && axisState.range.length === 2) {
                 layoutUpdate[axisName + '.range'] = axisState.range.slice();
@@ -8130,8 +8131,12 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
                         fig.layout[axis_name].range = list(axis_range)
                         fig.layout[axis_name].autorange = False
                 elif re.match(r"^yaxis[0-9]*$", axis_name):
-                    fig.layout[axis_name].range = list(axis_range)
-                    fig.layout[axis_name].autorange = False
+                    # Only the candle pane retains a manual vertical zoom.
+                    # Oscillator ranges are indicator-specific (for example
+                    # RSI/Stoch 0–100) and must keep fitting their own panes.
+                    if axis_name == "yaxis":
+                        fig.layout[axis_name].range = list(axis_range)
+                        fig.layout[axis_name].autorange = False
             except Exception:
                 continue
         elif axis_state.get("autorange"):
@@ -8669,6 +8674,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         spikedash="dash"
     )
     fig.update_yaxes(showspikes=False)
+    if total_rows > 1:
+        # Keep each oscillator's vertical scale independent. The time axis is
+        # intentionally shared with candles, but a drag/wheel zoom started in
+        # the main pane must never rescale or distort oscillator values.
+        for row in range(2, total_rows + 1):
+            fig.update_yaxes(fixedrange=True, row=row, col=1)
     if len(df) > 1:
         candle_step = df['x'].iloc[-1] - df['x'].iloc[-2]
         if candle_step.total_seconds() > 0:
