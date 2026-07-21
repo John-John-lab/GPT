@@ -7508,6 +7508,19 @@ def _extract_measure_box(relayout_data):
             if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
                 return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
 
+    # Plotly versions differ: a completed draw can arrive as the complete
+    # shapes list, separate ``shapes[0].x0`` keys, or one ``shapes[0]`` dict.
+    # Support the latter explicitly; without it the chart shows the rectangle
+    # but the measurement callback has no box to calculate.
+    indexed_shape_objects = []
+    for key, value in relayout_data.items():
+        match = re.match(r"^shapes\[(\d+)\]$", str(key))
+        if match and isinstance(value, dict):
+            indexed_shape_objects.append((int(match.group(1)), value))
+    for _, shape in sorted(indexed_shape_objects, reverse=True):
+        if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
+            return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
+
     shape_indexes = []
     for key in relayout_data:
         match = re.match(r"shapes\[(\d+)\]\.", str(key))
