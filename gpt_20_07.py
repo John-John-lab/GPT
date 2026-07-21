@@ -3276,11 +3276,40 @@ function applyChartToggleImmediately(button) {
     button.style.background = active ? (warm ? '#fff8e1' : (green ? '#e8f5e9' : '#e3f2fd')) : 'transparent';
     button.style.borderWidth = active ? '2px' : '1px';
     if (button.id === 'toggle-measure-btn') {
-        button.textContent = active ? '📏 Measuring' : 'Measure';
+        button.textContent = active ? '📐 Measuring' : '📐 Measure';
         button.style.fontWeight = active ? 'bold' : 'normal';
     }
     return true;
 }
+// Chrome/Plotly compatibility fallback: older Plotly bundles can paint a
+// drawrect shape before Dash publishes relayoutData. Read Plotly's own layout
+// after mouseup and update the already-rendered result element immediately.
+function showNativeMeasureResultAfterMouseup() {
+    window.setTimeout(function() {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (!plot || !plot.layout || plot.layout.dragmode !== 'drawrect') return;
+        const shapes = (plot.layout && plot.layout.shapes) || (plot._fullLayout && plot._fullLayout.shapes) || [];
+        let shape = null;
+        for (let i = shapes.length - 1; i >= 0; i -= 1) {
+            const candidate = shapes[i] || {};
+            if ((!candidate.type || candidate.type === 'rect') && candidate.x0 != null && candidate.x1 != null && candidate.y0 != null && candidate.y1 != null) { shape = candidate; break; }
+        }
+        if (!shape) return;
+        const y0 = Number(shape.y0), y1 = Number(shape.y1);
+        if (!Number.isFinite(y0) || !Number.isFinite(y1)) return;
+        const delta = y1 - y0, pct = y0 ? delta / y0 * 100 : 0;
+        const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
+        let timeText = 'time n/a';
+        if (Number.isFinite(start) && Number.isFinite(end)) {
+            const seconds = Math.abs(end - start) / 1000;
+            timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
+        }
+        const result = document.getElementById('measure-result');
+        if (result) result.textContent = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText;
+    }, 80);
+}
+document.addEventListener('mouseup', showNativeMeasureResultAfterMouseup, true);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
@@ -3785,7 +3814,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Measure", id="toggle-measure-btn", style={
+                            html.Button("📐 Measure", id="toggle-measure-btn", title="Measure price and time by drawing a rectangle", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -7023,7 +7052,7 @@ def update_measure_button(active):
         "whiteSpace": "nowrap",
         "fontWeight": "bold" if active else "normal"
     }
-    return ("📏 Measuring" if active else "Measure"), base_style
+    return ("📐 Measuring" if active else "📐 Measure"), base_style
 
 @app.callback(
     Output("toggle-measure-anchor-btn", "children"),
