@@ -3246,6 +3246,7 @@ const chartToggleStores = {
     'toggle-strategy-btn': ['strategy-visible-store', false],
     'toggle-chart-info-box-btn': ['chart-info-box-store', false],
     'toggle-oscillator-info-box-btn': ['oscillator-info-box-store', true],
+    'toggle-oscillator-sync-info-btn': ['oscillator-sync-info-store', false],
     'toggle-chart-extend-x-btn': ['chart-extend-x-store', false],
     'toggle-chart-focus-entry-btn': ['chart-focus-entry-store', false],
     'toggle-measure-anchor-btn': ['measure-anchor-store', false],
@@ -3300,6 +3301,7 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-measure-hover-btn') chartToggleState[button.id] = label.indexOf('Hover: On') >= 0;
     if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
     if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
+    if (button.id === 'toggle-oscillator-sync-info-btn') chartToggleState[button.id] = label.indexOf('Osc All: On') >= 0;
     if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
     if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
     if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
@@ -3317,6 +3319,7 @@ function applyChartToggleImmediately(button) {
     }
     if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
+    if (button.id === 'toggle-oscillator-sync-info-btn') button.textContent = active ? 'Osc All: On' : 'Osc All: Off';
     if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
     if (chartToggleLabels[button.id]) button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
     return true;
@@ -3741,6 +3744,7 @@ def build_root_layout():
     dcc.Store(id="measure-hover-store", data=True),
     dcc.Store(id="chart-info-box-store", data=False),
     dcc.Store(id="oscillator-info-box-store", data=True),
+    dcc.Store(id="oscillator-sync-info-store", data=False),
     dcc.Store(id="chart-extend-x-store", data=False),
     dcc.Store(id="chart-focus-entry-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
@@ -3987,6 +3991,10 @@ def build_root_layout():
                             }),
                             html.Button("Osc Info: On", id="toggle-oscillator-info-box-btn", title="Toggle exact hover values in every visible oscillator pane", style={
                                 "background": "#fff8e1", "color": "black", "border": "1px solid #f9a825",
+                                "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Osc All: Off", id="toggle-oscillator-sync-info-btn", title="Show synchronized values for every visible oscillator at the hovered time; never show main-chart values", style={
+                                "background": "transparent", "color": "black", "border": "1px solid #999",
                                 "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap"
                             }),
                             html.Button("Extend X: Off", id="toggle-chart-extend-x-btn", title="Add TradingView-style empty space to the right side of the chart", style={
@@ -7291,6 +7299,20 @@ def update_oscillator_info_box_button(info_enabled):
     return ("Osc Info: On" if info_enabled else "Osc Info: Off"), style
 
 
+@app.callback(
+    Output("toggle-oscillator-sync-info-btn", "children"),
+    Output("toggle-oscillator-sync-info-btn", "style"),
+    Input("oscillator-sync-info-store", "data"),
+    prevent_initial_call=False,
+)
+def update_oscillator_sync_info_button(sync_enabled):
+    style = {"background": "#e3f2fd" if sync_enabled else "transparent", "color": "black",
+             "border": "2px solid #1976d2" if sync_enabled else "1px solid #999", "padding": "6px 10px",
+             "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap",
+             "fontWeight": "bold" if sync_enabled else "normal"}
+    return ("Osc All: On" if sync_enabled else "Osc All: Off"), style
+
+
 def _chart_toggle_button(label, enabled):
     """Return one consistent, stateful appearance for chart-pane controls."""
     enabled = bool(enabled)
@@ -7386,7 +7408,7 @@ def update_chart_focus_entry_button(focus_enabled):
 
 clientside_callback(
     """
-function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
+function(measureMode, measureHover, candleInfo, oscillatorInfo, oscillatorSyncInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
@@ -7485,9 +7507,9 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
             // The dark gray crosshair already shows time. Suppress this
             // transparent helper's duplicate white timestamp tooltip.
             hoverinfo = 'skip';
-        } else if (isMainPane && !candleInfo) {
+        } else if (isMainPane && (!candleInfo || oscillatorSyncInfo)) {
             hoverinfo = 'skip';
-        } else if (!isMainPane && !oscillatorInfo) {
+        } else if (!isMainPane && !(oscillatorInfo || oscillatorSyncInfo)) {
             hoverinfo = 'skip';
         } else if (trace.type === 'candlestick') {
             hovertemplate = candleTemplate;
@@ -7521,6 +7543,7 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
     Input("measure-hover-store", "data"),
     Input("chart-info-box-store", "data"),
     Input("oscillator-info-box-store", "data"),
+    Input("oscillator-sync-info-store", "data"),
     Input("chart-extend-x-store", "data"),
     Input("chart-focus-entry-store", "data"),
     # A newly selected chart or a newly opened oscillator replaces the Plotly
@@ -7535,12 +7558,13 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
 
 clientside_callback(
     """
-function(figure) {
+function(figure, oscillatorSyncInfo) {
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (!plot) {
         return window.dash_clientside.no_update;
     }
+    plot.__dashOscillatorSyncInfo = Boolean(oscillatorSyncInfo);
     if (plot.__dashFullPaneCrosshairInstalled) {
         return {installed: true, ts: Date.now()};
     }
@@ -7634,6 +7658,8 @@ function(figure) {
             if (!trace || !trace.x || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
             if (traceName.startsWith('_') || traceName === 'Signal Time') return;
             if (trace.mode === 'markers' && trace.showlegend === false) return;
+            const isMainPane = !trace.yaxis || trace.yaxis === 'y';
+            if (plot.__dashOscillatorSyncInfo && isMainPane) return;
             hoverPoints.push({curveNumber: curveNumber, pointNumber: pointIndex});
         });
         if (hoverPoints.length) {
@@ -7661,6 +7687,7 @@ function(figure) {
 """,
     Output("chart-crosshair-listener-store", "data"),
     Input("task-chart", "figure"),
+    Input("oscillator-sync-info-store", "data"),
     prevent_initial_call=True,
 )
 # Keep the Measure button and Plotly's Pan / draw-rectangle modebar tools in
