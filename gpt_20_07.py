@@ -3281,6 +3281,37 @@ function applyChartToggleImmediately(button) {
     }
     return true;
 }
+// Last-resort native measurement renderer. Plotly always keeps completed draw
+// shapes in layout.shapes, so polling this tiny layout object also works in
+// Dash/Plotly combinations that do not forward plotly_relayout to callbacks.
+function refreshNativeMeasureResult() {
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (!plot || !plot.layout || plot.layout.dragmode !== 'drawrect') return;
+    const shapes = plot.layout.shapes || [];
+    let shape = null;
+    for (let i = shapes.length - 1; i >= 0; i -= 1) {
+        const candidate = shapes[i] || {};
+        if ((!candidate.type || candidate.type === 'rect') && candidate.x0 != null && candidate.x1 != null && candidate.y0 != null && candidate.y1 != null) {
+            shape = candidate;
+            break;
+        }
+    }
+    if (!shape) return;
+    const y0 = Number(shape.y0), y1 = Number(shape.y1);
+    if (!Number.isFinite(y0) || !Number.isFinite(y1)) return;
+    const delta = y1 - y0;
+    const pct = y0 ? delta / y0 * 100 : 0;
+    const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
+    let duration = 'time n/a';
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+        const seconds = Math.abs(end - start) / 1000;
+        duration = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
+    }
+    const result = document.getElementById('measure-result');
+    if (result) result.textContent = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + duration;
+}
+window.setInterval(refreshNativeMeasureResult, 150);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
