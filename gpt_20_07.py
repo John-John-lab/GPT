@@ -7463,7 +7463,14 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
     }
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
-    (figure.data || []).forEach(function(trace, index) {
+    const expectedTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
+    function applyHoverVisibility(targetPlot) {
+        if (!targetPlot || !window.Plotly) return;
+        const actualTaskId = String(((targetPlot.layout || {}).meta || {}).task_id || '');
+        // A navigation callback can run before React replaces the Plotly DOM.
+        // Never restyle the old coin with settings intended for the new coin.
+        if (expectedTaskId && actualTaskId && expectedTaskId !== actualTaskId) return;
+        (targetPlot.data || []).forEach(function(trace, index) {
         const traceName = trace.name ? String(trace.name) : '';
         const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
         const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
@@ -7492,7 +7499,19 @@ function(measureMode, measureHover, candleInfo, oscillatorInfo, extendX, focusEn
             const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
             hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
         }
-        window.Plotly.restyle(plot, {hoverinfo: hoverinfo, hovertemplate: hovertemplate}, [index]);
+            window.Plotly.restyle(targetPlot, {hoverinfo: hoverinfo, hovertemplate: hovertemplate}, [index]);
+        });
+    }
+    applyHoverVisibility(plot);
+    // Figure replacement and Plotly trace creation are asynchronous. Reapply
+    // the hover policy after those phases so Candle Info stays Off when an
+    // oscillator, Focus Entry, or another figure-changing control is used.
+    [0, 60, 200].forEach(function(delay) {
+        window.setTimeout(function() {
+            const currentRoot = document.getElementById('task-chart');
+            const currentPlot = currentRoot ? (currentRoot.querySelector('.js-plotly-plot') || currentRoot) : null;
+            applyHoverVisibility(currentPlot);
+        }, delay);
     });
     return {ts: Date.now(), measure: Boolean(measureMode), hover: Boolean(showHover)};
 }
@@ -8127,9 +8146,10 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("chart-focus-entry-store", "data"),
     State("chart-view-state-store", "data"),
     State("measure-mode-store", "data"),
+    State("chart-info-box-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, chart_view_state, measure_mode):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, chart_view_state, measure_mode, candle_info_enabled):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -8222,6 +8242,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             low=df['low'], close=df['close'], name="OHLC",
             customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+            hoverinfo='all' if candle_info_enabled else 'skip',
             hovertemplate=(
                 "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
                 "Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}"
