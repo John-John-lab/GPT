@@ -3254,9 +3254,39 @@ const chartToggleStores = {
     'toggle-measure-btn': ['measure-mode-store', false]
 };
 const chartToggleState = {};
+const chartToggleLabels = {
+    'toggle-rsi-btn': 'RSI',
+    'toggle-stochastic-btn': 'Stoch',
+    'toggle-volume-btn': 'Volume',
+    'toggle-adx-btn': 'ADX',
+    'toggle-macd-btn': 'MACD',
+    'toggle-disparity-btn': 'DIX',
+    'toggle-strategy-btn': 'Strategy',
+    'toggle-impulses-btn': 'Impulses',
+    'toggle-events-btn': 'Events'
+};
+const measureExclusiveButtons = new Set([
+    'toggle-rsi-btn', 'toggle-stochastic-btn', 'toggle-volume-btn',
+    'toggle-adx-btn', 'toggle-macd-btn', 'toggle-disparity-btn',
+    'toggle-strategy-btn', 'toggle-impulses-btn', 'toggle-events-btn',
+    'toggle-chart-extend-x-btn', 'toggle-chart-event-marks-btn'
+]);
 Object.keys(chartToggleStores).forEach(function(buttonId) {
     chartToggleState[buttonId] = chartToggleStores[buttonId][1];
 });
+function deactivateMeasureForChartAction() {
+    if (!chartToggleState['toggle-measure-btn']) return;
+    chartToggleState['toggle-measure-btn'] = false;
+    window.dash_clientside.set_props('measure-mode-store', {data: false});
+    const measureButton = document.getElementById('toggle-measure-btn');
+    if (measureButton) {
+        measureButton.textContent = '📐 Measure';
+        measureButton.setAttribute('aria-pressed', 'false');
+        measureButton.style.background = 'transparent';
+        measureButton.style.borderWidth = '1px';
+        measureButton.style.fontWeight = 'normal';
+    }
+}
 function applyChartToggleImmediately(button) {
     const config = chartToggleStores[button.id];
     if (!config || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') {
@@ -3269,6 +3299,7 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
     if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
     if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
+    if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
     window.dash_clientside.set_props(config[0], {data: active});
@@ -3283,6 +3314,7 @@ function applyChartToggleImmediately(button) {
     }
     if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
+    if (chartToggleLabels[button.id]) button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
     return true;
 }
 // Chrome/Plotly compatibility fallback: older Plotly bundles can paint a
@@ -3390,6 +3422,11 @@ document.addEventListener('click', function(e) {
     }
     
     if (!button) return;
+
+    // Indicator, overlay and range controls replace/reposition the figure.
+    // They therefore leave drawing mode before their own action runs, so the
+    // Measure appearance always agrees with the active chart interaction.
+    if (measureExclusiveButtons.has(button.id)) deactivateMeasureForChartAction();
 
     // These are pure UI Store toggles. Updating through set_props avoids a
     // registered clientside callback lookup, which older Dash renderers can
@@ -3833,7 +3870,7 @@ def build_root_layout():
                                 "minWidth": "34px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle RSI", id="toggle-rsi-btn", style={
+                            html.Button("RSI: Off", id="toggle-rsi-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3843,7 +3880,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Stoch", id="toggle-stochastic-btn", style={
+                            html.Button("Stoch: Off", id="toggle-stochastic-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3853,7 +3890,7 @@ def build_root_layout():
                                 "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Volume", id="toggle-volume-btn", style={
+                            html.Button("Volume: Off", id="toggle-volume-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3863,7 +3900,7 @@ def build_root_layout():
                                 "minWidth": "86px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle ADX", id="toggle-adx-btn", style={
+                            html.Button("ADX: Off", id="toggle-adx-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3873,7 +3910,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle MACD", id="toggle-macd-btn", style={
+                            html.Button("MACD: Off", id="toggle-macd-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3883,7 +3920,7 @@ def build_root_layout():
                                 "minWidth": "88px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle DIX", id="toggle-disparity-btn", title="Toggle CMOa Disparity Index (EMA 50/25/9)", style={
+                            html.Button("DIX: Off", id="toggle-disparity-btn", title="Toggle CMOa Disparity Index (EMA 50/25/9)", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3893,7 +3930,7 @@ def build_root_layout():
                                 "minWidth": "84px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Strategy", id="toggle-strategy-btn", style={
+                            html.Button("Strategy: Off", id="toggle-strategy-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3967,7 +4004,7 @@ def build_root_layout():
                                 "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Impulses", id="toggle-impulses-btn", style={
+                            html.Button("Impulses: On", id="toggle-impulses-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3987,7 +4024,7 @@ def build_root_layout():
                                 "minWidth": "108px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Events", id="toggle-events-btn", style={
+                            html.Button("Events: Off", id="toggle-events-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -7238,6 +7275,58 @@ def update_oscillator_info_box_button(info_enabled):
              "fontWeight": "bold" if info_enabled else "normal"}
     return ("Osc Info: On" if info_enabled else "Osc Info: Off"), style
 
+
+def _chart_toggle_button(label, enabled):
+    """Return one consistent, stateful appearance for chart-pane controls."""
+    enabled = bool(enabled)
+    style = {
+        "background": "#e3f2fd" if enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "76px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if enabled else "normal",
+    }
+    return f"{label}: {'On' if enabled else 'Off'}", style
+
+
+@app.callback(
+    Output("toggle-rsi-btn", "children"), Output("toggle-rsi-btn", "style"),
+    Output("toggle-stochastic-btn", "children"), Output("toggle-stochastic-btn", "style"),
+    Output("toggle-volume-btn", "children"), Output("toggle-volume-btn", "style"),
+    Output("toggle-adx-btn", "children"), Output("toggle-adx-btn", "style"),
+    Output("toggle-macd-btn", "children"), Output("toggle-macd-btn", "style"),
+    Output("toggle-disparity-btn", "children"), Output("toggle-disparity-btn", "style"),
+    Output("toggle-strategy-btn", "children"), Output("toggle-strategy-btn", "style"),
+    Output("toggle-impulses-btn", "children"), Output("toggle-impulses-btn", "style"),
+    Output("toggle-events-btn", "children"), Output("toggle-events-btn", "style"),
+    Input("rsi-visible-store", "data"),
+    Input("stochastic-visible-store", "data"),
+    Input("volume-visible-store", "data"),
+    Input("adx-visible-store", "data"),
+    Input("macd-visible-store", "data"),
+    Input("disparity-visible-store", "data"),
+    Input("strategy-visible-store", "data"),
+    Input("impulse-visible-store", "data"),
+    Input("events-visible-store", "data"),
+    prevent_initial_call=False,
+)
+def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, strategy, impulses, events):
+    return (
+        *_chart_toggle_button("RSI", rsi),
+        *_chart_toggle_button("Stoch", stochastic),
+        *_chart_toggle_button("Volume", volume),
+        *_chart_toggle_button("ADX", adx),
+        *_chart_toggle_button("MACD", macd),
+        *_chart_toggle_button("DIX", disparity),
+        *_chart_toggle_button("Strategy", strategy),
+        *_chart_toggle_button("Impulses", impulses),
+        *_chart_toggle_button("Events", events),
+    )
+
 @app.callback(
     Output("toggle-chart-extend-x-btn", "children"),
     Output("toggle-chart-extend-x-btn", "style"),
@@ -7543,8 +7632,10 @@ function(relayoutData) {
         return window.dash_clientside.no_update;
     }
     if (relayoutData.dragmode === 'drawrect') return true;
-    if (relayoutData.dragmode === 'pan') return false;
-    return window.dash_clientside.no_update;
+    // Pan, zoom, select and lasso are all non-measure Plotly interactions.
+    // Treat every one as leaving Measure so the button never says Measuring
+    // while another modebar tool owns the drag gesture.
+    return false;
 }
 """,
     Output("measure-mode-store", "data", allow_duplicate=True),
