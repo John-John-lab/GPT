@@ -3312,18 +3312,28 @@ function showNativeMeasureResultAfterMouseup() {
         const result = document.getElementById('measure-result');
         const text = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText;
         if (result) result.textContent = text;
-        // A lightweight DOM label keeps the measurement beside the rectangle
-        // without rebuilding the Plotly figure or altering its zoom/pan state.
+        // Attach the label to the chart container, not the browser viewport,
+        // so it scrolls and moves with the measured rectangle.
         const xaxis = plot._fullLayout && plot._fullLayout.xaxis, yaxis = plot._fullLayout && plot._fullLayout.yaxis;
         const svg = plot.querySelector('.main-svg');
         if (xaxis && yaxis && svg && xaxis.d2l && yaxis.d2l && xaxis.l2p && yaxis.l2p) {
             const svgRect = svg.getBoundingClientRect();
-            const label = document.getElementById('task-chart-measure-label') || document.body.appendChild(document.createElement('div'));
+            const rootRect = root.getBoundingClientRect();
+            root.style.position = 'relative';
+            const label = document.getElementById('task-chart-measure-label') || root.appendChild(document.createElement('div'));
             label.id = 'task-chart-measure-label';
             label.textContent = (delta >= 0 ? '▲ ' : '▼ ') + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '% | ' + timeText;
-            label.style.cssText = 'position:fixed;z-index:10051;pointer-events:none;background:rgba(25,118,210,.92);color:#fff;padding:3px 6px;border-radius:3px;font:11px sans-serif;white-space:nowrap;';
-            label.style.left = (svgRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(shape.x1)) + 8) + 'px';
-            label.style.top = (svgRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(shape.y1)) - 22) + 'px';
+            label.style.cssText = 'position:absolute;z-index:10051;pointer-events:none;background:rgba(25,118,210,.92);color:#fff;padding:3px 6px;border-radius:3px;font:11px sans-serif;white-space:nowrap;';
+            const pointX = svgRect.left - rootRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(shape.x1));
+            const pointY = svgRect.top - rootRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(shape.y1));
+            label.style.left = (pointX + 18) + 'px';
+            label.style.top = (pointY - 30) + 'px';
+            const pointer = document.getElementById('task-chart-measure-pointer') || root.appendChild(document.createElement('div'));
+            pointer.id = 'task-chart-measure-pointer';
+            const dx = 18, dy = -16, length = Math.sqrt(dx * dx + dy * dy);
+            pointer.style.cssText = 'position:absolute;z-index:10050;pointer-events:none;height:1px;background:#1976d2;transform-origin:0 0;';
+            pointer.style.left = pointX + 'px'; pointer.style.top = pointY + 'px';
+            pointer.style.width = length + 'px'; pointer.style.transform = 'rotate(' + Math.atan2(dy, dx) + 'rad)';
         }
     }, 80);
 }
@@ -3359,6 +3369,8 @@ document.addEventListener('click', function(e) {
         }
         const measureLabel = document.getElementById('task-chart-measure-label');
         if (measureLabel) measureLabel.remove();
+        const measurePointer = document.getElementById('task-chart-measure-pointer');
+        if (measurePointer) measurePointer.remove();
         return;
     }
 
@@ -3458,6 +3470,8 @@ document.addEventListener('keydown', function(e) {
     if (shapes.length - 1 <= base) {
         const label = document.getElementById('task-chart-measure-label');
         if (label) label.remove();
+        const pointer = document.getElementById('task-chart-measure-pointer');
+        if (pointer) pointer.remove();
     }
 }, true);
 // Toggle column highlight on header click
