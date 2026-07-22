@@ -3771,7 +3771,7 @@ def build_root_layout():
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
-    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
+    dcc.Store(id="chart-event-context-store", data={"source": "main_table", "events": [], "index": 0, "overlay": False}),
     dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
     dcc.Store(id="chart-dragmode-enforcer-store", data=None),  # keeps Measure draw-rectangle mode synced with Plotly modebar
     dcc.Store(id="chart-crosshair-listener-store", data=None),  # installs browser-side full-height chart crosshair overlay
@@ -7054,7 +7054,7 @@ def set_chart_task_id(trigger_data, click_store):
         return no_update, no_update, no_update
     click_store[key] = current_time
     prefetch_chart_neighbors(str(task_id))
-    return str(task_id), click_store, {"events": [], "index": 0, "overlay": False}
+    return str(task_id), click_store, {"source": "main_table", "events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
 @app.callback(
@@ -7082,7 +7082,7 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 )
 def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
-    return None, None, {}, {"events": [], "index": 0, "overlay": False}
+    return None, None, {}, {"source": "main_table", "events": [], "index": 0, "overlay": False}
 
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
@@ -7120,7 +7120,7 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     task_id = str(events[event_index].get("task_id") or "")
     if not task_id:
         return no_update, no_update, no_update, no_update, no_update
-    context = {"category": category, "events": events, "index": event_index, "overlay": True}
+    context = {"source": "dynamic_oscillator_summary", "category": category, "events": events, "index": event_index, "overlay": True}
     return task_id, {f"{task_id}_chart": time.time()}, context, True, True
 
 @app.callback(
@@ -8528,7 +8528,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     # indicator calculation is needed.
     event_focus_xrange = None
     event_focus_yrange = None
-    if isinstance(chart_event_context, dict):
+    if isinstance(chart_event_context, dict) and chart_event_context.get("source") == "dynamic_oscillator_summary":
         event_rows = chart_event_context.get("events") or []
         event_idx = int(chart_event_context.get("index") or 0)
         if 0 <= event_idx < len(event_rows):
@@ -8726,6 +8726,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             "extended_xrange": None,
             "entry_focus_xrange": entry_focus_xrange,
             "event_focus_xrange": event_focus_xrange,
+            "chart_open_source": (chart_event_context or {}).get("source", "main_table") if isinstance(chart_event_context, dict) else "main_table",
             "timeframe": task.timeframe,
             "task_id": str(task_id),
         },
