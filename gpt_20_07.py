@@ -7419,7 +7419,8 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     layoutUpdate.hoversubplots = showHover ? 'axis' : false;
 
     const meta = figure.layout.meta || {};
-    const targetRange = focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange);
+    const hasEventFocus = Array.isArray(meta.event_focus_xrange) && meta.event_focus_xrange.length === 2;
+    const targetRange = hasEventFocus ? meta.event_focus_xrange : (focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange));
     Object.keys(figure.layout).forEach(function(key) {
         if (/^xaxis[0-9]*$/.test(key)) {
             layoutUpdate[key + '.showspikes'] = false;
@@ -7428,7 +7429,7 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
             layoutUpdate[key + '.spikethickness'] = 1;
             layoutUpdate[key + '.spikedash'] = 'dash';
             layoutUpdate[key + '.spikesnap'] = 'cursor';
-            if ((extendX || focusEntry) && targetRange && targetRange.length === 2) {
+            if ((extendX || focusEntry || hasEventFocus) && targetRange && targetRange.length === 2) {
                 layoutUpdate[key + '.range'] = targetRange;
                 layoutUpdate[key + '.autorange'] = false;
             }
@@ -7437,7 +7438,7 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
             layoutUpdate[key + '.showspikes'] = false;
         }
     });
-    if (!extendX && !focusEntry && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
+    if (!extendX && !focusEntry && !hasEventFocus && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
         const axes = viewState.axes || {};
         Object.keys(axes).forEach(function(axisName) {
             if (/^yaxis[0-9]+$/.test(axisName)) return;
@@ -8521,6 +8522,39 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             focus_padding = max((focus_high - focus_low) * 0.06, 1e-12)
             entry_focus_yrange = [focus_low - focus_padding, focus_high + focus_padding]
 
+    # A chart opened from a Dynamic Oscillator summary has a concrete trade
+    # interval. Focus that entry-to-exit interval (not the original signal)
+    # using the already loaded task DataFrame; no additional parquet read or
+    # indicator calculation is needed.
+    event_focus_xrange = None
+    event_focus_yrange = None
+    if isinstance(chart_event_context, dict):
+        event_rows = chart_event_context.get("events") or []
+        event_idx = int(chart_event_context.get("index") or 0)
+        if 0 <= event_idx < len(event_rows):
+            selected_event = event_rows[event_idx] or {}
+            if str(selected_event.get("task_id")) == str(task_id):
+                try:
+                    event_entry_ms = float(selected_event.get("entry_time"))
+                    event_exit_ms = float(selected_event.get("exit_time"))
+                    event_entry_price = float(selected_event.get("entry_price"))
+                    event_exit_price = float(selected_event.get("exit_price"))
+                    if len(df) and all(np.isfinite(value) for value in (event_entry_ms, event_exit_ms, event_entry_price, event_exit_price)):
+                        timestamps = df['timestamp'].to_numpy()
+                        start_idx = int(np.searchsorted(timestamps, min(event_entry_ms, event_exit_ms), side='left'))
+                        end_idx = int(np.searchsorted(timestamps, max(event_entry_ms, event_exit_ms), side='right')) - 1
+                        start_idx = max(0, min(start_idx, len(df) - 1))
+                        end_idx = max(start_idx, min(end_idx, len(df) - 1))
+                        left_idx = max(0, start_idx - 20)
+                        right_idx = min(len(df) - 1, end_idx + 20)
+                        event_focus_xrange = [df['x'].iloc[left_idx], df['x'].iloc[right_idx]]
+                        event_low = min(float(df['low'].iloc[left_idx:right_idx + 1].min()), event_entry_price, event_exit_price)
+                        event_high = max(float(df['high'].iloc[left_idx:right_idx + 1].max()), event_entry_price, event_exit_price)
+                        event_padding = max((event_high - event_low) * 0.08, abs(event_entry_price) * 0.01, 1e-12)
+                        event_focus_yrange = [event_low - event_padding, event_high + event_padding]
+                except (TypeError, ValueError):
+                    pass
+
     # Do not place a transparent hover trace over the candle pane: it can steal
     # the OHLC hover label from candles. A browser-side crosshair overlay below
     # provides the always-visible vertical guide across the full chart instead.
@@ -8691,6 +8725,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
             "entry_focus_xrange": entry_focus_xrange,
+            "event_focus_xrange": event_focus_xrange,
             "timeframe": task.timeframe,
             "task_id": str(task_id),
         },
@@ -8729,7 +8764,10 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         fig.update_layout(hoversubplots="axis")
     except ValueError:
         pass
-    if focus_entry and entry_focus_xrange and entry_focus_yrange:
+    if event_focus_xrange and event_focus_yrange:
+        fig.update_xaxes(range=event_focus_xrange, autorange=False)
+        fig.update_yaxes(range=event_focus_yrange, autorange=False, row=1, col=1)
+    elif focus_entry and entry_focus_xrange and entry_focus_yrange:
         fig.update_xaxes(range=entry_focus_xrange, autorange=False)
         fig.update_yaxes(range=entry_focus_yrange, autorange=False, row=1, col=1)
     else:
