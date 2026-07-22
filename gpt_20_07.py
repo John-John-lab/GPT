@@ -814,6 +814,9 @@ chart_task_indicator_cache = OrderedDict()
 # source cache is byte-bounded, so this is safe on older Macs and makes the
 # first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
 CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
+# Let the foreground chart read claim an older SSD before optional neighbour
+# warm-up begins.  Set to 0 only on machines with fast storage.
+CHART_PREFETCH_DELAY_SECONDS = max(0.0, float(os.environ.get("GPT_CHART_PREFETCH_DELAY", "0.75")))
 chart_prefetch_pending = set()
 chart_prefetch_lock = threading.Lock()
 
@@ -939,6 +942,11 @@ def prefetch_chart_source_async(task):
 
     def _warm():
         try:
+            # ``set_chart_task_id`` launches this at the same time Dash starts
+            # the current chart callback. Without a short delay two parquet
+            # reads can contend for a slow SSD and make *both* charts slower.
+            if CHART_PREFETCH_DELAY_SECONDS:
+                time.sleep(CHART_PREFETCH_DELAY_SECONDS)
             prefetch_chart_source(task)
         finally:
             with chart_prefetch_lock:
