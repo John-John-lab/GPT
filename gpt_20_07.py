@@ -3377,6 +3377,75 @@ function applyChartToggleImmediately(button) {
     if (chartToggleLabels[button.id]) button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
     return true;
 }
+
+// Dash 4's inline clientside callback registry is disabled by default for
+// compatibility, so keep the full-height crosshair and Osc All values on a
+// direct DOM listener. This is independent from Dash callback registration.
+function installChartCrosshairFallback() {
+    if (window.__taskChartCrosshairFallbackInstalled) return;
+    window.__taskChartCrosshairFallbackInstalled = true;
+    const line = document.createElement('div');
+    line.id = 'task-chart-full-pane-crosshair';
+    line.style.cssText = 'position:fixed;z-index:10050;display:none;width:0;border-left:1px dashed #666;pointer-events:none;';
+    document.body.appendChild(line);
+    function clearLabels(root) {
+        if (root) root.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(node) { node.remove(); });
+    }
+    function asMillis(value) {
+        if (value instanceof Date) return value.getTime();
+        if (typeof value === 'number') return value;
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    function nearestIndex(values, target) {
+        let best = 0, distance = Infinity;
+        (values || []).forEach(function(value, index) {
+            const stamp = asMillis(value);
+            if (stamp === null) return;
+            const nextDistance = Math.abs(stamp - target);
+            if (nextDistance < distance) { best = index; distance = nextDistance; }
+        });
+        return Number.isFinite(distance) ? best : null;
+    }
+    document.addEventListener('mousemove', function(event) {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (!plot || !plot._fullLayout || !plot.data) { line.style.display = 'none'; return; }
+        const rect = plot.getBoundingClientRect();
+        if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+            line.style.display = 'none'; clearLabels(root); return;
+        }
+        line.style.left = event.clientX + 'px'; line.style.top = rect.top + 'px'; line.style.height = rect.height + 'px'; line.style.display = 'block';
+        if (!chartToggleState['toggle-oscillator-sync-info-btn']) { clearLabels(root); return; }
+        const xaxis = plot._fullLayout.xaxis || {}, range = xaxis.range || [];
+        const firstTrace = (plot.data || []).find(function(trace) { return trace && trace.x && trace.x.length; });
+        if (!firstTrace || range.length !== 2) return;
+        const start = asMillis(range[0]), end = asMillis(range[1]);
+        if (start === null || end === null || start === end) return;
+        const index = nearestIndex(firstTrace.x, start + (end - start) * ((event.clientX - rect.left) / Math.max(1, rect.width)));
+        if (index === null) return;
+        clearLabels(root);
+        if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
+        const svg = plot.querySelector('.main-svg'), svgRect = svg ? svg.getBoundingClientRect() : rect, rootRect = root.getBoundingClientRect(), valuesByAxis = {};
+        plot.data.forEach(function(trace) {
+            const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
+            const name = trace && trace.name ? String(trace.name) : '';
+            if (!trace || axisId === 'y' || !trace.y || index >= trace.y.length || trace.visible === false || name.startsWith('_')) return;
+            const value = Number(trace.y[index]);
+            if (!Number.isFinite(value)) return;
+            (valuesByAxis[axisId] || (valuesByAxis[axisId] = [])).push((name || 'Value') + ': ' + value.toFixed(Math.abs(value) >= 100 ? 1 : 2));
+        });
+        Object.keys(valuesByAxis).forEach(function(axisId) {
+            const axis = plot._fullLayout['yaxis' + axisId.slice(1)];
+            if (!axis || !Number.isFinite(axis._offset)) return;
+            const label = document.createElement('div');
+            label.dataset.taskChartOscillatorSyncLabel = 'true'; label.textContent = valuesByAxis[axisId].join('\n');
+            label.style.cssText = 'position:absolute;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
+            label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px'; label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px'; root.appendChild(label);
+        });
+    }, true);
+}
+installChartCrosshairFallback();
 // Chrome/Plotly compatibility fallback: older Plotly bundles can paint a
 // drawrect shape before Dash publishes relayoutData. Read Plotly's own layout
 // after mouseup and update the already-rendered result element immediately.
