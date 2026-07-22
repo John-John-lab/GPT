@@ -7512,15 +7512,21 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
             hoverinfo = 'skip';
         } else if (!isMainPane && !(oscillatorInfo || oscillatorSyncInfo)) {
             hoverinfo = 'skip';
-        } else if (trace.type === 'candlestick') {
-            hovertemplate = candleTemplate;
-        } else if (trace.name && String(trace.name).includes('Volume')) {
-            hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
-        } else if (trace.name && String(trace.name).includes('RSI')) {
-            hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
-        } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
-            const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
-            hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+        } else {
+            // Explicitly restore hover after an Osc Info/Osc All toggle. A
+            // trace may previously have been set to skip, and leaving the
+            // property unchanged would keep every synchronized box hidden.
+            hoverinfo = 'all';
+            if (trace.type === 'candlestick') {
+                hovertemplate = candleTemplate;
+            } else if (trace.name && String(trace.name).includes('Volume')) {
+                hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
+            } else if (trace.name && String(trace.name).includes('RSI')) {
+                hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
+            } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
+                const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
+                hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+            }
         }
             const update = {};
             if (hoverinfo !== null) update.hoverinfo = hoverinfo;
@@ -8311,7 +8317,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         target_fig.add_trace(go.Bar(
             x=df['x'], y=[high - low] * len(df), base=[low] * len(df),
             name=name, showlegend=False, opacity=0.001, marker_color='rgba(0,0,0,0.001)',
-            marker_line_width=0, hovertemplate='%{x|%Y-%m-%d %H:%M}<extra></extra>'
+            marker_line_width=0, hoverinfo='skip'
         ), row=row, col=1)
 
     def add_volume_trace(target_fig, row, title="Volume"):
