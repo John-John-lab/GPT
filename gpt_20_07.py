@@ -7570,14 +7570,21 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
 
 clientside_callback(
     """
-function(figure, oscillatorSyncInfo) {
+function(figure, oscillatorSyncInfo, candleInfo) {
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (!plot) {
         return window.dash_clientside.no_update;
     }
     plot.__dashOscillatorSyncInfo = Boolean(oscillatorSyncInfo);
+    plot.__dashCandleInfoEnabled = Boolean(candleInfo);
+    function clearOscillatorSyncLabels() {
+        root.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(label) {
+            label.remove();
+        });
+    }
     if (plot.__dashFullPaneCrosshairInstalled) {
+        if (!plot.__dashOscillatorSyncInfo) clearOscillatorSyncLabels();
         return {installed: true, ts: Date.now()};
     }
     plot.__dashFullPaneCrosshairInstalled = true;
@@ -7618,6 +7625,7 @@ function(figure, oscillatorSyncInfo) {
     }
     function hideLine() {
         line.style.display = 'none';
+        clearOscillatorSyncLabels();
         if (window.Plotly && window.Plotly.Fx) {
             try { window.Plotly.Fx.unhover(plot); } catch (e) {}
         }
@@ -7643,6 +7651,56 @@ function(figure, oscillatorSyncInfo) {
             if (ms > targetMs && distance > bestDistance) break;
         }
         return Number.isFinite(bestDistance) ? bestIndex : null;
+    }
+    function formatOscillatorValue(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return null;
+        const magnitude = Math.abs(numeric);
+        if (magnitude !== 0 && (magnitude < 0.01 || magnitude >= 10000)) return numeric.toPrecision(5);
+        return numeric.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4);
+    }
+    function renderOscillatorSyncLabels(pointIndex) {
+        clearOscillatorSyncLabels();
+        if (!plot.__dashOscillatorSyncInfo || !plot._fullLayout || !plot.data) return;
+        const svg = plot.querySelector('.main-svg');
+        if (!svg) return;
+        if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
+        const rootRect = root.getBoundingClientRect();
+        const svgRect = svg.getBoundingClientRect();
+        const valuesByAxis = {};
+        plot.data.forEach(function(trace) {
+            const traceName = trace && trace.name ? String(trace.name) : '';
+            const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
+            if (!trace || axisId === 'y' || !trace.x || !trace.y || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
+            if (traceName.startsWith('_') || traceName === 'Signal Time') return;
+            if (trace.mode === 'markers' && trace.showlegend === false) return;
+            const value = formatOscillatorValue(trace.y[pointIndex]);
+            if (value === null) return;
+            if (!valuesByAxis[axisId]) valuesByAxis[axisId] = [];
+            valuesByAxis[axisId].push((traceName || 'Value') + ': ' + value);
+        });
+        Object.keys(valuesByAxis).forEach(function(axisId) {
+            const axisKey = axisId === 'y' ? 'yaxis' : 'yaxis' + axisId.slice(1);
+            const axis = plot._fullLayout[axisKey];
+            if (!axis || !Number.isFinite(axis._offset)) return;
+            const label = document.createElement('div');
+            label.dataset.taskChartOscillatorSyncLabel = 'true';
+            label.textContent = valuesByAxis[axisId].join('\n');
+            label.style.position = 'absolute';
+            label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px';
+            label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px';
+            label.style.zIndex = '10052';
+            label.style.pointerEvents = 'none';
+            label.style.whiteSpace = 'pre-line';
+            label.style.background = 'rgba(255,255,255,0.92)';
+            label.style.border = '1px solid #90a4ae';
+            label.style.borderRadius = '3px';
+            label.style.color = '#263238';
+            label.style.font = '11px sans-serif';
+            label.style.lineHeight = '1.3';
+            label.style.padding = '2px 5px';
+            root.appendChild(label);
+        });
     }
     function syncedHoverAt(event, rect) {
         if (!window.Plotly || !window.Plotly.Fx || !plot._fullLayout || !plot.data || !plot.data.length) return;
@@ -7671,12 +7729,17 @@ function(figure, oscillatorSyncInfo) {
             if (traceName.startsWith('_') || traceName === 'Signal Time') return;
             if (trace.mode === 'markers' && trace.showlegend === false) return;
             const isMainPane = !trace.yaxis || trace.yaxis === 'y';
+            if (isMainPane && !plot.__dashCandleInfoEnabled) return;
             if (plot.__dashOscillatorSyncInfo && isMainPane) return;
             hoverPoints.push({curveNumber: curveNumber, pointNumber: pointIndex});
         });
         if (hoverPoints.length) {
             try { window.Plotly.Fx.hover(plot, hoverPoints); } catch (e) {}
         }
+        // Some older Plotly bundles do not render multi-subplot hover labels
+        // reliably. Keep a small, pane-anchored fallback for Osc All so every
+        // visible oscillator still reports its value at the current time.
+        renderOscillatorSyncLabels(pointIndex);
     }
     function moveLine(event) {
         const rect = getPlotAreaRect();
@@ -7700,6 +7763,7 @@ function(figure, oscillatorSyncInfo) {
     Output("chart-crosshair-listener-store", "data"),
     Input("task-chart", "figure"),
     Input("oscillator-sync-info-store", "data"),
+    Input("chart-info-box-store", "data"),
     prevent_initial_call=True,
 )
 # Keep the Measure button and Plotly's Pan / draw-rectangle modebar tools in
@@ -8746,6 +8810,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     # browser-side crosshair overlay supplies the single full-pane dashed line.
     fig.update_xaxes(
         tickformat="%H:%M",
+        hoverformat="%Y-%m-%d %H:%M",
         ticklabelmode="period",
         ticks="outside",
         showspikes=False,
