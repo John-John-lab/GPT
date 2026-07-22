@@ -20,7 +20,7 @@ import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functo
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 import dash
-from dash import dcc, html, Input, Output, State, MATCH, ALL, no_update, ctx, clientside_callback
+from dash import dcc, html, Input, Output, State, MATCH, ALL, no_update, ctx, clientside_callback as dash_clientside_callback
 import pandas as pd
 import numpy as np
 import requests
@@ -794,13 +794,77 @@ last_rendered_stats = {} # Cache for summary tables to prevent disappearance
 # read-only views of the current Golden Store task/data snapshot. Keep these
 # bounded: diagnostics should get faster on repeated parameter runs without
 # becoming an unbounded in-memory database.
-OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 1500
+OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX = 32
+OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX_BYTES = 192 * 1024 * 1024
 oscillator_reversal_source_cache = OrderedDict()
+oscillator_reversal_source_cache_bytes = 0
 
-# Keep enough recently opened chart sources for quick left/right navigation.
-# The cache is still bounded and invalidated by parquet mtime/size.
-CHART_PARQUET_CACHE_MAX = 24
+# Conservative chart caches for older machines: source entries are limited by
+# both count and total DataFrame memory, never just by number of coin pairs.
+# Entries are still invalidated by parquet mtime/size.
+CHART_PARQUET_CACHE_MAX = 6
+CHART_PARQUET_CACHE_MAX_BYTES = 192 * 1024 * 1024
 chart_parquet_cache = OrderedDict()
+chart_parquet_cache_bytes = 0
+CHART_FILE_END_CACHE_MAX = 48
+chart_file_end_cache = OrderedDict()
+CHART_TASK_INDICATOR_CACHE_MAX = 2
+chart_task_indicator_cache = OrderedDict()
+# Warm one neighbouring range while the user studies the current chart. The
+# source cache is byte-bounded, so this is safe on older Macs and makes the
+# first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
+CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
+# Let the foreground chart read claim an older SSD before optional neighbour
+# warm-up begins.  Set to 0 only on machines with fast storage.
+CHART_PREFETCH_DELAY_SECONDS = max(0.0, float(os.environ.get("GPT_CHART_PREFETCH_DELAY", "0.75")))
+chart_prefetch_pending = set()
+chart_prefetch_lock = threading.Lock()
+
+def _chart_dataframe_bytes(df):
+    """Return an accurate-enough in-memory size for a cached DataFrame."""
+    try:
+        return int(df.memory_usage(index=True, deep=True).sum())
+    except Exception:
+        return 0
+
+def retain_chart_task_indicator_cache(task):
+    """Keep lazy indicator data for only the active chart and one recent chart."""
+    task_id = str(getattr(task, "task_id", ""))
+    if not task_id:
+        return
+    chart_task_indicator_cache[task_id] = task
+    chart_task_indicator_cache.move_to_end(task_id)
+    while len(chart_task_indicator_cache) > CHART_TASK_INDICATOR_CACHE_MAX:
+        _, evicted_task = chart_task_indicator_cache.popitem(last=False)
+        if evicted_task is not task and hasattr(evicted_task, "_chart_cache"):
+            evicted_task._chart_cache.clear()
+
+def get_chart_file_end_timestamp(fp):
+    """Return a parquet file's latest timestamp without rescanning it per task.
+
+    Tasks for the same pair/timeframe often have no explicit end date.  The old
+    chart path read the timestamp column every time the user pressed Next,
+    even though the answer only changes when the parquet file changes.
+    """
+    stat = os.stat(fp)
+    cache_key = (fp, stat.st_mtime_ns, stat.st_size)
+    cached = chart_file_end_cache.get(cache_key)
+    if cached is not None:
+        chart_file_end_cache.move_to_end(cache_key)
+        return cached
+
+    # Retire cached bounds for an older version of this file.
+    for old_key in [key for key in chart_file_end_cache if key[0] == fp and key != cache_key]:
+        chart_file_end_cache.pop(old_key, None)
+    timestamps = pd.read_parquet(fp, columns=["timestamp"])
+    if timestamps.empty:
+        return None
+    latest = int(timestamps["timestamp"].max())
+    chart_file_end_cache[cache_key] = latest
+    chart_file_end_cache.move_to_end(cache_key)
+    while len(chart_file_end_cache) > CHART_FILE_END_CACHE_MAX:
+        chart_file_end_cache.popitem(last=False)
+    return latest
 
 def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
     """Read only the chart period, with a bounded mtime-aware cache.
@@ -811,6 +875,7 @@ def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
     the chart read-only and preserve the exact same inclusive time bounds while
     allowing PyArrow to skip unrelated row groups.
     """
+    global chart_parquet_cache_bytes
     stat = os.stat(fp)
     cache_key = (fp, stat.st_mtime_ns, stat.st_size, start_ms, end_ms)
     cached = chart_parquet_cache.get(cache_key)
@@ -824,7 +889,8 @@ def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
         key for key in chart_parquet_cache
         if key[0] == fp and (key[1] != stat.st_mtime_ns or key[2] != stat.st_size)
     ]:
-        chart_parquet_cache.pop(old_key, None)
+        stale_df = chart_parquet_cache.pop(old_key, None)
+        chart_parquet_cache_bytes -= _chart_dataframe_bytes(stale_df) if stale_df is not None else 0
 
     filters = []
     if start_ms is not None:
@@ -832,11 +898,61 @@ def read_chart_parquet_cached(fp, start_ms=None, end_ms=None):
     if end_ms is not None:
         filters.append(("timestamp", "<=", int(end_ms)))
     df = pd.read_parquet(fp, filters=filters or None)
-    chart_parquet_cache[cache_key] = df
-    chart_parquet_cache.move_to_end(cache_key)
-    while len(chart_parquet_cache) > CHART_PARQUET_CACHE_MAX:
-        chart_parquet_cache.popitem(last=False)
+    df_bytes = _chart_dataframe_bytes(df)
+    # A single oversized range is returned to the current chart but is not
+    # retained, preventing one long history window from exhausting RAM.
+    if df_bytes <= CHART_PARQUET_CACHE_MAX_BYTES:
+        chart_parquet_cache[cache_key] = df
+        chart_parquet_cache_bytes += df_bytes
+        chart_parquet_cache.move_to_end(cache_key)
+        while (len(chart_parquet_cache) > CHART_PARQUET_CACHE_MAX or
+               chart_parquet_cache_bytes > CHART_PARQUET_CACHE_MAX_BYTES):
+            _, evicted_df = chart_parquet_cache.popitem(last=False)
+            chart_parquet_cache_bytes -= _chart_dataframe_bytes(evicted_df)
     return df
+
+def prefetch_chart_source(task):
+    """Warm one neighbouring task's source data without blocking the UI."""
+    if not task or not getattr(task, "signal_time", None):
+        return
+    try:
+        fp = os.path.join(symbol_timeframe_path(task.symbols[0], task.timeframe), "data.parquet")
+        if not os.path.exists(fp):
+            return
+        start_ms = task_pre_signal_start_ms(task)
+        end_ms = (int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                  if task.end_date else get_chart_file_end_timestamp(fp))
+        if end_ms is not None:
+            read_chart_parquet_cached(fp, start_ms, end_ms)
+    except Exception:
+        # Prefetch is optional; it must never affect foreground navigation.
+        return
+
+def prefetch_chart_source_async(task):
+    """Start at most one background warm-up for each task id."""
+    if not CHART_PREFETCH_ENABLED:
+        return
+    task_id = str(getattr(task, "task_id", ""))
+    if not task_id:
+        return
+    with chart_prefetch_lock:
+        if task_id in chart_prefetch_pending:
+            return
+        chart_prefetch_pending.add(task_id)
+
+    def _warm():
+        try:
+            # ``set_chart_task_id`` launches this at the same time Dash starts
+            # the current chart callback. Without a short delay two parquet
+            # reads can contend for a slow SSD and make *both* charts slower.
+            if CHART_PREFETCH_DELAY_SECONDS:
+                time.sleep(CHART_PREFETCH_DELAY_SECONDS)
+            prefetch_chart_source(task)
+        finally:
+            with chart_prefetch_lock:
+                chart_prefetch_pending.discard(task_id)
+
+    threading.Thread(target=_warm, name="ChartPrefetch", daemon=True).start()
 
 STRATEGY_SETTINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_settings")
 OSCILLATOR_SETTINGS_IDS = [
@@ -884,7 +1000,7 @@ stats_cache_version = -1         # Version of data these stats belong to
 
 def reset_display_caches(reason=""):
     """Clear UI-only rendered page, summary, and diagnostic source caches."""
-    global _cached_golden_version, cached_signal_stats_html, cached_toward_strategy_stats_html, cached_small_stats_data, stats_cache_version
+    global _cached_golden_version, cached_signal_stats_html, cached_toward_strategy_stats_html, cached_small_stats_data, stats_cache_version, oscillator_reversal_source_cache_bytes
     if "_page_html_cache" in globals():
         _page_html_cache.clear()
     _cached_golden_version = None
@@ -894,6 +1010,7 @@ def reset_display_caches(reason=""):
     stats_cache_version = -1
     if "oscillator_reversal_source_cache" in globals():
         oscillator_reversal_source_cache.clear()
+        oscillator_reversal_source_cache_bytes = 0
     if reason:
         print(f"🔄 [GOLDEN] Display caches reset: {reason}")
 
@@ -2969,6 +3086,19 @@ optimizer_mgr = OptimizerManager()
 # ---------- Dash App ----------
 app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_callbacks='initial_duplicate')
 
+# Dash 4 can intermittently fail to resolve dynamically generated inline
+# clientside callback functions after a hot reload ("undefined.apply" in the
+# renderer). Keep the chart's clientside behavior enabled by default because
+# Osc All, crosshair synchronization, and view retention depend on it. A
+# deployment affected by that Dash runtime bug can explicitly set
+# GPT_ENABLE_INLINE_DASH_CALLBACKS=0 as a safe fallback.
+INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED = os.environ.get("GPT_ENABLE_INLINE_DASH_CALLBACKS", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+def register_browser_callback(*args, **kwargs):
+    if INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED:
+        return dash_clientside_callback(*args, **kwargs)
+    return None
+
 # ----- Flask route for task actions (stop/pause/save) – unchanged -----
 @app.server.route('/task-action', methods=['POST'])
 def task_action():
@@ -3123,9 +3253,7 @@ function pushDashStore(storeId, payload, fallbackEventName) {
         window.dash_clientside.set_props(storeId, {data: eventPayload});
         return;
     }
-
-    const event = new CustomEvent(fallbackEventName, {detail: eventPayload});
-    document.dispatchEvent(event);
+    console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
 }
 const chartToggleStores = {
     'toggle-rsi-btn': ['rsi-visible-store', false],
@@ -3135,18 +3263,60 @@ const chartToggleStores = {
     'toggle-macd-btn': ['macd-visible-store', false],
     'toggle-disparity-btn': ['disparity-visible-store', false],
     'toggle-strategy-btn': ['strategy-visible-store', false],
-    'toggle-chart-info-box-btn': ['chart-info-box-store', true],
+    'toggle-chart-info-box-btn': ['chart-info-box-store', false],
+    'toggle-oscillator-info-box-btn': ['oscillator-info-box-store', true],
+    'toggle-oscillator-sync-info-btn': ['oscillator-sync-info-store', false],
     'toggle-chart-extend-x-btn': ['chart-extend-x-store', false],
+    'toggle-chart-focus-entry-btn': ['chart-focus-entry-store', false],
+    'toggle-measure-oscillator-range-btn': ['measure-oscillator-range-store', false],
     'toggle-measure-anchor-btn': ['measure-anchor-store', false],
     'toggle-measure-hover-btn': ['measure-hover-store', true],
-    'toggle-impulses-btn': ['impulse-visible-store', true],
+    'toggle-impulses-btn': ['impulse-visible-store', false],
     'toggle-events-btn': ['events-visible-store', false],
     'toggle-measure-btn': ['measure-mode-store', false]
 };
 const chartToggleState = {};
+const chartToggleLabels = {
+    'toggle-rsi-btn': 'RSI',
+    'toggle-stochastic-btn': 'Stoch',
+    'toggle-volume-btn': 'Volume',
+    'toggle-adx-btn': 'ADX',
+    'toggle-macd-btn': 'MACD',
+    'toggle-disparity-btn': 'DIX',
+    'toggle-strategy-btn': 'Strategy',
+    'toggle-impulses-btn': 'Impulses',
+    'toggle-events-btn': 'Events'
+};
+const measureExclusiveButtons = new Set([
+    'toggle-rsi-btn', 'toggle-stochastic-btn', 'toggle-volume-btn',
+    'toggle-adx-btn', 'toggle-macd-btn', 'toggle-disparity-btn',
+    'toggle-strategy-btn', 'toggle-impulses-btn', 'toggle-events-btn',
+    'toggle-chart-extend-x-btn', 'toggle-chart-focus-entry-btn',
+    'toggle-chart-event-marks-btn'
+]);
 Object.keys(chartToggleStores).forEach(function(buttonId) {
     chartToggleState[buttonId] = chartToggleStores[buttonId][1];
 });
+function deactivateMeasureForChartAction() {
+    if (!chartToggleState['toggle-measure-btn']) return;
+    chartToggleState['toggle-measure-btn'] = false;
+    if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
+        window.dash_clientside.set_props('measure-mode-store', {data: false});
+    }
+    const measureButton = document.getElementById('toggle-measure-btn');
+    if (measureButton) {
+        measureButton.textContent = '📐 Measure';
+        measureButton.setAttribute('aria-pressed', 'false');
+        measureButton.style.background = 'transparent';
+        measureButton.style.borderWidth = '1px';
+        measureButton.style.fontWeight = 'normal';
+    }
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (plot && window.Plotly) {
+        window.Plotly.relayout(plot, {dragmode: 'pan'});
+    }
+}
 function applyChartToggleImmediately(button) {
     const config = chartToggleStores[button.id];
     if (!config || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') {
@@ -3156,8 +3326,13 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-measure-btn') chartToggleState[button.id] = label.indexOf('Measuring') >= 0;
     if (button.id === 'toggle-measure-anchor-btn') chartToggleState[button.id] = label.indexOf('Snap: On') >= 0;
     if (button.id === 'toggle-measure-hover-btn') chartToggleState[button.id] = label.indexOf('Hover: On') >= 0;
-    if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Info Box: On') >= 0;
+    if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
+    if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
+    if (button.id === 'toggle-oscillator-sync-info-btn') chartToggleState[button.id] = label.indexOf('Osc All: On') >= 0;
     if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
+    if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
+    if (button.id === 'toggle-measure-oscillator-range-btn') chartToggleState[button.id] = label.indexOf('Osc Range: On') >= 0;
+    if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
     window.dash_clientside.set_props(config[0], {data: active});
@@ -3167,11 +3342,199 @@ function applyChartToggleImmediately(button) {
     button.style.background = active ? (warm ? '#fff8e1' : (green ? '#e8f5e9' : '#e3f2fd')) : 'transparent';
     button.style.borderWidth = active ? '2px' : '1px';
     if (button.id === 'toggle-measure-btn') {
-        button.textContent = active ? '📏 Measuring' : 'Measure';
+        button.textContent = active ? '📐 Measuring' : '📐 Measure';
         button.style.fontWeight = active ? 'bold' : 'normal';
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (plot && window.Plotly) {
+            if (window.attachNativeMeasureOverlayListeners) window.attachNativeMeasureOverlayListeners(plot);
+            window.Plotly.relayout(plot, {dragmode: active ? 'drawrect' : 'pan'});
+        }
     }
+    if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
+    if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
+    if (button.id === 'toggle-oscillator-sync-info-btn') button.textContent = active ? 'Osc All: On' : 'Osc All: Off';
+    if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
+    if (button.id === 'toggle-measure-oscillator-range-btn') {
+        button.textContent = active ? 'Osc Range: On' : 'Osc Range: Off';
+        window.__taskChartOscillatorRangeEnabled = active;
+        if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup();
+    }
+    if (chartToggleLabels[button.id]) button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
     return true;
 }
+// Chrome/Plotly compatibility fallback: older Plotly bundles can paint a
+// drawrect shape before Dash publishes relayoutData. Read Plotly's own layout
+// after mouseup and update the already-rendered result element immediately.
+function refreshNativeMeasureResultSoon() {
+    window.clearTimeout(window.__taskChartMeasureRefreshTimer);
+    window.__taskChartMeasureRefreshTimer = window.setTimeout(function() {
+        showNativeMeasureResultAfterMouseup();
+    }, 40);
+}
+
+function measureShapeKey(shape) {
+    if (!shape) return '';
+    return [shape.type || 'rect', shape.xref || 'x', shape.yref || 'y', shape.x0, shape.x1, shape.y0, shape.y1]
+        .map(function(value) { return String(value); }).join('|');
+}
+
+function uniqueMeasureShapes(shapes) {
+    const seen = {};
+    return (shapes || []).filter(function(shape) {
+        if (!shape || (shape.type && shape.type !== 'rect') || shape.x0 == null || shape.x1 == null || shape.y0 == null || shape.y1 == null) return false;
+        const key = measureShapeKey(shape);
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+    });
+}
+
+function selectMeasureShapeAtPointer(plot, event) {
+    if (!plot || !plot.layout || !plot._fullLayout) return;
+    const xaxis = plot._fullLayout.xaxis, yaxis = plot._fullLayout.yaxis;
+    const svg = plot.querySelector('.main-svg');
+    if (!xaxis || !yaxis || !svg || !xaxis.d2l || !yaxis.d2l || !xaxis.l2p || !yaxis.l2p) return;
+    const base = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+    const shapes = plot.layout.shapes || [];
+    const svgRect = svg.getBoundingClientRect();
+    let selected = '';
+    let bestScore = Infinity;
+    shapes.slice(base).forEach(function(shape) {
+        if (!shape || (shape.type && shape.type !== 'rect')) return;
+        const x0 = svgRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(shape.x0));
+        const x1 = svgRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(shape.x1));
+        const y0 = svgRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(shape.y0));
+        const y1 = svgRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(shape.y1));
+        if (![x0, x1, y0, y1].every(Number.isFinite)) return;
+        const left = Math.min(x0, x1), right = Math.max(x0, x1), top = Math.min(y0, y1), bottom = Math.max(y0, y1);
+        const tolerance = 8;
+        if (event.clientX < left - tolerance || event.clientX > right + tolerance || event.clientY < top - tolerance || event.clientY > bottom + tolerance) return;
+        const edgeScore = Math.min(Math.abs(event.clientX - left), Math.abs(event.clientX - right), Math.abs(event.clientY - top), Math.abs(event.clientY - bottom));
+        if (edgeScore < bestScore) {
+            bestScore = edgeScore;
+            selected = measureShapeKey(shape);
+        }
+    });
+    plot.__dashSelectedMeasureShapeKey = selected;
+}
+
+function attachNativeMeasureOverlayListeners(plot) {
+    if (!plot || plot.__dashMeasureOverlayListenersAttached) return;
+    plot.__dashMeasureOverlayListenersAttached = true;
+    // Plotly shapes are data-anchored and move correctly by themselves. The
+    // HTML labels are pixel-anchored, so redraw them after every zoom, pan,
+    // and Extend X relayout to keep each label and pointer on its rectangle.
+    if (typeof plot.on === 'function') {
+        plot.on('plotly_relayout', refreshNativeMeasureResultSoon);
+    }
+    // Plotly does not expose a portable selected-shape API across the older
+    // bundles we support. Record the clicked user rectangle ourselves so Delete
+    // removes that exact box rather than an unrelated newest box.
+    plot.addEventListener('mousedown', function(event) { selectMeasureShapeAtPointer(plot, event); }, true);
+    if (typeof window.ResizeObserver === 'function') {
+        plot.__dashMeasureResizeObserver = new window.ResizeObserver(refreshNativeMeasureResultSoon);
+        plot.__dashMeasureResizeObserver.observe(plot);
+    } else {
+        window.addEventListener('resize', refreshNativeMeasureResultSoon);
+    }
+}
+
+function showNativeMeasureResultAfterMouseup() {
+    window.setTimeout(function() {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (!plot || !plot.layout) return;
+        attachNativeMeasureOverlayListeners(plot);
+        const shapes = (plot.layout && plot.layout.shapes) || (plot._fullLayout && plot._fullLayout.shapes) || [];
+        const baseCount = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+        // Preserve only user rectangles across indicator figure rebuilds.
+        const userShapes = uniqueMeasureShapes(shapes.slice(baseCount));
+        window.__taskChartMeasureShapes = userShapes.map(function(item) { return Object.assign({}, item); });
+        const shape = userShapes[userShapes.length - 1];
+        if (!shape) {
+            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+            return;
+        }
+        const y0 = Number(shape.y0), y1 = Number(shape.y1);
+        if (!Number.isFinite(y0) || !Number.isFinite(y1)) return;
+        const delta = y1 - y0, pct = y0 ? delta / y0 * 100 : 0;
+        const start = Date.parse(shape.x0), end = Date.parse(shape.x1);
+        let timeText = 'time n/a';
+        if (Number.isFinite(start) && Number.isFinite(end)) {
+            const seconds = Math.abs(end - start) / 1000;
+            timeText = seconds < 60 ? Math.round(seconds) + 's' : (seconds < 3600 ? (seconds / 60).toFixed(1) + 'm' : (seconds < 86400 ? (seconds / 3600).toFixed(2) + 'h' : (seconds / 86400).toFixed(2) + 'd'));
+        }
+        const result = document.getElementById('measure-result');
+        const text = '📦 Box ' + (delta >= 0 ? 'Up' : 'Down') + ': Δ Price ' + (delta >= 0 ? '+' : '') + delta.toPrecision(6) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%) | Δ Time: ' + timeText;
+        if (result) result.textContent = text;
+        // Attach the label to the chart container, not the browser viewport,
+        // so it scrolls and moves with the measured rectangle.
+        const xaxis = plot._fullLayout && plot._fullLayout.xaxis, yaxis = plot._fullLayout && plot._fullLayout.yaxis;
+        const svg = plot.querySelector('.main-svg');
+        if (xaxis && yaxis && svg && xaxis.d2l && yaxis.d2l && xaxis.l2p && yaxis.l2p) {
+            const svgRect = svg.getBoundingClientRect();
+            const rootRect = root.getBoundingClientRect();
+            root.style.position = 'relative';
+            const baseCount = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+            const activeIds = {};
+            shapes.forEach(function(measureShape, index) {
+                if (index < baseCount || !measureShape || (measureShape.type && measureShape.type !== 'rect')) return;
+                const my0 = Number(measureShape.y0), my1 = Number(measureShape.y1);
+                if (!Number.isFinite(my0) || !Number.isFinite(my1)) return;
+                const md = my1 - my0, mp = my0 ? md / my0 * 100 : 0;
+                const ms = Date.parse(measureShape.x0), me = Date.parse(measureShape.x1);
+                const mt = Number.isFinite(ms) && Number.isFinite(me) ? (Math.abs(me - ms) / 1000 < 60 ? Math.round(Math.abs(me - ms) / 1000) + 's' : (Math.abs(me - ms) / 60000).toFixed(1) + 'm') : 'time n/a';
+                const labelId = 'task-chart-measure-label-' + index, pointerId = 'task-chart-measure-pointer-' + index;
+                activeIds[labelId] = true; activeIds[pointerId] = true;
+                const pointX = svgRect.left - rootRect.left + xaxis._offset + xaxis.l2p(xaxis.d2l(measureShape.x1));
+                const pointY = svgRect.top - rootRect.top + yaxis._offset + yaxis.l2p(yaxis.d2l(measureShape.y1));
+                const label = document.getElementById(labelId) || root.appendChild(document.createElement('div'));
+                label.id = labelId; label.textContent = (md >= 0 ? '▲ ' : '▼ ') + (mp >= 0 ? '+' : '') + mp.toFixed(2) + '% | ' + mt;
+                label.style.cssText = 'position:absolute;z-index:10051;pointer-events:none;background:rgba(25,118,210,.92);color:#fff;padding:3px 6px;border-radius:3px;font:11px sans-serif;white-space:nowrap;';
+                label.style.left = (pointX + 18) + 'px'; label.style.top = (pointY - 30) + 'px';
+                const pointer = document.getElementById(pointerId) || root.appendChild(document.createElement('div'));
+                pointer.id = pointerId; const dx = 18, dy = -16, length = Math.sqrt(dx * dx + dy * dy);
+                pointer.style.cssText = 'position:absolute;z-index:10050;pointer-events:none;height:1px;background:#1976d2;transform-origin:0 0;';
+                pointer.style.left = pointX + 'px'; pointer.style.top = pointY + 'px'; pointer.style.width = length + 'px'; pointer.style.transform = 'rotate(' + Math.atan2(dy, dx) + 'rad)';
+            });
+            root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"]').forEach(function(node) { if (!activeIds[node.id]) node.remove(); });
+
+            // A DOM overlay (rather than a Plotly shape) keeps oscillator range
+            // highlighting separate from user measure rectangles. It therefore
+            // cannot be deleted by Clear/Backspace or mistaken for a measure.
+            const activeRangeIds = {};
+            if (window.__taskChartOscillatorRangeEnabled) {
+                const oscillatorAxes = Object.keys(plot._fullLayout || {}).map(function(key) {
+                    return plot._fullLayout[key];
+                }).filter(function(axis) {
+                    return axis && axis._id && axis._id !== 'y' && /^y[0-9]+$/.test(axis._id) && axis.visible !== false && axis._length > 0;
+                });
+                shapes.forEach(function(measureShape, measureIndex) {
+                    if (measureIndex < baseCount || !measureShape || (measureShape.type && measureShape.type !== 'rect')) return;
+                    const leftValue = xaxis.l2p(xaxis.d2l(measureShape.x0));
+                    const rightValue = xaxis.l2p(xaxis.d2l(measureShape.x1));
+                    if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) return;
+                    const left = svgRect.left - rootRect.left + xaxis._offset + Math.min(leftValue, rightValue);
+                    const width = Math.abs(rightValue - leftValue);
+                    oscillatorAxes.forEach(function(axis) {
+                        const rangeId = 'task-chart-measure-osc-range-' + measureIndex + '-' + axis._id;
+                        activeRangeIds[rangeId] = true;
+                        const range = document.getElementById(rangeId) || root.appendChild(document.createElement('div'));
+                        range.id = rangeId;
+                        range.style.cssText = 'position:absolute;z-index:10020;pointer-events:none;background:rgba(158,158,158,.20);border-left:1px solid rgba(117,117,117,.60);border-right:1px solid rgba(117,117,117,.60);';
+                        range.style.left = left + 'px';
+                        range.style.top = (svgRect.top - rootRect.top + axis._offset) + 'px';
+                        range.style.width = Math.max(1, width) + 'px';
+                        range.style.height = axis._length + 'px';
+                    });
+                });
+            }
+            root.querySelectorAll('[id^="task-chart-measure-osc-range-"]').forEach(function(node) { if (!activeRangeIds[node.id]) node.remove(); });
+        }
+    }, 80);
+}
+document.addEventListener('mouseup', showNativeMeasureResultAfterMouseup, true);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
     let target = e.target;
@@ -3186,10 +3549,32 @@ document.addEventListener('click', function(e) {
     
     if (!button) return;
 
+    // Indicator, overlay and range controls replace/reposition the figure.
+    // They therefore leave drawing mode before their own action runs, so the
+    // Measure appearance always agrees with the active chart interaction.
+    if (measureExclusiveButtons.has(button.id)) deactivateMeasureForChartAction();
+
     // These are pure UI Store toggles. Updating through set_props avoids a
     // registered clientside callback lookup, which older Dash renderers can
     // fail with "undefined (reading apply)" after hot reloads/cache changes.
     if (applyChartToggleImmediately(button)) return;
+
+    if (button.id === 'clear-measure-btn') {
+        const chartRoot = document.getElementById('task-chart');
+        const plot = chartRoot ? (chartRoot.querySelector('.js-plotly-plot') || chartRoot) : null;
+        // Clear native drawrect shapes locally.  The server callback below only
+        // clears the small result Stores, so this cannot reload or reposition
+        // the candle chart.
+        if (plot && window.Plotly) {
+            const keep = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+            window.Plotly.relayout(plot, {shapes: (plot.layout.shapes || []).slice(0, keep)});
+            window.__taskChartMeasureShapes = [];
+        }
+        if (chartRoot) {
+            chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+        }
+        return;
+    }
 
     if (button.id === 'close-chart-modal') {
         applyChartRowHighlight(null);
@@ -3273,6 +3658,34 @@ document.addEventListener('click', function(e) {
             console.error('Button click handler error:', e, 'Target:', button);
         }
 });
+// Backspace removes the newest user-drawn rectangle while preserving figure
+// shapes (notably the yellow Signal Level). Do not intercept text editing.
+document.addEventListener('keydown', function(e) {
+    const target = e.target;
+    const editingText = target && typeof target.matches === 'function' && target.matches('input, textarea, [contenteditable="true"]');
+    if ((e.key !== 'Backspace' && e.key !== 'Delete') || editingText) return;
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    const shapes = plot && plot.layout ? (plot.layout.shapes || []) : [];
+    const base = Math.max(0, Number(plot && plot.__dashBaseShapeCount || 0));
+    if (!plot || !window.Plotly || shapes.length <= base) return;
+    let removeIndex = shapes.length - 1;
+    if (e.key === 'Delete' && plot.__dashSelectedMeasureShapeKey) {
+        const selectedOffset = shapes.slice(base).findIndex(function(shape) {
+            return measureShapeKey(shape) === plot.__dashSelectedMeasureShapeKey;
+        });
+        if (selectedOffset < 0) return;
+        removeIndex = base + selectedOffset;
+    }
+    e.preventDefault();
+    const remainingShapes = shapes.slice(0, removeIndex).concat(shapes.slice(removeIndex + 1));
+    window.Plotly.relayout(plot, {shapes: remainingShapes});
+    window.__taskChartMeasureShapes = uniqueMeasureShapes(remainingShapes.slice(base)).map(function(item) { return Object.assign({}, item); });
+    plot.__dashSelectedMeasureShapeKey = '';
+    if (remainingShapes.length <= base) {
+        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+    }
+}, true);
 // Toggle column highlight on header click
 // Toggle row highlight on ANY cell click (not a button, not a header, not an interactive-button DIV)
 // CRITICAL FIX: Must check if click originated from inside a table cell, not just any element
@@ -3446,7 +3859,7 @@ def build_root_layout():
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
-    dcc.Store(id="chart-event-context-store", data={"events": [], "index": 0, "overlay": False}),
+    dcc.Store(id="chart-event-context-store", data={"source": "main_table", "events": [], "index": 0, "overlay": False}),
     dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
     dcc.Store(id="chart-dragmode-enforcer-store", data=None),  # keeps Measure draw-rectangle mode synced with Plotly modebar
     dcc.Store(id="chart-crosshair-listener-store", data=None),  # installs browser-side full-height chart crosshair overlay
@@ -3462,15 +3875,19 @@ def build_root_layout():
     dcc.Store(id="measure-mode-store", data=False),
     dcc.Store(id="measure-anchor-store", data=False),
     dcc.Store(id="measure-hover-store", data=True),
-    dcc.Store(id="chart-info-box-store", data=True),
+    dcc.Store(id="measure-oscillator-range-store", data=False),
+    dcc.Store(id="chart-info-box-store", data=False),
+    dcc.Store(id="oscillator-info-box-store", data=True),
+    dcc.Store(id="oscillator-sync-info-store", data=False),
     dcc.Store(id="chart-extend-x-store", data=False),
+    dcc.Store(id="chart-focus-entry-store", data=False),
     dcc.Store(id="measure-points-store", data={"first": None, "second": None}),
     dcc.Store(id="measure-result-store", data=None),
     # ---- Strategy details modal stores ----
     dcc.Store(id="strategy-details-task-id", data=None),
     dcc.Store(id="details-click-store", data={}),   # deduplication for details button
     # --------------------------------
-    dcc.Store(id="impulse-visible-store", data=True),
+    dcc.Store(id="impulse-visible-store", data=False),
     dcc.Store(id="events-visible-store", data=False),
     dcc.Store(id="impulse-params-store", data={}),
     # 🔧 CRITICAL: Hidden dummy buttons for CustomEvent-triggered callbacks (using html.Button which supports n_clicks)
@@ -3596,7 +4013,7 @@ def build_root_layout():
                                 "minWidth": "34px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle RSI", id="toggle-rsi-btn", style={
+                            html.Button("RSI: Off", id="toggle-rsi-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3606,7 +4023,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Stoch", id="toggle-stochastic-btn", style={
+                            html.Button("Stoch: Off", id="toggle-stochastic-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3616,7 +4033,7 @@ def build_root_layout():
                                 "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Volume", id="toggle-volume-btn", style={
+                            html.Button("Volume: Off", id="toggle-volume-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3626,7 +4043,7 @@ def build_root_layout():
                                 "minWidth": "86px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle ADX", id="toggle-adx-btn", style={
+                            html.Button("ADX: Off", id="toggle-adx-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3636,7 +4053,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle MACD", id="toggle-macd-btn", style={
+                            html.Button("MACD: Off", id="toggle-macd-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3646,7 +4063,7 @@ def build_root_layout():
                                 "minWidth": "88px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle DIX", id="toggle-disparity-btn", title="Toggle CMOa Disparity Index (EMA 50/25/9)", style={
+                            html.Button("DIX: Off", id="toggle-disparity-btn", title="Toggle CMOa Disparity Index (EMA 50/25/9)", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3656,7 +4073,7 @@ def build_root_layout():
                                 "minWidth": "84px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Strategy", id="toggle-strategy-btn", style={
+                            html.Button("Strategy: Off", id="toggle-strategy-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3666,7 +4083,7 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Measure", id="toggle-measure-btn", style={
+                            html.Button("📐 Measure", id="toggle-measure-btn", title="Measure price and time by drawing a rectangle", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3674,6 +4091,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "76px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Osc Range: Off", id="toggle-measure-oscillator-range-btn", title="Shade every visible oscillator over each measured time range", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "104px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Snap: Off", id="toggle-measure-anchor-btn", title="Toggle measurement anchoring to close-price helper points", style={
@@ -3696,8 +4123,8 @@ def build_root_layout():
                                 "minWidth": "78px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Info Box: On", id="toggle-chart-info-box-btn", title="Toggle the candle hover information box while keeping the vertical crosshair line", style={
-                                "background": "#fff8e1",
+                            html.Button("Candle Info: Off", id="toggle-chart-info-box-btn", title="Toggle exact OHLC information for the main candle chart", style={
+                                "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid #f9a825",
                                 "padding": "6px 10px",
@@ -3705,6 +4132,14 @@ def build_root_layout():
                                 "fontSize": "12px",
                                 "minWidth": "94px",
                                 "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Osc Info: On", id="toggle-oscillator-info-box-btn", title="Toggle exact hover values in every visible oscillator pane", style={
+                                "background": "#fff8e1", "color": "black", "border": "1px solid #f9a825",
+                                "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Osc All: Off", id="toggle-oscillator-sync-info-btn", title="Show synchronized values for every visible oscillator at the hovered time; never show main-chart values", style={
+                                "background": "transparent", "color": "black", "border": "1px solid #999",
+                                "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap"
                             }),
                             html.Button("Extend X: Off", id="toggle-chart-extend-x-btn", title="Add TradingView-style empty space to the right side of the chart", style={
                                 "background": "transparent",
@@ -3714,6 +4149,16 @@ def build_root_layout():
                                 "cursor": "pointer",
                                 "fontSize": "12px",
                                 "minWidth": "94px",
+                                "whiteSpace": "nowrap"
+                            }),
+                            html.Button("Focus Entry: Off", id="toggle-chart-focus-entry-btn", title="Center each newly opened chart on its signal entry with a practical zoom", style={
+                                "background": "transparent",
+                                "color": "black",
+                                "border": "1px solid #999",
+                                "padding": "6px 10px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "minWidth": "104px",
                                 "whiteSpace": "nowrap"
                             }),
                             html.Button("Clear Measure", id="clear-measure-btn", style={
@@ -3726,7 +4171,7 @@ def build_root_layout():
                                 "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Impulses", id="toggle-impulses-btn", style={
+                            html.Button("Impulses: Off", id="toggle-impulses-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -3746,7 +4191,7 @@ def build_root_layout():
                                 "minWidth": "108px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Toggle Events", id="toggle-events-btn", style={
+                            html.Button("Events: Off", id="toggle-events-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -5002,99 +5447,12 @@ def remove_task(_, stored_ids):
 # Note: The JavaScript event listener at line 2578 handles DIV button clicks globally
 # No need for a separate clientside_callback for remove-task buttons
 
-# 🔧 CRITICAL: Clientside callback to handle DIV button clicks and trigger server-side callbacks
-# This converts DIV clicks into store updates that server callbacks can listen to
-clientside_callback(
-    """
-function(clickData) {
-    // This is a dummy callback to enable DIV click handling via the existing JS event listener
-    // The actual work is done by the JavaScript event listener at line 2578
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("div-click-dummy-store", "data"),
-    Input("div-click-trigger-store", "data"),
-    prevent_initial_call=False
-)
+# Dash 4's ``set_props`` is used directly by the global click handler above.
+# Do not retain legacy dummy clientside callbacks here: an inline callback that
+# is not present after a hot reload is exactly what produces renderer-side
+# ``undefined.apply`` errors in older Dash/Chrome combinations.
 
-# 🔧 CRITICAL: Clientside callback to capture CustomEvent 'dash-chart-trigger' and update chart-button-trigger store
-# This is the missing link that allows the chart button to work!
-clientside_callback(
-    """
-function(n) {
-    // This callback is triggered by the custom event via the window event listener below
-    // The event detail is passed through the global window.dashChartEventData
-    if (window.dashChartEventData) {
-        return window.dashChartEventData;
-    }
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("chart-button-trigger", "data"),
-    Input("chart-event-dummy", "n_clicks"),  # Dummy button that gets incremented by event listener
-    prevent_initial_call=True
-)
-
-# 🔧 CRITICAL: Global event listeners for CustomEvents - these capture event details and update dummy counters
-app.index_string = app.index_string.replace(
-    '{%renderer%}',
-    '''{%renderer%}
-<script>
-// Global event listeners for CustomEvents dispatched by button clicks
-document.addEventListener('dash-chart-trigger', function(e) {
-    window.dashChartEventData = e.detail;
-    // Trigger a click on the hidden button to activate the clientside callback
-    const dummyBtn = document.getElementById('chart-event-dummy');
-    if (dummyBtn) dummyBtn.click();
-});
-document.addEventListener('dash-details-trigger', function(e) {
-    window.dashDetailsEventData = e.detail;
-    const dummyBtn = document.getElementById('details-event-dummy');
-    if (dummyBtn) dummyBtn.click();
-});
-document.addEventListener('dash-impulse-trigger', function(e) {
-    window.dashImpulseEventData = e.detail;
-    const dummyBtn = document.getElementById('impulse-event-dummy');
-    if (dummyBtn) dummyBtn.click();
-});
-</script>'''
-)
-
-# 🔧 CRITICAL: Clientside callback to capture CustomEvent 'dash-details-trigger' and update strategy-details-trigger store
-# This enables the Details button to work
-clientside_callback(
-    """
-function(n) {
-    // This callback is triggered by the custom event via the window event listener
-    // The event detail is passed through the global window.dashDetailsEventData
-    if (window.dashDetailsEventData) {
-        return window.dashDetailsEventData;
-    }
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("strategy-details-trigger", "data"),
-    Input("details-event-dummy", "n_clicks"),  # Dummy button that gets incremented by event listener
-    prevent_initial_call=True
-)
-
-# 🔧 CRITICAL: Clientside callback to capture CustomEvent 'dash-impulse-trigger' and update impulse-button-trigger store
-# This enables the Impulse button to work
-clientside_callback(
-    """
-function(n) {
-    // This callback is triggered by the custom event via the window event listener
-    // The event detail is passed through the global window.dashImpulseEventData
-    if (window.dashImpulseEventData) {
-        return window.dashImpulseEventData;
-    }
-    return window.dash_clientside.no_update;
-}
-""",
-    Output("impulse-button-trigger", "data"),
-    Input("impulse-event-dummy", "n_clicks"),  # Dummy button that gets incremented by event listener
-    prevent_initial_call=True
-)
+# Details and Impulse use the same direct ``set_props`` path as Chart.
 
 @app.callback(
     Output({"type": "log", "index": ALL}, "value"),
@@ -6613,6 +6971,23 @@ def get_chartable_tasks_for_navigation():
     chartable = [t for t in tasks if getattr(t, 'status', None) == "completed"]
     return tasks, chartable
 
+def prefetch_chart_neighbors(task_id):
+    """Warm immediate previous/next chart sources after a chart opens."""
+    if not task_id or not CHART_PREFETCH_ENABLED:
+        return
+    _, chartable = get_chartable_tasks_for_navigation()
+    ids = [str(t.task_id) for t in chartable]
+    try:
+        index = ids.index(str(task_id))
+    except ValueError:
+        return
+    # A single adjacent source gives the best old-SSD tradeoff. Prefer Next,
+    # because it is the common navigation direction.
+    if index + 1 < len(chartable):
+        prefetch_chart_source_async(chartable[index + 1])
+    elif index > 0:
+        prefetch_chart_source_async(chartable[index - 1])
+
 def page_for_task(task_id, tasks):
     for idx, task in enumerate(tasks):
         if str(getattr(task, 'task_id', '')) == str(task_id):
@@ -6688,6 +7063,9 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
         # rows.  Do not force the task table to jump pages here; that expensive
         # table rebuild made left/right chart navigation feel very slow.
         updated_context = dict(event_context, index=next_idx)
+        warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
+        if 0 <= warm_idx < len(events):
+            prefetch_chart_source_async(tm.get_task(str(events[warm_idx].get("task_id") or "")))
         return target_id, no_update, {f"{target_id}_chart": time.time()}, updated_context, carry_chart_view_state_to_task(chart_view_state, target_id)
 
     _, chartable = get_chartable_tasks_for_navigation()
@@ -6704,9 +7082,12 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
     # Keep chart navigation independent from the main task table.  Jumping the
     # table page here triggers an expensive table rebuild and makes the chart's
     # left/right buttons feel delayed on large task sets.
+    warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
+    if 0 <= warm_idx < len(chartable):
+        prefetch_chart_source_async(chartable[warm_idx])
     return target_id, no_update, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
-clientside_callback(
+register_browser_callback(
     """
 function(taskId, page) {
     function apply() {
@@ -6760,7 +7141,8 @@ def set_chart_task_id(trigger_data, click_store):
     if current_time - float(click_store.get(key, 0) or 0) < 0.5:
         return no_update, no_update, no_update
     click_store[key] = current_time
-    return str(task_id), click_store, {"events": [], "index": 0, "overlay": False}
+    prefetch_chart_neighbors(str(task_id))
+    return str(task_id), click_store, {"source": "main_table", "events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
 @app.callback(
@@ -6780,7 +7162,7 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
-    Output("chart-button-trigger", "data", allow_duplicate=True),
+    Output("chart-button-trigger", "data"),
     Output("chart-click-store", "data", allow_duplicate=True),
     Output("chart-event-context-store", "data", allow_duplicate=True),
     Input("close-chart-modal", "n_clicks"),
@@ -6788,7 +7170,7 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 )
 def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
-    return None, None, {}, {"events": [], "index": 0, "overlay": False}
+    return None, None, {}, {"source": "main_table", "events": [], "index": 0, "overlay": False}
 
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
@@ -6826,7 +7208,7 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     task_id = str(events[event_index].get("task_id") or "")
     if not task_id:
         return no_update, no_update, no_update, no_update, no_update
-    context = {"category": category, "events": events, "index": event_index, "overlay": True}
+    context = {"source": "dynamic_oscillator_summary", "category": category, "events": events, "index": event_index, "overlay": True}
     return task_id, {f"{task_id}_chart": time.time()}, context, True, True
 
 @app.callback(
@@ -6898,7 +7280,7 @@ def update_measure_button(active):
         "whiteSpace": "nowrap",
         "fontWeight": "bold" if active else "normal"
     }
-    return ("📏 Measuring" if active else "Measure"), base_style
+    return ("📐 Measuring" if active else "📐 Measure"), base_style
 
 @app.callback(
     Output("toggle-measure-anchor-btn", "children"),
@@ -6940,6 +7322,27 @@ def update_measure_hover_button(hover_enabled):
     }
     return ("Hover: On" if hover_enabled else "Hover: Off"), base_style
 
+
+@app.callback(
+    Output("toggle-measure-oscillator-range-btn", "children"),
+    Output("toggle-measure-oscillator-range-btn", "style"),
+    Input("measure-oscillator-range-store", "data"),
+    prevent_initial_call=False,
+)
+def update_measure_oscillator_range_button(enabled):
+    style = {
+        "background": "#eceff1" if enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #78909c" if enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "104px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if enabled else "normal",
+    }
+    return ("Osc Range: On" if enabled else "Osc Range: Off"), style
+
 @app.callback(
     Output("toggle-chart-info-box-btn", "children"),
     Output("toggle-chart-info-box-btn", "style"),
@@ -6958,7 +7361,86 @@ def update_chart_info_box_button(info_enabled):
         "whiteSpace": "nowrap",
         "fontWeight": "bold" if info_enabled else "normal"
     }
-    return ("Info Box: On" if info_enabled else "Info Box: Off"), base_style
+    return ("Candle Info: On" if info_enabled else "Candle Info: Off"), base_style
+
+@app.callback(
+    Output("toggle-oscillator-info-box-btn", "children"),
+    Output("toggle-oscillator-info-box-btn", "style"),
+    Input("oscillator-info-box-store", "data"),
+    prevent_initial_call=False
+)
+def update_oscillator_info_box_button(info_enabled):
+    style = {"background": "#fff8e1" if info_enabled else "transparent", "color": "black",
+             "border": "2px solid #f9a825" if info_enabled else "1px solid #999", "padding": "6px 10px",
+             "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap",
+             "fontWeight": "bold" if info_enabled else "normal"}
+    return ("Osc Info: On" if info_enabled else "Osc Info: Off"), style
+
+
+@app.callback(
+    Output("toggle-oscillator-sync-info-btn", "children"),
+    Output("toggle-oscillator-sync-info-btn", "style"),
+    Input("oscillator-sync-info-store", "data"),
+    prevent_initial_call=False,
+)
+def update_oscillator_sync_info_button(sync_enabled):
+    style = {"background": "#e3f2fd" if sync_enabled else "transparent", "color": "black",
+             "border": "2px solid #1976d2" if sync_enabled else "1px solid #999", "padding": "6px 10px",
+             "cursor": "pointer", "fontSize": "12px", "minWidth": "94px", "whiteSpace": "nowrap",
+             "fontWeight": "bold" if sync_enabled else "normal"}
+    return ("Osc All: On" if sync_enabled else "Osc All: Off"), style
+
+
+def _chart_toggle_button(label, enabled):
+    """Return one consistent, stateful appearance for chart-pane controls."""
+    enabled = bool(enabled)
+    style = {
+        "background": "#e3f2fd" if enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "76px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if enabled else "normal",
+    }
+    return f"{label}: {'On' if enabled else 'Off'}", style
+
+
+@app.callback(
+    Output("toggle-rsi-btn", "children"), Output("toggle-rsi-btn", "style"),
+    Output("toggle-stochastic-btn", "children"), Output("toggle-stochastic-btn", "style"),
+    Output("toggle-volume-btn", "children"), Output("toggle-volume-btn", "style"),
+    Output("toggle-adx-btn", "children"), Output("toggle-adx-btn", "style"),
+    Output("toggle-macd-btn", "children"), Output("toggle-macd-btn", "style"),
+    Output("toggle-disparity-btn", "children"), Output("toggle-disparity-btn", "style"),
+    Output("toggle-strategy-btn", "children"), Output("toggle-strategy-btn", "style"),
+    Output("toggle-impulses-btn", "children"), Output("toggle-impulses-btn", "style"),
+    Output("toggle-events-btn", "children"), Output("toggle-events-btn", "style"),
+    Input("rsi-visible-store", "data"),
+    Input("stochastic-visible-store", "data"),
+    Input("volume-visible-store", "data"),
+    Input("adx-visible-store", "data"),
+    Input("macd-visible-store", "data"),
+    Input("disparity-visible-store", "data"),
+    Input("strategy-visible-store", "data"),
+    Input("impulse-visible-store", "data"),
+    Input("events-visible-store", "data"),
+    prevent_initial_call=False,
+)
+def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, strategy, impulses, events):
+    return (
+        *_chart_toggle_button("RSI", rsi),
+        *_chart_toggle_button("Stoch", stochastic),
+        *_chart_toggle_button("Volume", volume),
+        *_chart_toggle_button("ADX", adx),
+        *_chart_toggle_button("MACD", macd),
+        *_chart_toggle_button("DIX", disparity),
+        *_chart_toggle_button("Strategy", strategy),
+        *_chart_toggle_button("Impulses", impulses),
+        *_chart_toggle_button("Events", events),
+    )
 
 @app.callback(
     Output("toggle-chart-extend-x-btn", "children"),
@@ -6981,15 +7463,41 @@ def update_chart_extend_x_button(extend_enabled):
     return ("Extend X: On" if extend_enabled else "Extend X: Off"), base_style
 
 
-clientside_callback(
+@app.callback(
+    Output("toggle-chart-focus-entry-btn", "children"),
+    Output("toggle-chart-focus-entry-btn", "style"),
+    Input("chart-focus-entry-store", "data"),
+    prevent_initial_call=False,
+)
+def update_chart_focus_entry_button(focus_enabled):
+    style = {
+        "background": "#e3f2fd" if focus_enabled else "transparent",
+        "color": "black",
+        "border": "2px solid #1976d2" if focus_enabled else "1px solid #999",
+        "padding": "6px 10px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+        "minWidth": "104px",
+        "whiteSpace": "nowrap",
+        "fontWeight": "bold" if focus_enabled else "normal",
+    }
+    return ("Focus Entry: On" if focus_enabled else "Focus Entry: Off"), style
+
+
+register_browser_callback(
     """
-function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTaskId) {
+function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo, oscillatorSyncInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
         return window.dash_clientside.no_update;
     }
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (!plot || !window.Plotly) return window.dash_clientside.no_update;
+    window.__taskChartOscillatorRangeEnabled = Boolean(oscillatorRange);
+    if (window.attachNativeMeasureOverlayListeners) window.attachNativeMeasureOverlayListeners(plot);
+    // Remember shapes supplied by the figure itself. User measurements are
+    // appended after these, so Clear/Backspace cannot delete Signal Level.
+    plot.__dashBaseShapeCount = ((figure.layout && figure.layout.shapes) || []).length;
 
     // Do not deep-clone and return the complete chart. Large candle figures
     // made that old path serialize/reconcile every point for a UI-only toggle.
@@ -6999,7 +7507,8 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
     layoutUpdate.hoversubplots = showHover ? 'axis' : false;
 
     const meta = figure.layout.meta || {};
-    const targetRange = extendX ? meta.extended_xrange : meta.default_xrange;
+    const hasEventFocus = Array.isArray(meta.event_focus_xrange) && meta.event_focus_xrange.length === 2;
+    const targetRange = hasEventFocus ? meta.event_focus_xrange : (focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange));
     Object.keys(figure.layout).forEach(function(key) {
         if (/^xaxis[0-9]*$/.test(key)) {
             layoutUpdate[key + '.showspikes'] = false;
@@ -7008,7 +7517,7 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
             layoutUpdate[key + '.spikethickness'] = 1;
             layoutUpdate[key + '.spikedash'] = 'dash';
             layoutUpdate[key + '.spikesnap'] = 'cursor';
-            if (extendX && targetRange && targetRange.length === 2) {
+            if ((extendX || focusEntry || hasEventFocus) && targetRange && targetRange.length === 2) {
                 layoutUpdate[key + '.range'] = targetRange;
                 layoutUpdate[key + '.autorange'] = false;
             }
@@ -7017,9 +7526,10 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
             layoutUpdate[key + '.showspikes'] = false;
         }
     });
-    if (!extendX && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
+    if (!extendX && !focusEntry && !hasEventFocus && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
         const axes = viewState.axes || {};
         Object.keys(axes).forEach(function(axisName) {
+            if (/^yaxis[0-9]+$/.test(axisName)) return;
             const axisState = axes[axisName] || {};
             if (axisState.range && axisState.range.length === 2) {
                 layoutUpdate[axisName + '.range'] = axisState.range.slice();
@@ -7030,56 +7540,140 @@ function(measureMode, measureHover, infoBox, extendX, figure, viewState, chartTa
         });
     }
     window.Plotly.relayout(plot, layoutUpdate);
+    if (measureMode) {
+        // A server-rendered figure can arrive just after the Store becomes
+        // active. Reassert drawrect after Plotly has reconciled that figure,
+        // without registering a second callback for the same Dash output.
+        function enforceDrawRect() {
+            if (plot.layout && plot.layout.dragmode !== 'drawrect') {
+                window.Plotly.relayout(plot, {dragmode: 'drawrect'});
+            }
+        }
+        window.setTimeout(enforceDrawRect, 0);
+        window.setTimeout(enforceDrawRect, 60);
+        window.setTimeout(enforceDrawRect, 200);
+    }
+    const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
+    if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
+        window.__taskChartMeasureShapes = [];
+        // Measurements belong to one coin/timeframe. Remove the previous
+        // chart's DOM labels and oscillator highlights immediately instead of
+        // waiting for a new rectangle to be drawn on the next/previous chart.
+        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+    }
+    window.__taskChartMeasureTaskId = figureTaskId;
+    const savedMeasureShapes = uniqueMeasureShapes(window.__taskChartMeasureShapes || []);
+    window.__taskChartMeasureShapes = savedMeasureShapes.map(function(shape) { return Object.assign({}, shape); });
+    if (savedMeasureShapes.length) {
+        const baseShapes = (plot.layout.shapes || []).slice(0, plot.__dashBaseShapeCount);
+        window.Plotly.relayout(plot, {shapes: baseShapes.concat(savedMeasureShapes)});
+        window.setTimeout(function() { if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup(); }, 40);
+    }
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
-    (figure.data || []).forEach(function(trace, index) {
+    const expectedTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
+    function applyHoverVisibility(targetPlot) {
+        if (!targetPlot || !window.Plotly) return;
+        const actualTaskId = String(((targetPlot.layout || {}).meta || {}).task_id || '');
+        // A navigation callback can run before React replaces the Plotly DOM.
+        // Never restyle the old coin with settings intended for the new coin.
+        if (expectedTaskId && actualTaskId && expectedTaskId !== actualTaskId) return;
+        (targetPlot.data || []).forEach(function(trace, index) {
         const traceName = trace.name ? String(trace.name) : '';
         const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
         const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
+        const isDynamicStrategyEvent = traceName === 'Dynamic strategy entry' || traceName === 'Dynamic strategy exit';
+        // Dynamic event traces already carry their full, server-built reason
+        // hovertemplate. Do not overwrite it during a zoom/pan/toggle update.
+        if (isDynamicStrategyEvent && showHover && !oscillatorSyncInfo) return;
+        // Main-pane entry/exit markers are candle information, not oscillator
+        // information. Keep the two toggles independent even at an entry x.
+        const isMainPane = !trace.yaxis || trace.yaxis === 'y';
         let hoverinfo = null;
         let hovertemplate = null;
         if (!showHover || isHelper) {
             hoverinfo = 'skip';
         } else if (isSpikeHoverHelper) {
-            hovertemplate = infoBox ? '%{x|%Y-%m-%d %H:%M}<extra></extra>' : '<extra></extra>';
-        } else if (!infoBox) {
+            // The dark gray crosshair already shows time. Suppress this
+            // transparent helper's duplicate white timestamp tooltip.
             hoverinfo = 'skip';
-        } else if (trace.type === 'candlestick') {
-            hovertemplate = candleTemplate;
-        } else if (trace.name && String(trace.name).includes('Volume')) {
-            hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
-        } else if (trace.name && String(trace.name).includes('RSI')) {
-            hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
-        } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
-            const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
-            hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+        } else if (isMainPane && (oscillatorSyncInfo || (!candleInfo && !isDynamicStrategyEvent))) {
+            hoverinfo = 'skip';
+        } else if (!isMainPane && !(oscillatorInfo || oscillatorSyncInfo)) {
+            hoverinfo = 'skip';
+        } else {
+            // Explicitly restore hover after an Osc Info/Osc All toggle. A
+            // trace may previously have been set to skip, and leaving the
+            // property unchanged would keep every synchronized box hidden.
+            hoverinfo = 'all';
+            if (trace.type === 'candlestick') {
+                hovertemplate = candleTemplate;
+            } else if (trace.name && String(trace.name).includes('Volume')) {
+                hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
+            } else if (trace.name && String(trace.name).includes('RSI')) {
+                hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
+            } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
+                const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
+                hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+            }
         }
-        window.Plotly.restyle(plot, {hoverinfo: hoverinfo, hovertemplate: hovertemplate}, [index]);
+            const update = {};
+            if (hoverinfo !== null) update.hoverinfo = hoverinfo;
+            if (hovertemplate !== null) update.hovertemplate = hovertemplate;
+            if (Object.keys(update).length) window.Plotly.restyle(targetPlot, update, [index]);
+        });
+    }
+    applyHoverVisibility(plot);
+    // Figure replacement and Plotly trace creation are asynchronous. Reapply
+    // the hover policy after those phases so Candle Info stays Off when an
+    // oscillator, Focus Entry, or another figure-changing control is used.
+    [0, 60, 200].forEach(function(delay) {
+        window.setTimeout(function() {
+            const currentRoot = document.getElementById('task-chart');
+            const currentPlot = currentRoot ? (currentRoot.querySelector('.js-plotly-plot') || currentRoot) : null;
+            applyHoverVisibility(currentPlot);
+        }, delay);
     });
+    if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup();
     return {ts: Date.now(), measure: Boolean(measureMode), hover: Boolean(showHover)};
 }
 """,
-    Output("chart-dragmode-enforcer-store", "data", allow_duplicate=True),
+    Output("chart-dragmode-enforcer-store", "data"),
     Input("measure-mode-store", "data"),
     Input("measure-hover-store", "data"),
+    Input("measure-oscillator-range-store", "data"),
     Input("chart-info-box-store", "data"),
+    Input("oscillator-info-box-store", "data"),
+    Input("oscillator-sync-info-store", "data"),
     Input("chart-extend-x-store", "data"),
-    State("task-chart", "figure"),
+    Input("chart-focus-entry-store", "data"),
+    # A newly selected chart or a newly opened oscillator replaces the Plotly
+    # figure. Listen to that replacement as well, otherwise its fresh traces
+    # can briefly restore candle hover boxes despite Candle Info being off.
+    Input("task-chart", "figure"),
     State("chart-view-state-store", "data"),
     State("chart-task-id", "data"),
     prevent_initial_call=True
 )
 
 
-clientside_callback(
+register_browser_callback(
     """
-function(figure) {
+function(figure, oscillatorSyncInfo, candleInfo) {
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (!plot) {
         return window.dash_clientside.no_update;
     }
+    plot.__dashOscillatorSyncInfo = Boolean(oscillatorSyncInfo);
+    plot.__dashCandleInfoEnabled = Boolean(candleInfo);
+    function clearOscillatorSyncLabels() {
+        root.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(label) {
+            label.remove();
+        });
+    }
     if (plot.__dashFullPaneCrosshairInstalled) {
+        if (!plot.__dashOscillatorSyncInfo) clearOscillatorSyncLabels();
         return {installed: true, ts: Date.now()};
     }
     plot.__dashFullPaneCrosshairInstalled = true;
@@ -7120,6 +7714,7 @@ function(figure) {
     }
     function hideLine() {
         line.style.display = 'none';
+        clearOscillatorSyncLabels();
         if (window.Plotly && window.Plotly.Fx) {
             try { window.Plotly.Fx.unhover(plot); } catch (e) {}
         }
@@ -7145,6 +7740,56 @@ function(figure) {
             if (ms > targetMs && distance > bestDistance) break;
         }
         return Number.isFinite(bestDistance) ? bestIndex : null;
+    }
+    function formatOscillatorValue(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return null;
+        const magnitude = Math.abs(numeric);
+        if (magnitude !== 0 && (magnitude < 0.01 || magnitude >= 10000)) return numeric.toPrecision(5);
+        return numeric.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4);
+    }
+    function renderOscillatorSyncLabels(pointIndex) {
+        clearOscillatorSyncLabels();
+        if (!plot.__dashOscillatorSyncInfo || !plot._fullLayout || !plot.data) return;
+        const svg = plot.querySelector('.main-svg');
+        if (!svg) return;
+        if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
+        const rootRect = root.getBoundingClientRect();
+        const svgRect = svg.getBoundingClientRect();
+        const valuesByAxis = {};
+        plot.data.forEach(function(trace) {
+            const traceName = trace && trace.name ? String(trace.name) : '';
+            const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
+            if (!trace || axisId === 'y' || !trace.x || !trace.y || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
+            if (traceName.startsWith('_') || traceName === 'Signal Time') return;
+            if (trace.mode === 'markers' && trace.showlegend === false) return;
+            const value = formatOscillatorValue(trace.y[pointIndex]);
+            if (value === null) return;
+            if (!valuesByAxis[axisId]) valuesByAxis[axisId] = [];
+            valuesByAxis[axisId].push((traceName || 'Value') + ': ' + value);
+        });
+        Object.keys(valuesByAxis).forEach(function(axisId) {
+            const axisKey = axisId === 'y' ? 'yaxis' : 'yaxis' + axisId.slice(1);
+            const axis = plot._fullLayout[axisKey];
+            if (!axis || !Number.isFinite(axis._offset)) return;
+            const label = document.createElement('div');
+            label.dataset.taskChartOscillatorSyncLabel = 'true';
+            label.textContent = valuesByAxis[axisId].join('\n');
+            label.style.position = 'absolute';
+            label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px';
+            label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px';
+            label.style.zIndex = '10052';
+            label.style.pointerEvents = 'none';
+            label.style.whiteSpace = 'pre-line';
+            label.style.background = 'rgba(255,255,255,0.92)';
+            label.style.border = '1px solid #90a4ae';
+            label.style.borderRadius = '3px';
+            label.style.color = '#263238';
+            label.style.font = '11px sans-serif';
+            label.style.lineHeight = '1.3';
+            label.style.padding = '2px 5px';
+            root.appendChild(label);
+        });
     }
     function syncedHoverAt(event, rect) {
         if (!window.Plotly || !window.Plotly.Fx || !plot._fullLayout || !plot.data || !plot.data.length) return;
@@ -7172,11 +7817,18 @@ function(figure) {
             if (!trace || !trace.x || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
             if (traceName.startsWith('_') || traceName === 'Signal Time') return;
             if (trace.mode === 'markers' && trace.showlegend === false) return;
+            const isMainPane = !trace.yaxis || trace.yaxis === 'y';
+            if (isMainPane && !plot.__dashCandleInfoEnabled) return;
+            if (plot.__dashOscillatorSyncInfo && isMainPane) return;
             hoverPoints.push({curveNumber: curveNumber, pointNumber: pointIndex});
         });
         if (hoverPoints.length) {
             try { window.Plotly.Fx.hover(plot, hoverPoints); } catch (e) {}
         }
+        // Some older Plotly bundles do not render multi-subplot hover labels
+        // reliably. Keep a small, pane-anchored fallback for Osc All so every
+        // visible oscillator still reports its value at the current time.
+        renderOscillatorSyncLabels(pointIndex);
     }
     function moveLine(event) {
         const rect = getPlotAreaRect();
@@ -7199,42 +7851,35 @@ function(figure) {
 """,
     Output("chart-crosshair-listener-store", "data"),
     Input("task-chart", "figure"),
+    Input("oscillator-sync-info-store", "data"),
+    Input("chart-info-box-store", "data"),
     prevent_initial_call=True,
 )
-
-clientside_callback(
+# Keep the Measure button and Plotly's Pan / draw-rectangle modebar tools in
+# agreement.  This is deliberately client-side so a modebar click never sends
+# the candle figure back to Python or changes the current zoom/pan ranges.
+register_browser_callback(
     """
-function(relayoutData, figure, measureMode) {
-    if (!measureMode) {
+function(relayoutData, currentMeasureMode) {
+    if (!relayoutData || !Object.prototype.hasOwnProperty.call(relayoutData, 'dragmode')) {
         return window.dash_clientside.no_update;
     }
-    if (relayoutData && relayoutData.dragmode === 'drawrect') {
-        return window.dash_clientside.no_update;
+    if (relayoutData.dragmode === 'drawrect') {
+        return currentMeasureMode ? window.dash_clientside.no_update : true;
     }
-    function forceMeasureMode() {
-        const root = document.getElementById('task-chart');
-        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
-        if (plot && window.Plotly && plot.layout && plot.layout.dragmode !== 'drawrect') {
-            window.Plotly.relayout(plot, {dragmode: 'drawrect'});
-        }
-    }
-    // A server-rendered indicator/measurement figure arrives after the Store
-    // has already said Measure is active. Reassert drawrect after Plotly has
-    // reconciled that figure so its default pan mode cannot win the race.
-    window.setTimeout(forceMeasureMode, 0);
-    window.setTimeout(forceMeasureMode, 60);
-    window.setTimeout(forceMeasureMode, 200);
-    return {ts: Date.now(), forced: 'drawrect', previous: relayoutData ? relayoutData.dragmode : null};
+    // Pan, zoom, select and lasso are all non-measure Plotly interactions.
+    // Treat every one as leaving Measure so the button never says Measuring
+    // while another modebar tool owns the drag gesture.
+    return currentMeasureMode ? false : window.dash_clientside.no_update;
 }
 """,
-    Output("chart-dragmode-enforcer-store", "data"),
+    Output("measure-mode-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
-    Input("task-chart", "figure"),
     State("measure-mode-store", "data"),
     prevent_initial_call=True,
 )
 
-clientside_callback(
+register_browser_callback(
     """
 function(relayoutData, taskId, currentView) {
     if (!relayoutData || !taskId) {
@@ -7305,7 +7950,10 @@ def _extract_measure_point(click_data, anchor_enabled=True):
     x_val = point.get('x')
     y_val = point.get('y')
 
-    if not anchor_enabled and point.get('curveNumber') is not None and point.get('y') is None:
+    # The close-price helper is the second trace (after OHLC).  With Snap Off,
+    # reject clicks on that helper so the preference has a real effect without
+    # requiring a chart rebuild to add/remove the trace.
+    if not anchor_enabled and point.get('curveNumber') == 1:
         return None
 
     if y_val is None:
@@ -7366,6 +8014,19 @@ def _extract_measure_box(relayout_data):
             if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
                 return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
 
+    # Plotly versions differ: a completed draw can arrive as the complete
+    # shapes list, separate ``shapes[0].x0`` keys, or one ``shapes[0]`` dict.
+    # Support the latter explicitly; without it the chart shows the rectangle
+    # but the measurement callback has no box to calculate.
+    indexed_shape_objects = []
+    for key, value in relayout_data.items():
+        match = re.match(r"^shapes\[(\d+)\]$", str(key))
+        if match and isinstance(value, dict):
+            indexed_shape_objects.append((int(match.group(1)), value))
+    for _, shape in sorted(indexed_shape_objects, reverse=True):
+        if shape.get("type") in (None, "rect") and all(k in shape for k in ("x0", "x1", "y0", "y1")):
+            return {k: shape[k] for k in ("x0", "x1", "y0", "y1")}
+
     shape_indexes = []
     for key in relayout_data:
         match = re.match(r"shapes\[(\d+)\]\.", str(key))
@@ -7387,7 +8048,6 @@ def _extract_measure_box(relayout_data):
 
 @app.callback(
     Output("measure-points-store", "data", allow_duplicate=True),
-    Output("measure-result-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
     State("measure-mode-store", "data"),
     State("chart-task-id", "data"),
@@ -7395,38 +8055,24 @@ def _extract_measure_box(relayout_data):
 )
 def capture_measure_box(relayout_data, measure_mode, task_id):
     if not measure_mode or not relayout_data:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     box = _extract_measure_box(relayout_data)
     if not box:
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     try:
         y0 = float(box["y0"])
         y1 = float(box["y1"])
     except (TypeError, ValueError):
-        return dash.no_update, dash.no_update
+        return dash.no_update
 
     first = {"x": box["x0"], "y": y0}
     second = {"x": box["x1"], "y": y1}
-    price_diff = y1 - y0
-    pct_change = (price_diff / y0) * 100 if y0 else 0
-    direction = "Up" if price_diff >= 0 else "Down"
-    task = tm.get_task(task_id) if task_id else None
-    timeframe = task.timeframe if task else None
-    time_text, bars_text = _format_measure_time_delta(first["x"], second["x"], timeframe)
-    result = {
-        "text": f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}",
-        "task_id": task_id,
-        "first": first,
-        "second": second,
-        "shape": box,
-        "price_diff": price_diff,
-        "pct_change": pct_change,
-        "time_text": time_text,
-        "bars_text": bars_text,
-    }
-    return {"task_id": task_id, "first": first, "second": second}, result
+    # The result itself is calculated in the matching clientside callback so
+    # it is visible immediately. Keep this server callback only for point
+    # state, avoiding two callbacks with the same relayout input/output pair.
+    return {"task_id": task_id, "first": first, "second": second}
 
 
 @app.callback(
@@ -7510,14 +8156,31 @@ def clear_measure(_):
 @app.callback(
     Output("measure-result", "children"),
     Input("measure-result-store", "data"),
-    prevent_initial_call=False
+    Input("task-chart", "relayoutData"),
+    State("chart-task-id", "data"),
+    prevent_initial_call=False,
 )
-def show_measure_result(result):
+def render_measure_result(result, relayout_data, task_id):
+    """Render point and rectangle measurements through one reliable Dash output."""
+    # Do not gate this on measure-mode-store. Plotly can emit a dragmode
+    # relayout after a completed shape; that async Store update may briefly say
+    # ``False`` even though the visible rectangle is valid.
+    if ctx.triggered_id == "task-chart":
+        box = _extract_measure_box(relayout_data)
+        if box:
+            try:
+                y0, y1 = float(box["y0"]), float(box["y1"])
+            except (TypeError, ValueError):
+                return "📏 Measure box could not read its price values. Draw it again inside the candle pane."
+            price_diff = y1 - y0
+            pct_change = price_diff / y0 * 100 if y0 else 0
+            task = tm.get_task(task_id) if task_id else None
+            time_text, bars_text = _format_measure_time_delta(box["x0"], box["x1"], task.timeframe if task else None)
+            direction = "Up" if price_diff >= 0 else "Down"
+            return f"📦 Box {direction}: Δ Price {price_diff:+.6g} ({pct_change:+.2f}%) | Δ Time: {time_text} | Δ Candles: {bars_text}"
     if isinstance(result, dict):
         return result.get("text", "")
-    if result:
-        return result
-    return ""
+    return result or ""
 
 @app.callback(
     Output("measure-hint", "children"),
@@ -7650,8 +8313,12 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
                         fig.layout[axis_name].range = list(axis_range)
                         fig.layout[axis_name].autorange = False
                 elif re.match(r"^yaxis[0-9]*$", axis_name):
-                    fig.layout[axis_name].range = list(axis_range)
-                    fig.layout[axis_name].autorange = False
+                    # Only the candle pane retains a manual vertical zoom.
+                    # Oscillator ranges are indicator-specific (for example
+                    # RSI/Stoch 0–100) and must keep fitting their own panes.
+                    if axis_name == "yaxis":
+                        fig.layout[axis_name].range = list(axis_range)
+                        fig.layout[axis_name].autorange = False
             except Exception:
                 continue
         elif axis_state.get("autorange"):
@@ -7674,15 +8341,14 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
-    Input("measure-anchor-store", "data"),
-    Input("measure-points-store", "data"),
-    Input("measure-result-store", "data"),
     Input("chart-event-context-store", "data"),
+    Input("chart-focus-entry-store", "data"),
     State("chart-view-state-store", "data"),
     State("measure-mode-store", "data"),
+    State("chart-info-box-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, measure_anchor, measure_points, measure_result, chart_event_context, chart_view_state, measure_mode):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, chart_view_state, measure_mode, candle_info_enabled):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -7700,10 +8366,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     if task.end_date:
         end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
     else:
-        timestamp_only = pd.read_parquet(fp, columns=["timestamp"], filters=[("timestamp", ">=", start_ms)])
-        if timestamp_only.empty:
+        end_ms = get_chart_file_end_timestamp(fp)
+        if end_ms is None or end_ms < start_ms:
             return go.Figure()
-        end_ms = int(timestamp_only["timestamp"].max())
     df_source = read_chart_parquet_cached(fp, start_ms, end_ms)
     if df_source.empty:
         return go.Figure()
@@ -7776,21 +8441,21 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             low=df['low'], close=df['close'], name="OHLC",
             customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+            hoverinfo='all' if candle_info_enabled else 'skip',
             hovertemplate=(
                 "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
                 "Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}"
                 "<extra></extra>"
             )
         ), row=1, col=1)
-        if measure_anchor:
-            # Invisible close-price points make the Measure tool reliable because
-            # candlestick clickData can omit a usable y/price value.  The Snap
-            # toggle hides these helper points when users do not want anchoring.
-            target_fig.add_trace(go.Scatter(
-                x=df['x'], y=df['close'], mode='markers',
-                name='_measure_click_points', showlegend=False, hoverinfo='skip',
-                marker=dict(size=18, color='rgba(0,0,0,0)')
-            ), row=1, col=1)
+        # Keep the invisible close-price helper in every figure.  This makes
+        # Snap a capture-only preference rather than a reason to rebuild a
+        # potentially large candle chart.
+        target_fig.add_trace(go.Scatter(
+            x=df['x'], y=df['close'], mode='markers',
+            name='_measure_click_points', showlegend=False, hoverinfo='skip',
+            marker=dict(size=18, color='rgba(0,0,0,0)')
+        ), row=1, col=1)
 
     def add_hover_spike_bar(target_fig, row, y0, y1, name):
         """Transparent full-pane hover target so x-spikes work anywhere in a subplot."""
@@ -7805,7 +8470,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         target_fig.add_trace(go.Bar(
             x=df['x'], y=[high - low] * len(df), base=[low] * len(df),
             name=name, showlegend=False, opacity=0.001, marker_color='rgba(0,0,0,0.001)',
-            marker_line_width=0, hovertemplate='%{x|%Y-%m-%d %H:%M}<extra></extra>'
+            marker_line_width=0, hoverinfo='skip'
         ), row=row, col=1)
 
     def add_volume_trace(target_fig, row, title="Volume"):
@@ -7891,6 +8556,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         task._chart_cache.clear()  # Keep only 1 view in RAM
         task._chart_cache[cache_key] = df.copy()
     df = task._chart_cache[cache_key]
+    retain_chart_task_indicator_cache(task)
 
     if volume_visible and has_volume:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
@@ -7983,6 +8649,71 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     y_min -= y_padding
     y_max += y_padding
 
+    # Optional per-task entry focus. Use a balanced local candle window and a
+    # symmetric price range around the recorded signal price so switching to a
+    # different coin never reuses an unrelated coin's zoom or y-position.
+    entry_focus_xrange = None
+    entry_focus_yrange = None
+    # Always provide this lightweight metadata. That lets the browser focus
+    # the *currently displayed* chart immediately when the toggle is clicked,
+    # before the normal figure callback finishes rebuilding it. The server
+    # then applies the same range to every subsequently opened chart while
+    # Focus Entry remains enabled.
+    if len(df):
+        timestamps = df['timestamp'].to_numpy()
+        signal_ms = int(float(task.signal_time))
+        entry_idx = int(np.searchsorted(timestamps, signal_ms, side='left'))
+        entry_idx = max(0, min(entry_idx, len(df) - 1))
+        # About 100 candles gives context without showing an entire history.
+        left_idx = max(0, entry_idx - 50)
+        right_idx = min(len(df) - 1, entry_idx + 50)
+        entry_focus_xrange = [df['x'].iloc[left_idx], df['x'].iloc[right_idx]]
+        focus_low = float(df['low'].iloc[left_idx:right_idx + 1].min())
+        focus_high = float(df['high'].iloc[left_idx:right_idx + 1].max())
+        try:
+            entry_price = float(task.signal_price)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if np.isfinite(entry_price) and entry_price > 0:
+            half_span = max(abs(entry_price - focus_low), abs(focus_high - entry_price), entry_price * 0.01) * 1.12
+            entry_focus_yrange = [entry_price - half_span, entry_price + half_span]
+        else:
+            focus_padding = max((focus_high - focus_low) * 0.06, 1e-12)
+            entry_focus_yrange = [focus_low - focus_padding, focus_high + focus_padding]
+
+    # A chart opened from a Dynamic Oscillator summary has a concrete trade
+    # interval. Focus that entry-to-exit interval (not the original signal)
+    # using the already loaded task DataFrame; no additional parquet read or
+    # indicator calculation is needed.
+    event_focus_xrange = None
+    event_focus_yrange = None
+    if isinstance(chart_event_context, dict) and chart_event_context.get("source") == "dynamic_oscillator_summary":
+        event_rows = chart_event_context.get("events") or []
+        event_idx = int(chart_event_context.get("index") or 0)
+        if 0 <= event_idx < len(event_rows):
+            selected_event = event_rows[event_idx] or {}
+            if str(selected_event.get("task_id")) == str(task_id):
+                try:
+                    event_entry_ms = float(selected_event.get("entry_time"))
+                    event_exit_ms = float(selected_event.get("exit_time"))
+                    event_entry_price = float(selected_event.get("entry_price"))
+                    event_exit_price = float(selected_event.get("exit_price"))
+                    if len(df) and all(np.isfinite(value) for value in (event_entry_ms, event_exit_ms, event_entry_price, event_exit_price)):
+                        timestamps = df['timestamp'].to_numpy()
+                        start_idx = int(np.searchsorted(timestamps, min(event_entry_ms, event_exit_ms), side='left'))
+                        end_idx = int(np.searchsorted(timestamps, max(event_entry_ms, event_exit_ms), side='right')) - 1
+                        start_idx = max(0, min(start_idx, len(df) - 1))
+                        end_idx = max(start_idx, min(end_idx, len(df) - 1))
+                        left_idx = max(0, start_idx - 20)
+                        right_idx = min(len(df) - 1, end_idx + 20)
+                        event_focus_xrange = [df['x'].iloc[left_idx], df['x'].iloc[right_idx]]
+                        event_low = min(float(df['low'].iloc[left_idx:right_idx + 1].min()), event_entry_price, event_exit_price)
+                        event_high = max(float(df['high'].iloc[left_idx:right_idx + 1].max()), event_entry_price, event_exit_price)
+                        event_padding = max((event_high - event_low) * 0.08, abs(event_entry_price) * 0.01, 1e-12)
+                        event_focus_yrange = [event_low - event_padding, event_high + event_padding]
+                except (TypeError, ValueError):
+                    pass
+
     # Do not place a transparent hover trace over the candle pane: it can steal
     # the OHLC hover label from candles. A browser-side crosshair overlay below
     # provides the always-visible vertical guide across the full chart instead.
@@ -8032,15 +8763,40 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                 entry_price = active_event.get("entry_price")
                 exit_price = active_event.get("exit_price")
                 event_label = active_event.get("label") or active_event.get("category") or "Dynamic strategy event"
-                nav_label = f"{event_index + 1}/{len(events)}"
+                direction_label = str(active_event.get("direction") or "").upper()
+                exit_reason = str(active_event.get("exit_reason") or "open")
+                exit_reason_label = {
+                    "oscillator_close": "Stochastic close",
+                    "stop": "Stop loss",
+                    "max_adverse_dd": "Max adverse DD",
+                    "open": "Still open",
+                }.get(exit_reason, exit_reason.replace("_", " ").title())
+                return_pct = active_event.get("return_pct")
+                try:
+                    return_text = f"{float(return_pct):+.2f}%"
+                except (TypeError, ValueError):
+                    return_text = "n/a"
+                entry_conditions = str(active_event.get("entry_conditions") or "oscillator confirmation")
+                entry_window = active_event.get("entry_condition_window")
+                entry_execution = str(active_event.get("entry_execution") or "entry after confirmation")
+                try:
+                    entry_distance_text = f"{float(active_event.get('entry_level_distance_pct')):.2f}% from level"
+                except (TypeError, ValueError):
+                    entry_distance_text = "level distance n/a"
+                entry_reason = (f"Level condition reached; {entry_conditions}; "
+                                f"window={entry_window or 1} candle(s); {entry_execution}; {entry_distance_text}")
+                exit_conditions = str(active_event.get("exit_conditions") or exit_reason_label)
+                is_tp_checkpoint = str(active_event.get("category") or "").startswith("tp_")
                 if entry_time is not None and entry_price is not None:
                     entry_dt = ms_to_utc_datetime(float(entry_time))
                     fig.add_trace(go.Scatter(
                         x=[entry_dt], y=[float(entry_price)], mode='markers+text',
-                        text=[f"ENTRY {nav_label}"], textposition='top center',
+                        text=[f"ENTRY {direction_label}".strip()], textposition='top center',
                         marker=dict(size=14, color='#00c853', symbol='triangle-up', line=dict(width=2, color='white')),
                         name='Dynamic strategy entry', showlegend=False,
-                        hovertemplate=f"{event_label}<br>Entry: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                        hovertemplate=(f"<b>{event_label}</b><br>Entry {direction_label or 'trade'}: %{{y:.6g}}"
+                                       f"<br>Why entered: {entry_reason}"
+                                       f"<br>Time: %{{x|%Y-%m-%d %H:%M}}<extra></extra>")
                     ), row=1, col=1)
                     fig.add_trace(go.Scatter(
                         x=[entry_dt, entry_dt], y=[y_min, y_max], mode='lines',
@@ -8049,12 +8805,20 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     ), row=1, col=1)
                 if exit_time is not None and exit_price is not None:
                     exit_dt = ms_to_utc_datetime(float(exit_time))
+                    exit_text = ("TP CHECKPOINT" if is_tp_checkpoint
+                                 else f"EXIT {exit_reason_label}: {return_text}")
+                    exit_color = '#ff9800' if is_tp_checkpoint else ('#00c853' if return_text.startswith('+') else '#d50000')
+                    exit_hover = (f"{event_label}<br>TP checkpoint: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}"
+                                  if is_tp_checkpoint else
+                                  f"<b>{event_label}</b><br>Exit reason: {exit_reason_label}"
+                                  f"<br>Why exited: {exit_conditions}<br>Return: {return_text}"
+                                  f"<br>Exit: %{{y:.6g}}<br>Time: %{{x|%Y-%m-%d %H:%M}}")
                     fig.add_trace(go.Scatter(
                         x=[exit_dt], y=[float(exit_price)], mode='markers+text',
-                        text=["EXIT"], textposition='bottom center',
-                        marker=dict(size=14, color='#d50000', symbol='x', line=dict(width=2, color='white')),
+                        text=[exit_text], textposition='bottom center',
+                        marker=dict(size=14, color=exit_color, symbol='x', line=dict(width=2, color='white')),
                         name='Dynamic strategy exit', showlegend=False,
-                        hovertemplate=f"{event_label}<br>Exit: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                        hovertemplate=exit_hover + "<extra></extra>"
                     ), row=1, col=1)
                     fig.add_trace(go.Scatter(
                         x=[exit_dt, exit_dt], y=[y_min, y_max], mode='lines',
@@ -8094,60 +8858,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     text=sig.get('extra_info', ''),
                     hoverinfo='skip'
                 ), row=1, col=1)
-    # TradingView-style measurement overlay: first click marker, then a ruler
-    # line with a compact result label after the second click.
-    measure_first = None
-    measure_second = None
-    measure_text = ""
-    measure_shape = None
-    if isinstance(measure_result, dict) and measure_result.get('task_id') == task_id:
-        measure_first = measure_result.get('first')
-        measure_second = measure_result.get('second')
-        measure_text = measure_result.get('text', '')
-        measure_shape = measure_result.get('shape')
-    if isinstance(measure_points, dict) and measure_points.get('task_id') == task_id:
-        measure_first = measure_points.get('first') or measure_first
-        measure_second = measure_points.get('second') or measure_second
-
-    if measure_shape:
-        fig.add_shape(
-            type="rect",
-            x0=measure_shape["x0"], x1=measure_shape["x1"],
-            y0=measure_shape["y0"], y1=measure_shape["y1"],
-            xref="x", yref="y",
-            line=dict(color="#1976d2", width=2, dash="dot"),
-            fillcolor="rgba(25,118,210,0.08)",
-        )
-        short_text = measure_text.replace('📦 ', '')
-        fig.add_annotation(
-            x=measure_shape["x1"], y=measure_shape["y1"], xref='x', yref='y',
-            text=short_text, showarrow=True, arrowhead=2, ax=40, ay=-40,
-            bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
-            font=dict(color='white', size=11)
-        )
-    elif measure_first and not measure_second:
-        fig.add_trace(go.Scatter(
-            x=[measure_first['x']], y=[measure_first['y']],
-            mode='markers', showlegend=False, name='Measure start',
-            marker=dict(size=12, color='#1976d2', symbol='circle', line=dict(width=2, color='white')),
-            hovertemplate='Measure start<br>%{x}<br>%{y}<extra></extra>'
-        ), row=1, col=1)
-    elif measure_first and measure_second:
-        fig.add_trace(go.Scatter(
-            x=[measure_first['x'], measure_second['x']],
-            y=[measure_first['y'], measure_second['y']],
-            mode='lines+markers', showlegend=False, name='Measure',
-            line=dict(color='#1976d2', width=2, dash='dot'),
-            marker=dict(size=10, color='#1976d2', line=dict(width=2, color='white')),
-            hovertemplate='Measure<br>%{x}<br>%{y}<extra></extra>'
-        ), row=1, col=1)
-        short_text = measure_text.replace('📏 ', '')
-        fig.add_annotation(
-            x=measure_second['x'], y=measure_second['y'], xref='x', yref='y',
-            text=short_text, showarrow=True, arrowhead=2, ax=40, ay=-40,
-            bgcolor='rgba(25,118,210,0.92)', bordercolor='#0d47a1', borderwidth=1,
-            font=dict(color='white', size=11)
-        )
+    # The native Plotly rectangle remains in the browser, and measurement text
+    # is updated independently.  Keeping it out of this callback avoids a full
+    # parquet/figure rebuild for every drag or point measurement.
 
     # Layout (light theme)
     fig.update_layout(
@@ -8170,6 +8883,11 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         meta={
             "default_xrange": [df['x'].iloc[0], df['x'].iloc[-1]],
             "extended_xrange": None,
+            "entry_focus_xrange": entry_focus_xrange,
+            "event_focus_xrange": event_focus_xrange,
+            "chart_open_source": (chart_event_context or {}).get("source", "main_table") if isinstance(chart_event_context, dict) else "main_table",
+            "timeframe": task.timeframe,
+            "task_id": str(task_id),
         },
         # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
         # or marker overlays rebuild this figure.  The key changes only when a
@@ -8181,6 +8899,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     # browser-side crosshair overlay supplies the single full-pane dashed line.
     fig.update_xaxes(
         tickformat="%H:%M",
+        hoverformat="%Y-%m-%d %H:%M",
         ticklabelmode="period",
         ticks="outside",
         showspikes=False,
@@ -8191,6 +8910,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         spikedash="dash"
     )
     fig.update_yaxes(showspikes=False)
+    if total_rows > 1:
+        # Keep each oscillator's vertical scale independent. The time axis is
+        # intentionally shared with candles, but a drag/wheel zoom started in
+        # the main pane must never rescale or distort oscillator values.
+        for row in range(2, total_rows + 1):
+            fig.update_yaxes(fixedrange=True, row=row, col=1)
     if len(df) > 1:
         candle_step = df['x'].iloc[-1] - df['x'].iloc[-2]
         if candle_step.total_seconds() > 0:
@@ -8200,7 +8925,14 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         fig.update_layout(hoversubplots="axis")
     except ValueError:
         pass
-    apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
+    if event_focus_xrange and event_focus_yrange:
+        fig.update_xaxes(range=event_focus_xrange, autorange=False)
+        fig.update_yaxes(range=event_focus_yrange, autorange=False, row=1, col=1)
+    elif focus_entry and entry_focus_xrange and entry_focus_yrange:
+        fig.update_xaxes(range=entry_focus_xrange, autorange=False)
+        fig.update_yaxes(range=entry_focus_yrange, autorange=False, row=1, col=1)
+    else:
+        apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
     return fig
 
 # =============================================================================
@@ -8922,16 +9654,21 @@ def oscillator_condition_met_within_window(values, idx, level, condition, window
     return any(oscillator_condition_met(values, check_idx, level, condition) for check_idx in range(start_idx, idx + 1))
 
 
-def oscillator_specs_met_within_window(df, specs, idx, window=1, min_idx=0):
-    """Require every enabled oscillator spec to have matched within the same past/current window."""
+def oscillator_specs_met_within_window(values_by_column, specs, idx, window=1, min_idx=0):
+    """Require every enabled oscillator spec to have matched within the same past/current window.
+
+    ``values_by_column`` is prebuilt once per task source. Repeatedly calling
+    DataFrame.to_numpy() inside the candle scan made long histories effectively
+    quadratic and was the main reason the dynamic stochastic checkup stalled.
+    """
     for spec in specs:
         condition = normalize_oscillator_condition(spec.get("condition"))
         if condition == "disabled":
             continue
         column = spec.get("column")
-        if column not in df:
+        values = values_by_column.get(column) if isinstance(values_by_column, dict) else None
+        if values is None:
             return False
-        values = df[column].to_numpy(dtype=float)
         if not oscillator_condition_met_within_window(values, idx, spec["level"], condition, window, min_idx=min_idx):
             return False
     return True
@@ -9031,19 +9768,27 @@ def build_oscillator_reversal_source_uncached(task):
     if getattr(task, "signal_direction", None) not in ("resistance", "support"):
         return None
 
-    df = load_task_data_cached(task)
-    if df is None or df.empty:
-        return None
-    required = {"timestamp", "high", "low", "close"}
-    if not required.issubset(df.columns):
-        return None
-
-    # ``load_task_data_cached`` deliberately reads a defensive outer window for
-    # event analysis. Dynamic indicators must use the exact same requested
-    # pre-signal boundary as the chart, otherwise an old task start can silently
-    # contribute extra warm-up candles after pre_buffer_minutes is changed.
+    # Read only this task's needed candle window.  The generic task-data helper
+    # caches a complete pair/timeframe parquet file, which made a first dynamic
+    # stochastic checkup slow on older SSDs even when the task uses a short
+    # period.  This mtime-aware predicate read shares the bounded chart cache.
     history_start_ms = task_pre_signal_start_ms(task)
-    df = df[pd.to_numeric(df["timestamp"], errors="coerce") >= history_start_ms].copy()
+    fp = os.path.join(symbol_timeframe_path(task.symbols[0], task.timeframe), "data.parquet")
+    if not os.path.exists(fp):
+        return None
+    if task.end_date:
+        history_end_ms = int(task.end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    else:
+        history_end_ms = get_chart_file_end_timestamp(fp)
+    if history_end_ms is None or history_end_ms < history_start_ms:
+        return None
+    df = read_chart_parquet_cached(fp, history_start_ms, history_end_ms).copy()
+    required = {"timestamp", "high", "low", "close"}
+    if df.empty or not required.issubset(df.columns):
+        return None
+    # Preserve the inclusive boundary defensively even though the parquet read
+    # already uses the same predicates.
+    df = df[(df["timestamp"] >= history_start_ms) & (df["timestamp"] <= history_end_ms)]
     if df.empty:
         return None
 
@@ -9057,7 +9802,9 @@ def build_oscillator_reversal_source_uncached(task):
     df_sorted["stoch_k_14_1_3"], df_sorted["stoch_d_14_1_3"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
     df_sorted["stoch_k_40_1_4"], df_sorted["stoch_d_40_1_4"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
     df_sorted["stoch_k_60_1_10"], df_sorted["stoch_d_60_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
-    df_sorted["stoch_k_300_1_10"], df_sorted["stoch_d_300_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 10, 1)
+    # Keep calculation parameters aligned with the public column/UI name:
+    # Stoch 300/1/10 means %K length 300, %D length 1, smoothing 10.
+    df_sorted["stoch_k_300_1_10"], df_sorted["stoch_d_300_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 1, 10)
     df_sorted["rsi_14_14"] = compute_dynamic_rsi_series(df_sorted["close"], 14).rolling(window=14, min_periods=1).mean()
 
     search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
@@ -9067,6 +9814,10 @@ def build_oscillator_reversal_source_uncached(task):
     if path_df.empty:
         return None
 
+    oscillator_columns = [
+        "stoch_d_14_1_3", "stoch_d_40_1_4", "stoch_d_60_1_10",
+        "stoch_d_300_1_10", "rsi_14_14",
+    ]
     return {
         "task_id": str(getattr(task, "task_id", "")),
         "level_kind": task.signal_direction,
@@ -9074,20 +9825,37 @@ def build_oscillator_reversal_source_uncached(task):
         "direction": "sell" if task.signal_direction == "resistance" else "buy",
         "signal_price": signal_price,
         "df": path_df,
+        "oscillator_values": {
+            column: path_df[column].to_numpy(dtype=float, copy=False)
+            for column in oscillator_columns
+        },
     }
 
 
+def _oscillator_source_bytes(source):
+    if not source or not isinstance(source, dict):
+        return 0
+    return _chart_dataframe_bytes(source.get("df"))
+
 def build_oscillator_reversal_source(task):
     """Return a bounded cached oscillator source for fast repeated checkup runs."""
+    global oscillator_reversal_source_cache_bytes
     cache_key = make_oscillator_reversal_source_cache_key(task)
     if cache_key in oscillator_reversal_source_cache:
         oscillator_reversal_source_cache.move_to_end(cache_key)
         return oscillator_reversal_source_cache[cache_key]
     source = build_oscillator_reversal_source_uncached(task)
-    oscillator_reversal_source_cache[cache_key] = source
-    oscillator_reversal_source_cache.move_to_end(cache_key)
-    while len(oscillator_reversal_source_cache) > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX:
-        oscillator_reversal_source_cache.popitem(last=False)
+    source_bytes = _oscillator_source_bytes(source)
+    # Return a large source to this calculation, but do not retain it across
+    # runs on a low-memory machine.
+    if source_bytes <= OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX_BYTES:
+        oscillator_reversal_source_cache[cache_key] = source
+        oscillator_reversal_source_cache_bytes += source_bytes
+        oscillator_reversal_source_cache.move_to_end(cache_key)
+        while (len(oscillator_reversal_source_cache) > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX or
+               oscillator_reversal_source_cache_bytes > OSCILLATOR_REVERSAL_SOURCE_CACHE_MAX_BYTES):
+            _, evicted_source = oscillator_reversal_source_cache.popitem(last=False)
+            oscillator_reversal_source_cache_bytes -= _oscillator_source_bytes(evicted_source)
     return source
 
 
@@ -9109,7 +9877,7 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
     selected_specs = select_oscillator_specs_for_source(source, oscillator_specs)
     oscillator_idx = None
     for idx in range(cross_idx, len(df)):
-        if oscillator_specs_met_within_window(df, selected_specs, idx, entry_condition_window, min_idx=cross_idx):
+        if oscillator_specs_met_within_window(source["oscillator_values"], selected_specs, idx, entry_condition_window, min_idx=cross_idx):
             oscillator_idx = idx
             break
     if oscillator_idx is None:
@@ -9143,6 +9911,8 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
         "oscillator_idx": oscillator_idx,
         "entry_execution": "signal_candle_close_next_candle_path",
         "toward_direction": source.get("toward_direction"),
+        "entry_conditions": format_oscillator_specs(selected_specs),
+        "entry_condition_window": int(entry_condition_window or 1),
     }
 
 
@@ -9166,7 +9936,7 @@ def bucket_stochastic_exit_return(return_pct):
     return "Profit 4%+"
 
 
-def build_chart_event_record(path, result, category, label):
+def build_chart_event_record(path, result, category, label, oscillator_exit_specs=None):
     """Build a chart navigation event for oscillator research result rows."""
     if not path or not result or not path.get("task_id"):
         return None
@@ -9186,15 +9956,36 @@ def build_chart_event_record(path, result, category, label):
     exit_time = None
     if exit_idx is not None and timestamps is not None and 0 <= int(exit_idx) < len(timestamps):
         exit_time = float(timestamps[int(exit_idx)])
+    exit_reason = result.get("exit_reason")
+    if exit_reason == "oscillator_close":
+        exit_conditions = format_oscillator_specs(select_exit_oscillator_specs(path, oscillator_exit_specs))
+    elif exit_reason == "stop":
+        stop_return = result.get("stop_return_pct")
+        try:
+            exit_conditions = ("Original stop loss" if result.get("initial_stop_hit")
+                               else f"Moved/trailing stop locked at {float(stop_return):+.2f}%")
+        except (TypeError, ValueError):
+            exit_conditions = "Original or moved stop loss"
+    elif exit_reason == "max_adverse_dd":
+        exit_conditions = "Maximum adverse drawdown cap reached"
+    else:
+        exit_conditions = "No completed exit / checkpoint only"
     return {
         "task_id": path.get("task_id"),
         "category": category,
         "label": label,
+        "direction": path.get("direction"),
         "entry_time": path.get("entry_time"),
         "entry_price": path.get("entry_price"),
         "exit_time": exit_time,
         "exit_price": exit_price,
-        "exit_reason": result.get("exit_reason"),
+        "entry_conditions": path.get("entry_conditions"),
+        "entry_condition_window": path.get("entry_condition_window"),
+        "entry_execution": path.get("entry_execution"),
+        "entry_level_distance_pct": path.get("entry_level_distance_pct"),
+        "exit_reason": exit_reason,
+        "exit_conditions": exit_conditions,
+        "stop_return_pct": result.get("stop_return_pct"),
         "return_pct": result.get("exit_return_pct"),
     }
 
@@ -9259,7 +10050,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         if not result or not result.get("valid"):
             continue
         if result.get("initial_stop_hit"):
-            event = build_chart_event_record(path, result, "original_sl", "Original SL exit")
+            event = build_chart_event_record(path, result, "original_sl", "Original SL exit", oscillator_exit_specs)
             if event:
                 event_groups["original_sl"].append(event)
         if result.get("stop_hit") and result.get("stop_return_pct") is not None:
@@ -9268,11 +10059,11 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
             stop_category = f"stop_exec_{stop_key_value}"
             stop_label = ("Original SL" if result.get("initial_stop_hit") else "Moved stop") + f" executed at {stop_return_pct:g}% return"
             stop_execution_levels[stop_category] = stop_return_pct
-            event = build_chart_event_record(path, result, stop_category, stop_label)
+            event = build_chart_event_record(path, result, stop_category, stop_label, oscillator_exit_specs)
             if event:
                 event_groups.setdefault(stop_category, []).append(event)
         if result.get("oscillator_exit_hit"):
-            event = build_chart_event_record(path, result, "stochastic_close", "Stochastic close")
+            event = build_chart_event_record(path, result, "stochastic_close", "Stochastic close", oscillator_exit_specs)
             if event:
                 event_groups["stochastic_close"].append(event)
                 bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
@@ -9280,7 +10071,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
                     event_groups.setdefault(f"stoch_bucket_{bucket}", []).append(dict(event, category=f"stoch_bucket_{bucket}", label=bucket))
         for level in tp_levels:
             if level in result.get("tp_hits", set()):
-                event = build_chart_event_record(path, result, f"tp_{level:g}", f"TP {fmt_dynamic_level_label(level)} checkpoint")
+                event = build_chart_event_record(path, result, f"tp_{level:g}", f"TP {fmt_dynamic_level_label(level)} checkpoint", oscillator_exit_specs)
                 if event:
                     event_groups[f"tp_{level:g}"].append(event)
 
