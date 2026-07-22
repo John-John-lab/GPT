@@ -20,7 +20,7 @@ import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functo
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 import dash
-from dash import dcc, html, Input, Output, State, MATCH, ALL, no_update, ctx, clientside_callback
+from dash import dcc, html, Input, Output, State, MATCH, ALL, no_update, ctx, clientside_callback as dash_clientside_callback
 import pandas as pd
 import numpy as np
 import requests
@@ -3086,6 +3086,18 @@ optimizer_mgr = OptimizerManager()
 # ---------- Dash App ----------
 app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_callbacks='initial_duplicate')
 
+# Dash 4 can intermittently fail to resolve dynamically generated inline
+# clientside callback functions after a hot reload ("undefined.apply" in the
+# renderer).  The chart's essential controls already have direct DOM handlers,
+# so keep those fragile callback registrations opt-in until the deployed Dash
+# version provides a stable clientside-function registry.
+INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED = os.environ.get("GPT_ENABLE_INLINE_DASH_CALLBACKS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+def register_browser_callback(*args, **kwargs):
+    if INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED:
+        return dash_clientside_callback(*args, **kwargs)
+    return None
+
 # ----- Flask route for task actions (stop/pause/save) – unchanged -----
 @app.server.route('/task-action', methods=['POST'])
 def task_action():
@@ -3296,6 +3308,11 @@ function deactivateMeasureForChartAction() {
         measureButton.style.borderWidth = '1px';
         measureButton.style.fontWeight = 'normal';
     }
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (plot && window.Plotly) {
+        window.Plotly.relayout(plot, {dragmode: 'pan'});
+    }
 }
 function applyChartToggleImmediately(button) {
     const config = chartToggleStores[button.id];
@@ -3324,6 +3341,12 @@ function applyChartToggleImmediately(button) {
     if (button.id === 'toggle-measure-btn') {
         button.textContent = active ? '📐 Measuring' : '📐 Measure';
         button.style.fontWeight = active ? 'bold' : 'normal';
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (plot && window.Plotly) {
+            if (window.attachNativeMeasureOverlayListeners) window.attachNativeMeasureOverlayListeners(plot);
+            window.Plotly.relayout(plot, {dragmode: active ? 'drawrect' : 'pan'});
+        }
     }
     if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
@@ -7057,7 +7080,7 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
         prefetch_chart_source_async(chartable[warm_idx])
     return target_id, no_update, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
-clientside_callback(
+register_browser_callback(
     """
 function(taskId, page) {
     function apply() {
@@ -7454,7 +7477,7 @@ def update_chart_focus_entry_button(focus_enabled):
     return ("Focus Entry: On" if focus_enabled else "Focus Entry: Off"), style
 
 
-clientside_callback(
+register_browser_callback(
     """
 function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo, oscillatorSyncInfo, extendX, focusEntry, figure, viewState, chartTaskId) {
     if (!figure || !figure.layout) {
@@ -7627,7 +7650,7 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
 )
 
 
-clientside_callback(
+register_browser_callback(
     """
 function(figure, oscillatorSyncInfo, candleInfo) {
     const root = document.getElementById('task-chart');
@@ -7828,7 +7851,7 @@ function(figure, oscillatorSyncInfo, candleInfo) {
 # Keep the Measure button and Plotly's Pan / draw-rectangle modebar tools in
 # agreement.  This is deliberately client-side so a modebar click never sends
 # the candle figure back to Python or changes the current zoom/pan ranges.
-clientside_callback(
+register_browser_callback(
     """
 function(relayoutData, currentMeasureMode) {
     if (!relayoutData || !Object.prototype.hasOwnProperty.call(relayoutData, 'dragmode')) {
@@ -7849,7 +7872,7 @@ function(relayoutData, currentMeasureMode) {
     prevent_initial_call=True,
 )
 
-clientside_callback(
+register_browser_callback(
     """
 function(relayoutData, taskId, currentView) {
     if (!relayoutData || !taskId) {
