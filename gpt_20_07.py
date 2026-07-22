@@ -3249,12 +3249,23 @@ function applyHiddenColumns() {
 // visually clickable but with no Store update for the Python callback.
 function pushDashStore(storeId, payload, fallbackEventName) {
     const eventPayload = Object.assign({ts: Date.now()}, payload);
-
-    if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
-        window.dash_clientside.set_props(storeId, {data: eventPayload});
-        return;
+    function publish() {
+        if (!window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+        try {
+            window.dash_clientside.set_props(storeId, {data: eventPayload});
+            return true;
+        } catch (error) {
+            console.error('Dash set_props failed for store:', storeId, error);
+            return false;
+        }
     }
-    console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
+    if (publish()) return;
+    // Dash can expose set_props a few milliseconds after the page shell and
+    // table HTML are visible. Retry once so a main-table Chart click is never
+    // lost during startup/hot reload, while keeping the same unique payload.
+    window.setTimeout(function() {
+        if (!publish()) console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
+    }, 80);
 }
 const chartToggleStores = {
     'toggle-rsi-btn': ['rsi-visible-store', false],
