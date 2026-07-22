@@ -8480,7 +8480,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     # different coin never reuses an unrelated coin's zoom or y-position.
     entry_focus_xrange = None
     entry_focus_yrange = None
-    if focus_entry and len(df):
+    # Always provide this lightweight metadata. That lets the browser focus
+    # the *currently displayed* chart immediately when the toggle is clicked,
+    # before the normal figure callback finishes rebuilding it. The server
+    # then applies the same range to every subsequently opened chart while
+    # Focus Entry remains enabled.
+    if len(df):
         timestamps = df['timestamp'].to_numpy()
         signal_ms = int(float(task.signal_time))
         entry_idx = int(np.searchsorted(timestamps, signal_ms, side='left'))
