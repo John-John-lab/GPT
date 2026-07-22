@@ -3243,29 +3243,32 @@ function applyHiddenColumns() {
 }
 // ✅ OPTIMIZED: Removed MutationObserver - it was causing infinite loops and race conditions
 // Column hiding is now handled by CSS rules in the stylesheet, applied automatically on render
-// Push an action payload into a Dash Store immediately.  The previous
-// CustomEvent -> hidden button -> clientside callback bridge can miss clicks
-// in some Dash/browser combinations, leaving Chart/Details/Impulse buttons
-// visually clickable but with no Store update for the Python callback.
+// Push an action payload into a Dash Store immediately. The task table is
+// re-rendered by Dash, so this must use delegated events and wait for Dash's
+// client API to be ready instead of relying on a handler attached to an old row.
 function pushDashStore(storeId, payload, fallbackEventName) {
     const eventPayload = Object.assign({ts: Date.now()}, payload);
-    function publish() {
-        if (!window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
-        try {
-            window.dash_clientside.set_props(storeId, {data: eventPayload});
-            return true;
-        } catch (error) {
-            console.error('Dash set_props failed for store:', storeId, error);
-            return false;
+    let attempts = 0;
+    function publishWhenReady() {
+        attempts += 1;
+        if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
+            try {
+                window.dash_clientside.set_props(storeId, {data: eventPayload});
+                return;
+            } catch (error) {
+                console.error('Dash set_props failed for store:', storeId, error);
+            }
+        }
+        // During initial load or a hot reload the table can appear before the
+        // Dash renderer exposes set_props. Keep the original payload (and its
+        // timestamp) across retries so one physical click produces one action.
+        if (attempts < 20) {
+            window.setTimeout(publishWhenReady, 100);
+        } else {
+            console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
         }
     }
-    if (publish()) return;
-    // Dash can expose set_props a few milliseconds after the page shell and
-    // table HTML are visible. Retry once so a main-table Chart click is never
-    // lost during startup/hot reload, while keeping the same unique payload.
-    window.setTimeout(function() {
-        if (!publish()) console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
-    }, 80);
+    publishWhenReady();
 }
 const chartToggleStores = {
     'toggle-rsi-btn': ['rsi-visible-store', false],
@@ -3631,16 +3634,12 @@ function showNativeMeasureResultAfterMouseup() {
 document.addEventListener('mouseup', showNativeMeasureResultAfterMouseup, true);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
-    let target = e.target;
-    
-    // Check if the clicked element is a button or contains a button
-    let button = null;
-    if (target.tagName === 'BUTTON' || target.closest('button')) {
-        button = target.tagName === 'BUTTON' ? target : target.closest('button');
-    } else if (target.tagName === 'DIV' && target.classList.contains('interactive-button')) {
-        button = target;
-    }
-    
+    const target = e.target;
+    // Dash may place spans/icons inside a component and replaces every table
+    // row on refresh. Resolve the nearest actionable ancestor, not only an
+    // element that happens to be the direct click target.
+    if (!target || typeof target.closest !== 'function') return;
+    const button = target.closest('button, .interactive-button');
     if (!button) return;
 
     // Indicator, overlay and range controls replace/reposition the figure.
@@ -3786,9 +3785,11 @@ document.addEventListener('keydown', function(e) {
 document.addEventListener('click', function(e) {
     // CRITICAL: Check if we're clicking inside a TABLE first before checking for buttons
     // This ensures table clicks are handled even if they contain interactive elements
-    let table = e.target.closest('table');
+    if (!e.target || typeof e.target.closest !== 'function') return;
+    let table = e.target.closest('#task-table-container table');
     
-    // If we're NOT in a table, exit early (let button handler deal with it)
+    // If we're NOT in the main task table, exit early (let the other tables
+    // and their buttons keep their own behaviour).
     if (!table) return;
     
     // Ignore clicks inside buttons OR interactive-button DIVs within the table
