@@ -7493,6 +7493,9 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
         const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
         const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
         const isDynamicStrategyEvent = traceName === 'Dynamic strategy entry' || traceName === 'Dynamic strategy exit';
+        // Dynamic event traces already carry their full, server-built reason
+        // hovertemplate. Do not overwrite it during a zoom/pan/toggle update.
+        if (isDynamicStrategyEvent && showHover && !oscillatorSyncInfo) return;
         // Main-pane entry/exit markers are candle information, not oscillator
         // information. Keep the two toggles independent even at an entry x.
         const isMainPane = !trace.yaxis || trace.yaxis === 'y';
@@ -7518,7 +7521,10 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
             const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
             hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
         }
-            window.Plotly.restyle(targetPlot, {hoverinfo: hoverinfo, hovertemplate: hovertemplate}, [index]);
+            const update = {};
+            if (hoverinfo !== null) update.hoverinfo = hoverinfo;
+            if (hovertemplate !== null) update.hovertemplate = hovertemplate;
+            if (Object.keys(update).length) window.Plotly.restyle(targetPlot, update, [index]);
         });
     }
     applyHoverVisibility(plot);
@@ -7694,19 +7700,22 @@ function(figure, oscillatorSyncInfo) {
 # the candle figure back to Python or changes the current zoom/pan ranges.
 clientside_callback(
     """
-function(relayoutData) {
+function(relayoutData, currentMeasureMode) {
     if (!relayoutData || !Object.prototype.hasOwnProperty.call(relayoutData, 'dragmode')) {
         return window.dash_clientside.no_update;
     }
-    if (relayoutData.dragmode === 'drawrect') return true;
+    if (relayoutData.dragmode === 'drawrect') {
+        return currentMeasureMode ? window.dash_clientside.no_update : true;
+    }
     // Pan, zoom, select and lasso are all non-measure Plotly interactions.
     // Treat every one as leaving Measure so the button never says Measuring
     // while another modebar tool owns the drag gesture.
-    return false;
+    return currentMeasureMode ? false : window.dash_clientside.no_update;
 }
 """,
     Output("measure-mode-store", "data", allow_duplicate=True),
     Input("task-chart", "relayoutData"),
+    State("measure-mode-store", "data"),
     prevent_initial_call=True,
 )
 
@@ -8561,7 +8570,6 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                 entry_price = active_event.get("entry_price")
                 exit_price = active_event.get("exit_price")
                 event_label = active_event.get("label") or active_event.get("category") or "Dynamic strategy event"
-                nav_label = f"{event_index + 1}/{len(events)}"
                 direction_label = str(active_event.get("direction") or "").upper()
                 exit_reason = str(active_event.get("exit_reason") or "open")
                 exit_reason_label = {
@@ -8590,7 +8598,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     entry_dt = ms_to_utc_datetime(float(entry_time))
                     fig.add_trace(go.Scatter(
                         x=[entry_dt], y=[float(entry_price)], mode='markers+text',
-                        text=[f"ENTRY {direction_label} {nav_label}".strip()], textposition='top center',
+                        text=[f"ENTRY {direction_label}".strip()], textposition='top center',
                         marker=dict(size=14, color='#00c853', symbol='triangle-up', line=dict(width=2, color='white')),
                         name='Dynamic strategy entry', showlegend=False,
                         hovertemplate=(f"<b>{event_label}</b><br>Entry {direction_label or 'trade'}: %{{y:.6g}}"
@@ -8604,7 +8612,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     ), row=1, col=1)
                 if exit_time is not None and exit_price is not None:
                     exit_dt = ms_to_utc_datetime(float(exit_time))
-                    exit_text = (f"TP CHECKPOINT {nav_label}" if is_tp_checkpoint
+                    exit_text = ("TP CHECKPOINT" if is_tp_checkpoint
                                  else f"EXIT {exit_reason_label}: {return_text}")
                     exit_color = '#ff9800' if is_tp_checkpoint else ('#00c853' if return_text.startswith('+') else '#d50000')
                     exit_hover = (f"{event_label}<br>TP checkpoint: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}"
