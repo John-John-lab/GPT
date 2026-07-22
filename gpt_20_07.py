@@ -3258,7 +3258,7 @@ const chartToggleStores = {
     'toggle-measure-oscillator-range-btn': ['measure-oscillator-range-store', false],
     'toggle-measure-anchor-btn': ['measure-anchor-store', false],
     'toggle-measure-hover-btn': ['measure-hover-store', true],
-    'toggle-impulses-btn': ['impulse-visible-store', true],
+    'toggle-impulses-btn': ['impulse-visible-store', false],
     'toggle-events-btn': ['events-visible-store', false],
     'toggle-measure-btn': ['measure-mode-store', false]
 };
@@ -3799,7 +3799,7 @@ def build_root_layout():
     dcc.Store(id="strategy-details-task-id", data=None),
     dcc.Store(id="details-click-store", data={}),   # deduplication for details button
     # --------------------------------
-    dcc.Store(id="impulse-visible-store", data=True),
+    dcc.Store(id="impulse-visible-store", data=False),
     dcc.Store(id="events-visible-store", data=False),
     dcc.Store(id="impulse-params-store", data={}),
     # 🔧 CRITICAL: Hidden dummy buttons for CustomEvent-triggered callbacks (using html.Button which supports n_clicks)
@@ -4083,7 +4083,7 @@ def build_root_layout():
                                 "minWidth": "82px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("Impulses: On", id="toggle-impulses-btn", style={
+                            html.Button("Impulses: Off", id="toggle-impulses-btn", style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
