@@ -9802,7 +9802,9 @@ def build_oscillator_reversal_source_uncached(task):
     df_sorted["stoch_k_14_1_3"], df_sorted["stoch_d_14_1_3"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 14, 1, 3)
     df_sorted["stoch_k_40_1_4"], df_sorted["stoch_d_40_1_4"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 40, 1, 4)
     df_sorted["stoch_k_60_1_10"], df_sorted["stoch_d_60_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 60, 1, 10)
-    df_sorted["stoch_k_300_1_10"], df_sorted["stoch_d_300_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 10, 1)
+    # Keep calculation parameters aligned with the public column/UI name:
+    # Stoch 300/1/10 means %K length 300, %D length 1, smoothing 10.
+    df_sorted["stoch_k_300_1_10"], df_sorted["stoch_d_300_1_10"] = compute_dynamic_stochastic_series(df_sorted["high"], df_sorted["low"], df_sorted["close"], 300, 1, 10)
     df_sorted["rsi_14_14"] = compute_dynamic_rsi_series(df_sorted["close"], 14).rolling(window=14, min_periods=1).mean()
 
     search_idx = df_sorted["timestamp"].searchsorted(float(task.signal_time), side="right")
