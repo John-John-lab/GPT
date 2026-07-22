@@ -7467,6 +7467,10 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
     if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
         window.__taskChartMeasureShapes = [];
+        // Measurements belong to one coin/timeframe. Remove the previous
+        // chart's DOM labels and oscillator highlights immediately instead of
+        // waiting for a new rectangle to be drawn on the next/previous chart.
+        root.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
     }
     window.__taskChartMeasureTaskId = figureTaskId;
     const savedMeasureShapes = window.__taskChartMeasureShapes || [];
