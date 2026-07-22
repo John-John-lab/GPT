@@ -3088,7 +3088,7 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_cal
 
 # Dash 4 can intermittently fail to resolve dynamically generated inline
 # clientside callback functions after a hot reload ("undefined.apply" in the
-# renderer).  The chart's essential controls already have direct DOM handlers,
+# renderer). The UI toggle and measurement mode paths have direct DOM handlers,
 # so keep those fragile callback registrations opt-in until the deployed Dash
 # version provides a stable clientside-function registry.
 INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED = os.environ.get("GPT_ENABLE_INLINE_DASH_CALLBACKS", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -3299,7 +3299,9 @@ Object.keys(chartToggleStores).forEach(function(buttonId) {
 function deactivateMeasureForChartAction() {
     if (!chartToggleState['toggle-measure-btn']) return;
     chartToggleState['toggle-measure-btn'] = false;
-    window.dash_clientside.set_props('measure-mode-store', {data: false});
+    if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
+        window.dash_clientside.set_props('measure-mode-store', {data: false});
+    }
     const measureButton = document.getElementById('toggle-measure-btn');
     if (measureButton) {
         measureButton.textContent = '📐 Measure';
@@ -3567,7 +3569,9 @@ document.addEventListener('click', function(e) {
             window.Plotly.relayout(plot, {shapes: (plot.layout.shapes || []).slice(0, keep)});
             window.__taskChartMeasureShapes = [];
         }
-        chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+        if (chartRoot) {
+            chartRoot.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+        }
         return;
     }
 
@@ -3656,7 +3660,9 @@ document.addEventListener('click', function(e) {
 // Backspace removes the newest user-drawn rectangle while preserving figure
 // shapes (notably the yellow Signal Level). Do not intercept text editing.
 document.addEventListener('keydown', function(e) {
-    if ((e.key !== 'Backspace' && e.key !== 'Delete') || e.target.matches('input, textarea, [contenteditable="true"]')) return;
+    const target = e.target;
+    const editingText = target && typeof target.matches === 'function' && target.matches('input, textarea, [contenteditable="true"]');
+    if ((e.key !== 'Backspace' && e.key !== 'Delete') || editingText) return;
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     const shapes = plot && plot.layout ? (plot.layout.shapes || []) : [];
