@@ -3088,10 +3088,11 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_cal
 
 # Dash 4 can intermittently fail to resolve dynamically generated inline
 # clientside callback functions after a hot reload ("undefined.apply" in the
-# renderer). The UI toggle and measurement mode paths have direct DOM handlers,
-# so keep those fragile callback registrations opt-in until the deployed Dash
-# version provides a stable clientside-function registry.
-INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED = os.environ.get("GPT_ENABLE_INLINE_DASH_CALLBACKS", "0").strip().lower() in {"1", "true", "yes", "on"}
+# renderer). Keep the chart's clientside behavior enabled by default because
+# Osc All, crosshair synchronization, and view retention depend on it. A
+# deployment affected by that Dash runtime bug can explicitly set
+# GPT_ENABLE_INLINE_DASH_CALLBACKS=0 as a safe fallback.
+INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED = os.environ.get("GPT_ENABLE_INLINE_DASH_CALLBACKS", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 def register_browser_callback(*args, **kwargs):
     if INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED:
