@@ -7492,6 +7492,7 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
         const traceName = trace.name ? String(trace.name) : '';
         const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
         const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
+        const isDynamicStrategyEvent = traceName === 'Dynamic strategy entry' || traceName === 'Dynamic strategy exit';
         // Main-pane entry/exit markers are candle information, not oscillator
         // information. Keep the two toggles independent even at an entry x.
         const isMainPane = !trace.yaxis || trace.yaxis === 'y';
@@ -7503,7 +7504,7 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
             // The dark gray crosshair already shows time. Suppress this
             // transparent helper's duplicate white timestamp tooltip.
             hoverinfo = 'skip';
-        } else if (isMainPane && (!candleInfo || oscillatorSyncInfo)) {
+        } else if (isMainPane && (oscillatorSyncInfo || (!candleInfo && !isDynamicStrategyEvent))) {
             hoverinfo = 'skip';
         } else if (!isMainPane && !(oscillatorInfo || oscillatorSyncInfo)) {
             hoverinfo = 'skip';
@@ -8574,6 +8575,16 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     return_text = f"{float(return_pct):+.2f}%"
                 except (TypeError, ValueError):
                     return_text = "n/a"
+                entry_conditions = str(active_event.get("entry_conditions") or "oscillator confirmation")
+                entry_window = active_event.get("entry_condition_window")
+                entry_execution = str(active_event.get("entry_execution") or "entry after confirmation")
+                try:
+                    entry_distance_text = f"{float(active_event.get('entry_level_distance_pct')):.2f}% from level"
+                except (TypeError, ValueError):
+                    entry_distance_text = "level distance n/a"
+                entry_reason = (f"Level condition reached; {entry_conditions}; "
+                                f"window={entry_window or 1} candle(s); {entry_execution}; {entry_distance_text}")
+                exit_conditions = str(active_event.get("exit_conditions") or exit_reason_label)
                 is_tp_checkpoint = str(active_event.get("category") or "").startswith("tp_")
                 if entry_time is not None and entry_price is not None:
                     entry_dt = ms_to_utc_datetime(float(entry_time))
@@ -8582,7 +8593,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                         text=[f"ENTRY {direction_label} {nav_label}".strip()], textposition='top center',
                         marker=dict(size=14, color='#00c853', symbol='triangle-up', line=dict(width=2, color='white')),
                         name='Dynamic strategy entry', showlegend=False,
-                        hovertemplate=f"{event_label}<br>Entry {direction_label or 'trade'}: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                        hovertemplate=(f"<b>{event_label}</b><br>Entry {direction_label or 'trade'}: %{{y:.6g}}"
+                                       f"<br>Why entered: {entry_reason}"
+                                       f"<br>Time: %{{x|%Y-%m-%d %H:%M}}<extra></extra>")
                     ), row=1, col=1)
                     fig.add_trace(go.Scatter(
                         x=[entry_dt, entry_dt], y=[y_min, y_max], mode='lines',
@@ -8596,7 +8609,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
                     exit_color = '#ff9800' if is_tp_checkpoint else ('#00c853' if return_text.startswith('+') else '#d50000')
                     exit_hover = (f"{event_label}<br>TP checkpoint: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}"
                                   if is_tp_checkpoint else
-                                  f"{event_label}<br>Exit reason: {exit_reason_label}<br>Return: {return_text}<br>Exit: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}")
+                                  f"<b>{event_label}</b><br>Exit reason: {exit_reason_label}"
+                                  f"<br>Why exited: {exit_conditions}<br>Return: {return_text}"
+                                  f"<br>Exit: %{{y:.6g}}<br>Time: %{{x|%Y-%m-%d %H:%M}}")
                     fig.add_trace(go.Scatter(
                         x=[exit_dt], y=[float(exit_price)], mode='markers+text',
                         text=[exit_text], textposition='bottom center',
@@ -9687,6 +9702,8 @@ def build_oscillator_reversal_path_from_source(source, oscillator_specs, entry_c
         "oscillator_idx": oscillator_idx,
         "entry_execution": "signal_candle_close_next_candle_path",
         "toward_direction": source.get("toward_direction"),
+        "entry_conditions": format_oscillator_specs(selected_specs),
+        "entry_condition_window": int(entry_condition_window or 1),
     }
 
 
@@ -9710,7 +9727,7 @@ def bucket_stochastic_exit_return(return_pct):
     return "Profit 4%+"
 
 
-def build_chart_event_record(path, result, category, label):
+def build_chart_event_record(path, result, category, label, oscillator_exit_specs=None):
     """Build a chart navigation event for oscillator research result rows."""
     if not path or not result or not path.get("task_id"):
         return None
@@ -9730,6 +9747,20 @@ def build_chart_event_record(path, result, category, label):
     exit_time = None
     if exit_idx is not None and timestamps is not None and 0 <= int(exit_idx) < len(timestamps):
         exit_time = float(timestamps[int(exit_idx)])
+    exit_reason = result.get("exit_reason")
+    if exit_reason == "oscillator_close":
+        exit_conditions = format_oscillator_specs(select_exit_oscillator_specs(path, oscillator_exit_specs))
+    elif exit_reason == "stop":
+        stop_return = result.get("stop_return_pct")
+        try:
+            exit_conditions = ("Original stop loss" if result.get("initial_stop_hit")
+                               else f"Moved/trailing stop locked at {float(stop_return):+.2f}%")
+        except (TypeError, ValueError):
+            exit_conditions = "Original or moved stop loss"
+    elif exit_reason == "max_adverse_dd":
+        exit_conditions = "Maximum adverse drawdown cap reached"
+    else:
+        exit_conditions = "No completed exit / checkpoint only"
     return {
         "task_id": path.get("task_id"),
         "category": category,
@@ -9739,7 +9770,13 @@ def build_chart_event_record(path, result, category, label):
         "entry_price": path.get("entry_price"),
         "exit_time": exit_time,
         "exit_price": exit_price,
-        "exit_reason": result.get("exit_reason"),
+        "entry_conditions": path.get("entry_conditions"),
+        "entry_condition_window": path.get("entry_condition_window"),
+        "entry_execution": path.get("entry_execution"),
+        "entry_level_distance_pct": path.get("entry_level_distance_pct"),
+        "exit_reason": exit_reason,
+        "exit_conditions": exit_conditions,
+        "stop_return_pct": result.get("stop_return_pct"),
         "return_pct": result.get("exit_return_pct"),
     }
 
@@ -9804,7 +9841,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
         if not result or not result.get("valid"):
             continue
         if result.get("initial_stop_hit"):
-            event = build_chart_event_record(path, result, "original_sl", "Original SL exit")
+            event = build_chart_event_record(path, result, "original_sl", "Original SL exit", oscillator_exit_specs)
             if event:
                 event_groups["original_sl"].append(event)
         if result.get("stop_hit") and result.get("stop_return_pct") is not None:
@@ -9813,11 +9850,11 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
             stop_category = f"stop_exec_{stop_key_value}"
             stop_label = ("Original SL" if result.get("initial_stop_hit") else "Moved stop") + f" executed at {stop_return_pct:g}% return"
             stop_execution_levels[stop_category] = stop_return_pct
-            event = build_chart_event_record(path, result, stop_category, stop_label)
+            event = build_chart_event_record(path, result, stop_category, stop_label, oscillator_exit_specs)
             if event:
                 event_groups.setdefault(stop_category, []).append(event)
         if result.get("oscillator_exit_hit"):
-            event = build_chart_event_record(path, result, "stochastic_close", "Stochastic close")
+            event = build_chart_event_record(path, result, "stochastic_close", "Stochastic close", oscillator_exit_specs)
             if event:
                 event_groups["stochastic_close"].append(event)
                 bucket = bucket_stochastic_exit_return(result.get("exit_return_pct"))
@@ -9825,7 +9862,7 @@ def build_oscillator_reversal_summary_table(tasks, oscillator_specs, stop_loss_p
                     event_groups.setdefault(f"stoch_bucket_{bucket}", []).append(dict(event, category=f"stoch_bucket_{bucket}", label=bucket))
         for level in tp_levels:
             if level in result.get("tp_hits", set()):
-                event = build_chart_event_record(path, result, f"tp_{level:g}", f"TP {fmt_dynamic_level_label(level)} checkpoint")
+                event = build_chart_event_record(path, result, f"tp_{level:g}", f"TP {fmt_dynamic_level_label(level)} checkpoint", oscillator_exit_specs)
                 if event:
                     event_groups[f"tp_{level:g}"].append(event)
 
