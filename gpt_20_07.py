@@ -3352,7 +3352,20 @@ function applyChartToggleImmediately(button) {
             window.Plotly.relayout(plot, {dragmode: active ? 'drawrect' : 'pan'});
         }
     }
-    if (button.id === 'toggle-chart-info-box-btn') button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
+    if (button.id === 'toggle-chart-info-box-btn') {
+        button.textContent = active ? 'Candle Info: On' : 'Candle Info: Off';
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (plot && window.Plotly) {
+            (plot.data || []).forEach(function(trace, index) {
+                if (!trace || trace.type !== 'candlestick') return;
+                window.Plotly.restyle(plot, {
+                    hoverinfo: active ? 'all' : 'skip',
+                    hovertemplate: active ? '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>' : null
+                }, [index]);
+            });
+        }
+    }
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
     if (button.id === 'toggle-oscillator-sync-info-btn') button.textContent = active ? 'Osc All: On' : 'Osc All: Off';
     if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
@@ -8344,12 +8357,15 @@ def apply_chart_view_state_to_figure(fig, view_state, task_id):
     Input("events-visible-store", "data"),
     Input("chart-event-context-store", "data"),
     Input("chart-focus-entry-store", "data"),
+    # Candle Info is a rendering input, not only clientside state. Keeping it
+    # as an Input ensures Candle Info: Off is authoritative even when the
+    # optional inline Dash callbacks are disabled for renderer compatibility.
+    Input("chart-info-box-store", "data"),
     State("chart-view-state-store", "data"),
     State("measure-mode-store", "data"),
-    State("chart-info-box-store", "data"),
     prevent_initial_call=True
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, chart_view_state, measure_mode, candle_info_enabled):
+def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, candle_info_enabled, chart_view_state, measure_mode):
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
@@ -8443,11 +8459,14 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
             hoverinfo='all' if candle_info_enabled else 'skip',
+            # Plotly applies hovertemplate ahead of hoverinfo for some OHLC
+            # bundles. Remove it entirely when Candle Info is off; otherwise
+            # older Plotly/Dash combinations can still show an OHLC box.
             hovertemplate=(
                 "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
                 "Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}"
                 "<extra></extra>"
-            )
+            ) if candle_info_enabled else None
         ), row=1, col=1)
         # Keep the invisible close-price helper in every figure.  This makes
         # Snap a capture-only preference rather than a reason to rebuild a
