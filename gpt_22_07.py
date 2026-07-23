@@ -3338,9 +3338,10 @@ const chartToggleStores = {
     'toggle-events-btn': ['events-visible-store', false],
     'toggle-measure-btn': ['measure-mode-store', false]
 };
-// Toolbar state is written by a normal Dash callback below. This avoids
-// relying on set_props on Dash renderers where inline callbacks are disabled.
-window.__chartToolbarUsesServerCallbacks = true;
+// Dash 4 exposes set_props even when dynamically registered clientside callbacks
+// are disabled. Use it for immediate Store writes; a capture listener stops the
+// native button event so the server fallback cannot toggle the Store twice.
+window.__chartToolbarUsesServerCallbacks = false;
 const chartToggleState = {};
 function traceUi(message, details) {
     const text = new Date().toLocaleTimeString() + ' | ' + message + (details ? ' | ' + JSON.stringify(details) : '');
@@ -3359,6 +3360,7 @@ function applyLocalToolbarInteraction(button) {
     if (!button || !chartToggleStores[button.id]) return;
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
+    button.__gptOptimisticActive = active;
     // The server remains authoritative for chart panes. Update the control
     // immediately so a request queued behind a large Dash update is visible
     // to the user instead of looking like a lost click.
@@ -3428,18 +3430,27 @@ function applyChartToggleImmediately(button) {
     if (!config || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') {
         return false;
     }
-    const label = String(button.textContent || '');
-    if (button.id === 'toggle-measure-btn') chartToggleState[button.id] = label.indexOf('Measuring') >= 0;
-    if (button.id === 'toggle-measure-anchor-btn') chartToggleState[button.id] = label.indexOf('Snap: On') >= 0;
-    if (button.id === 'toggle-measure-hover-btn') chartToggleState[button.id] = label.indexOf('Hover: On') >= 0;
-    if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
-    if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
-    if (button.id === 'toggle-oscillator-sync-info-btn') chartToggleState[button.id] = label.indexOf('Osc All: On') >= 0;
-    if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
-    if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
-    if (button.id === 'toggle-measure-oscillator-range-btn') chartToggleState[button.id] = label.indexOf('Osc Range: On') >= 0;
-    if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
-    const active = !Boolean(chartToggleState[button.id]);
+    const optimisticActive = button.__gptOptimisticActive;
+    let active;
+    if (typeof optimisticActive === 'boolean') {
+        // applyLocalToolbarInteraction already changed the control appearance.
+        // Reuse that value instead of inverting it a second time.
+        active = optimisticActive;
+        delete button.__gptOptimisticActive;
+    } else {
+        const label = String(button.textContent || '');
+        if (button.id === 'toggle-measure-btn') chartToggleState[button.id] = label.indexOf('Measuring') >= 0;
+        if (button.id === 'toggle-measure-anchor-btn') chartToggleState[button.id] = label.indexOf('Snap: On') >= 0;
+        if (button.id === 'toggle-measure-hover-btn') chartToggleState[button.id] = label.indexOf('Hover: On') >= 0;
+        if (button.id === 'toggle-chart-info-box-btn') chartToggleState[button.id] = label.indexOf('Candle Info: On') >= 0;
+        if (button.id === 'toggle-oscillator-info-box-btn') chartToggleState[button.id] = label.indexOf('Osc Info: On') >= 0;
+        if (button.id === 'toggle-oscillator-sync-info-btn') chartToggleState[button.id] = label.indexOf('Osc All: On') >= 0;
+        if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
+        if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
+        if (button.id === 'toggle-measure-oscillator-range-btn') chartToggleState[button.id] = label.indexOf('Osc Range: On') >= 0;
+        if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
+        active = !Boolean(chartToggleState[button.id]);
+    }
     chartToggleState[button.id] = active;
     window.dash_clientside.set_props(config[0], {data: active});
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
@@ -3723,7 +3734,27 @@ function showNativeMeasureResultAfterMouseup() {
     }, 80);
 }
 document.addEventListener('mouseup', showNativeMeasureResultAfterMouseup, true);
-// Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
+function openTableChartImmediately(button) {
+    const rawId = String((button && button.id) || '');
+    if (!rawId.startsWith('{') || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+    try {
+        const id = JSON.parse(rawId);
+        if (id.type !== 'task-table-chart' || !id.task_id) return false;
+        const taskId = String(id.task_id);
+        window.dash_clientside.set_props('chart-task-id', {data: taskId});
+        window.dash_clientside.set_props('chart-click-store', {data: {[taskId + '_chart']: Date.now() / 1000}});
+        window.dash_clientside.set_props('chart-event-context-store', {data: {source: 'main_table', events: [], index: 0, overlay: true}});
+        traceUi('local chart open', {taskId: taskId});
+        return true;
+    } catch (error) {
+        console.error('Immediate table chart open failed:', error);
+        return false;
+    }
+}
+// Capture phase lets direct Store updates reach Dash before React queues the
+// native n_click callback. If set_props is unavailable, normal bubbling keeps
+// the server fallback fully functional.
+// Existing button feedback - supports both BUTTON and DIV elements.
 document.addEventListener('click', function(e) {
     let target = e.target;
     
@@ -3737,6 +3768,11 @@ document.addEventListener('click', function(e) {
     
     if (!button) return;
     traceUi('button click', {id: button.id, action: button.getAttribute('data-action')});
+    if (openTableChartImmediately(button)) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+    }
     applyLocalToolbarInteraction(button);
 
     // Indicator, overlay and range controls replace/reposition the figure.
@@ -3747,7 +3783,11 @@ document.addEventListener('click', function(e) {
     // These are pure UI Store toggles. Updating through set_props avoids a
     // registered clientside callback lookup, which older Dash renderers can
     // fail with "undefined (reading apply)" after hot reloads/cache changes.
-    if (applyChartToggleImmediately(button)) return;
+    if (applyChartToggleImmediately(button)) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+    }
 
     if (button.id === 'clear-measure-btn') {
         const chartRoot = document.getElementById('task-chart');
