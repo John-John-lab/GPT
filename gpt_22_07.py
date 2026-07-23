@@ -3387,6 +3387,34 @@ traceUi('page script initialized', {loaded: window.__gptIndexScriptLoaded});
 function markChartRenderRequested(kind) {
     window.__gptChartRenderRequest = {kind: kind, startedAt: performance.now()};
 }
+function installDashChartNetworkTrace() {
+    if (window.__gptDashChartFetchTraceInstalled || typeof window.fetch !== 'function') return;
+    window.__gptDashChartFetchTraceInstalled = true;
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = function(input, init) {
+        const url = typeof input === 'string' ? input : String((input && input.url) || '');
+        let output = '';
+        try {
+            const body = init && init.body;
+            if (typeof body === 'string') output = String((JSON.parse(body) || {}).output || '');
+        } catch (_) {
+            // Diagnostics must never interfere with Dash's request path.
+        }
+        const isChartFigure = url.indexOf('/_dash-update-component') >= 0 && output.indexOf('task-chart.figure') >= 0;
+        const startedAt = isChartFigure ? performance.now() : 0;
+        if (isChartFigure) traceUi('chart Dash request sent', {kind: (window.__gptChartRenderRequest || {}).kind || 'external'});
+        return originalFetch(input, init).then(function(response) {
+            if (isChartFigure) {
+                traceUi('chart Dash response received', {
+                    elapsed_ms: Math.round(performance.now() - startedAt),
+                    bytes: response.headers.get('content-length') || 'chunked'
+                });
+            }
+            return response;
+        });
+    };
+}
+installDashChartNetworkTrace();
 function installChartBrowserRenderTrace() {
     function attach() {
         const root = document.getElementById('task-chart');
@@ -9097,7 +9125,18 @@ def load_chart_task_window(task):
         end_ms = get_chart_file_end_timestamp(file_path)
         if end_ms is None or end_ms < start_ms:
             return None
+    # Record whether the exact mtime-aware range is already warm before the
+    # read. This gives diagnostics a concrete cache hit/miss answer without
+    # changing the cache or any chart data.
+    try:
+        stat = os.stat(file_path)
+        cache_key = (file_path, stat.st_mtime_ns, stat.st_size, start_ms, end_ms)
+        cache_hit = cache_key in chart_parquet_cache
+    except OSError:
+        cache_hit = False
+    source_read_started = time.perf_counter()
     df_source = read_chart_parquet_cached(file_path, start_ms, end_ms)
+    source_read_ms = round((time.perf_counter() - source_read_started) * 1000)
     if df_source.empty:
         return None
     # Keep the defensive inclusive slice used by the original callback.
@@ -9111,6 +9150,9 @@ def load_chart_task_window(task):
         "start_ms": start_ms,
         "end_ms": end_ms,
         "df": df,
+        "cache_hit": cache_hit,
+        "source_read_ms": source_read_ms,
+        "source_rows": len(df_source),
     }
 
 
@@ -9297,6 +9339,12 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     if not chart_window:
         timer.check("Task window unavailable").end()
         return go.Figure()
+    interaction_trace(
+        "chart data "
+        f"cache={'hit' if chart_window.get('cache_hit') else 'miss'} "
+        f"read_ms={chart_window.get('source_read_ms')} "
+        f"source_rows={chart_window.get('source_rows')} window_rows={len(chart_window['df'])}"
+    )
     timer.check("Load task window")
     sym = chart_window["symbol"]
     fp = chart_window["file_path"]
