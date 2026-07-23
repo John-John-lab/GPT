@@ -3247,7 +3247,26 @@ th {
 {%scripts%}
 {%renderer%}
 <script>
+// Keep this tiny diagnostic listener first. If later chart helper code throws,
+// it still proves whether the page shell script reached the browser at all.
 window.__gptIndexScriptLoaded = Date.now();
+window.__gptEarlyBrowserTrace = [];
+window.__gptEarlyTrace = function(message) {
+    const line = new Date().toLocaleTimeString() + ' | EARLY | ' + message;
+    window.__gptEarlyBrowserTrace.push(line);
+    const panel = document.getElementById('ui-client-trace-output');
+    if (panel) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\n');
+};
+window.__gptEarlyTrace('page shell script loaded');
+document.addEventListener('click', function(event) {
+    const target = event.target;
+    const id = target && target.closest ? (target.closest('button, th, td') || {}).id : '';
+    window.__gptEarlyTrace('capture click target=' + (target && target.tagName ? target.tagName : '?') + ' id=' + (id || '-'));
+}, true);
+window.setInterval(function() {
+    const panel = document.getElementById('ui-client-trace-output');
+    if (panel && window.__gptEarlyBrowserTrace.length) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\n');
+}, 500);
 // Global store for hidden columns (by zero-based column index)
 let hiddenColumns = new Set();
 // Function to apply hidden column classes to the current table
