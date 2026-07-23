@@ -7491,6 +7491,13 @@ def auto_throttle_updates(_):
 def set_chart_task_id(trigger_data, _table_chart_clicks, click_store):
     triggered = ctx.triggered_id
     if isinstance(triggered, dict) and triggered.get("type") == "task-table-chart":
+        # Pattern-matching inputs can fire with n_clicks=0 when Dash inserts a
+        # freshly rendered page of table rows. That is not a user click; without
+        # this guard the first rendered task opens itself and queues stale charts.
+        trigger_value = (ctx.triggered[0].get("value") if ctx.triggered else None)
+        if not trigger_value:
+            interaction_trace(f"ignored initial table chart input task={triggered.get('task_id')}")
+            return no_update, no_update, no_update
         task_id = triggered.get("task_id")
     elif triggered == "chart-button-trigger" and trigger_data and trigger_data.get("action") == "chart":
         task_id = trigger_data.get("task_id")
