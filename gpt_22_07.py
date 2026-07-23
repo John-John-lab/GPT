@@ -3385,7 +3385,7 @@ function traceUi(message, details) {
 }
 traceUi('page script initialized', {loaded: window.__gptIndexScriptLoaded});
 function markChartRenderRequested(kind) {
-    window.__gptChartRenderRequest = {kind: kind, startedAt: performance.now()};
+    window.__gptChartRenderRequest = {kind: kind, startedAt: performance.now(), responseReceived: false};
 }
 function installDashChartNetworkTrace() {
     if (window.__gptDashChartFetchTraceInstalled || typeof window.fetch !== 'function') return;
@@ -3405,6 +3405,11 @@ function installDashChartNetworkTrace() {
         if (isChartFigure) traceUi('chart Dash request sent', {kind: (window.__gptChartRenderRequest || {}).kind || 'external'});
         return originalFetch(input, init).then(function(response) {
             if (isChartFigure) {
+                const activeRequest = window.__gptChartRenderRequest;
+                if (activeRequest) {
+                    activeRequest.responseReceived = true;
+                    activeRequest.responseReceivedAt = performance.now();
+                }
                 traceUi('chart Dash response received', {
                     elapsed_ms: Math.round(performance.now() - startedAt),
                     bytes: response.headers.get('content-length') || 'chunked'
@@ -3423,6 +3428,10 @@ function installChartBrowserRenderTrace() {
         plot.__gptBrowserRenderTraceInstalled = true;
         plot.on('plotly_afterplot', function() {
             const request = window.__gptChartRenderRequest;
+            // Local relayouts (for example Measure mode) can emit afterplot
+            // before Dash has returned the replacement figure. Do not consume
+            // the click marker until the matching figure response is received.
+            if (request && !request.responseReceived) return;
             const elapsedMs = request ? Math.round(performance.now() - request.startedAt) : null;
             // A figure may emit more than one afterplot event while Plotly
             // settles its layout. Report the first paint for this request.
