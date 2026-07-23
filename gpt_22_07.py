@@ -3247,6 +3247,7 @@ th {
 {%scripts%}
 {%renderer%}
 <script>
+window.__gptIndexScriptLoaded = Date.now();
 // Global store for hidden columns (by zero-based column index)
 let hiddenColumns = new Set();
 // Function to apply hidden column classes to the current table
@@ -3315,10 +3316,18 @@ const chartToggleStores = {
 window.__chartToolbarUsesServerCallbacks = true;
 const chartToggleState = {};
 function traceUi(message, details) {
+    const text = new Date().toLocaleTimeString() + ' | ' + message + (details ? ' | ' + JSON.stringify(details) : '');
+    const panel = document.getElementById('ui-client-trace-output');
+    if (panel) {
+        const prior = String(panel.textContent || '').split('\n').filter(Boolean);
+        prior.push(text);
+        panel.textContent = prior.slice(-30).join('\n');
+    }
     if (window.localStorage && window.localStorage.getItem('gptTraceUi') === '1') {
         console.debug('[GPT UI TRACE]', message, details || '');
     }
 }
+traceUi('page script initialized', {loaded: window.__gptIndexScriptLoaded});
 function applyLocalToolbarInteraction(button) {
     if (!button || button.id !== 'toggle-measure-btn') return;
     const active = !Boolean(chartToggleState['toggle-measure-btn']);
@@ -4239,11 +4248,12 @@ def build_root_layout():
     html.Button(id="chart-event-dummy", style={"display": "none"}, n_clicks=0),
     html.Button(id="details-event-dummy", style={"display": "none"}, n_clicks=0),
     html.Button(id="impulse-event-dummy", style={"display": "none"}, n_clicks=0),
-    dcc.Interval(id="ui-trace-interval", interval=1000, n_intervals=0),
+    dcc.Interval(id="ui-trace-interval", interval=5000, n_intervals=0),
     html.Details([
         html.Summary("🩺 Chart diagnostics (click to open)", style={"cursor": "pointer", "fontWeight": "bold"}),
         html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events.", style={"fontSize": "12px", "margin": "6px 0"}),
-        html.Pre(id="ui-trace-output", children="No chart events yet.", style={"maxHeight": "180px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
+        html.Pre(id="ui-trace-output", children="No server chart events yet.", style={"maxHeight": "140px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
+        html.Pre(id="ui-client-trace-output", children="Browser click trace: waiting for page script.", style={"maxHeight": "100px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#102027", "color": "#b2ebf2", "padding": "8px", "fontSize": "11px", "borderRadius": "4px", "marginTop": "6px"}),
     ], style={"margin": "8px 0", "padding": "6px", "border": "1px solid #90a4ae", "borderRadius": "4px", "backgroundColor": "#f5f7f8"}),
     dcc.Tabs(id="main-tabs", value="tab-tasks", children=[
         dcc.Tab(label="Tasks", value="tab-tasks"),
