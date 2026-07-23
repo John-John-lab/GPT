@@ -3751,7 +3751,7 @@ document.addEventListener('click', function(e) {
             // P1 CRITICAL: Log errors instead of silently swallowing them
             console.error('Button click handler error:', e, 'Target:', button);
         }
-});
+}, true);
 // Backspace removes the newest user-drawn rectangle while preserving figure
 // shapes (notably the yellow Signal Level). Do not intercept text editing.
 document.addEventListener('keydown', function(e) {
@@ -3817,44 +3817,53 @@ function handleTaskTableClick(e) {
         }
     }
 }
-// Fallback for tables that are already present when the page script starts.
-document.addEventListener('click', handleTaskTableClick);
-
-function bindRenderedTaskTable(table) {
-    if (!table || table.dataset.taskTableClickBound === 'true') return;
-    table.dataset.taskTableClickBound = 'true';
-    // Dash/React may stop a bubbled event at its root. A listener on the table
-    // itself runs first and remains valid until this particular table is replaced.
+// Dash can stop bubbling at its React root. Bind the normal table-click
+// handler directly to every rendered HTML table, so summary and task tables
+// retain immediate highlighting after any component refresh.
+function bindRenderedTable(table) {
+    if (!table || table.dataset.tableClickBound === 'true') return;
+    table.dataset.tableClickBound = 'true';
     table.addEventListener('click', function(e) {
         handleTaskTableClick(e);
-        // Leave controls alone: Dash buttons and the legacy JS action controls
-        // still need to bubble to their own handlers. Only table-cell clicks
-        // are stopped after their local highlight handler has run.
-        if (!e.target.closest('button, .interactive-button')) e.stopPropagation();
+        // Do not interfere with Dash buttons or legacy action controls.
+        if (!e.target.closest('button, .interactive-button, a, input, select, textarea')) {
+            e.stopPropagation();
+        }
     });
 }
 
-function refreshRenderedTaskTable() {
-    const container = document.getElementById('task-table-container');
-    if (!container) return;
-    const table = container.querySelector('table');
-    if (!table) return;
-    bindRenderedTaskTable(table);
-    applyHiddenColumns();
+function bindTablesBelow(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.tagName === 'TABLE') bindRenderedTable(node);
+    if (node.querySelectorAll) node.querySelectorAll('table').forEach(bindRenderedTable);
 }
 
-function installTaskTableRenderListener() {
-    const container = document.getElementById('task-table-container');
-    if (!container || window.__taskTableRenderObserver) return;
-    window.__taskTableRenderObserver = new MutationObserver(refreshRenderedTaskTable);
-    window.__taskTableRenderObserver.observe(container, {childList: true, subtree: true});
-    refreshRenderedTaskTable();
+function installTableRenderListener() {
+    if (window.__tableRenderObserver || !document.body) return;
+    document.querySelectorAll('table').forEach(bindRenderedTable);
+    window.__tableRenderObserver = new MutationObserver(function(mutations) {
+        let tableAdded = false;
+        mutations.forEach(function(mutation) {
+            mutation.addedNodes.forEach(function(node) {
+                if (!node || node.nodeType !== 1) return;
+                tableAdded = tableAdded || node.tagName === 'TABLE' || Boolean(node.querySelector && node.querySelector('table'));
+                bindTablesBelow(node);
+            });
+        });
+        // Reapply hidden columns only after Dash actually replaced a table;
+        // Plotly and chart controls also mutate the page and must not trigger
+        // table work on every interaction.
+        if (tableAdded) applyHiddenColumns();
+    });
+    window.__tableRenderObserver.observe(document.body, {childList: true, subtree: true});
 }
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', installTaskTableRenderListener, {once: true});
+    document.addEventListener('DOMContentLoaded', installTableRenderListener, {once: true});
 } else {
-    installTaskTableRenderListener();
+    installTableRenderListener();
 }
+// Fallback for page layouts that are not observed yet.
+document.addEventListener('click', handleTaskTableClick);
 // Toggle column visibility on double-click of header (with highlight cleanup)
 document.addEventListener('dblclick', function(e) {
     let th = e.target.closest('th');
@@ -7292,7 +7301,14 @@ def set_chart_task_id(trigger_data, _table_chart_clicks, click_store):
     if current_time - float(click_store.get(key, 0) or 0) < 0.5:
         return no_update, no_update, no_update
     click_store[key] = current_time
-    prefetch_chart_neighbors(str(task_id))
+    # Discovering neighbours can walk the full task snapshot. Keep it off the
+    # click callback so the modal and figure callback are released immediately.
+    threading.Thread(
+        target=prefetch_chart_neighbors,
+        args=(str(task_id),),
+        name="ChartNeighbourPrefetch",
+        daemon=True,
+    ).start()
     return str(task_id), click_store, {"source": "main_table", "events": [], "index": 0, "overlay": False}
 
 # ----- Modal display callback -----
