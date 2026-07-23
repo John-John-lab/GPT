@@ -3356,6 +3356,36 @@ function traceUi(message, details) {
     }
 }
 traceUi('page script initialized', {loaded: window.__gptIndexScriptLoaded});
+function markChartRenderRequested(kind) {
+    window.__gptChartRenderRequest = {kind: kind, startedAt: performance.now()};
+}
+function installChartBrowserRenderTrace() {
+    function attach() {
+        const root = document.getElementById('task-chart');
+        const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+        if (!plot || !window.Plotly || plot.__gptBrowserRenderTraceInstalled || typeof plot.on !== 'function') return;
+        plot.__gptBrowserRenderTraceInstalled = true;
+        plot.on('plotly_afterplot', function() {
+            const request = window.__gptChartRenderRequest;
+            const elapsedMs = request ? Math.round(performance.now() - request.startedAt) : null;
+            // A figure may emit more than one afterplot event while Plotly
+            // settles its layout. Report the first paint for this request.
+            if (request) window.__gptChartRenderRequest = null;
+            window.requestAnimationFrame(function() {
+                traceUi('chart browser applied', {
+                    kind: request ? request.kind : 'external',
+                    elapsed_ms: elapsedMs,
+                    traces: (plot.data || []).length
+                });
+            });
+        });
+    }
+    attach();
+    // Dash replaces the Plotly DOM node after a figure update. The short,
+    // bounded poll only attaches an event listener and performs no rendering.
+    window.setInterval(attach, 500);
+}
+installChartBrowserRenderTrace();
 function applyLocalToolbarInteraction(button) {
     if (!button || !chartToggleStores[button.id]) return;
     const active = !Boolean(chartToggleState[button.id]);
@@ -3452,6 +3482,7 @@ function applyChartToggleImmediately(button) {
         active = !Boolean(chartToggleState[button.id]);
     }
     chartToggleState[button.id] = active;
+    markChartRenderRequested(button.id);
     window.dash_clientside.set_props(config[0], {data: active});
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
     const warm = button.id === 'toggle-chart-info-box-btn' || button.id === 'toggle-measure-hover-btn';
@@ -3741,6 +3772,7 @@ function openTableChartImmediately(button) {
         const id = JSON.parse(rawId);
         if (id.type !== 'task-table-chart' || !id.task_id) return false;
         const taskId = String(id.task_id);
+        markChartRenderRequested('main-table-chart');
         window.dash_clientside.set_props('chart-task-id', {data: taskId});
         window.dash_clientside.set_props('chart-click-store', {data: {[taskId + '_chart']: Date.now() / 1000}});
         window.dash_clientside.set_props('chart-event-context-store', {data: {source: 'main_table', events: [], index: 0, overlay: true}});
