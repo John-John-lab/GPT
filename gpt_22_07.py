@@ -4251,7 +4251,8 @@ def build_root_layout():
     dcc.Interval(id="ui-trace-interval", interval=5000, n_intervals=0),
     html.Details([
         html.Summary("🩺 Chart diagnostics (click to open)", style={"cursor": "pointer", "fontWeight": "bold"}),
-        html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events.", style={"fontSize": "12px", "margin": "6px 0"}),
+        html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events. The blue area is read-only; use the test button below to verify browser click tracing.", style={"fontSize": "12px", "margin": "6px 0"}),
+        html.Button("Test browser click tracing", id="ui-client-trace-test-btn", n_clicks=0, style={"fontSize": "12px", "marginBottom": "6px"}),
         html.Pre(id="ui-trace-output", children="No server chart events yet.", style={"maxHeight": "140px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
         html.Pre(id="ui-client-trace-output", children="Browser click trace: waiting for page script.", style={"maxHeight": "100px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#102027", "color": "#b2ebf2", "padding": "8px", "fontSize": "11px", "borderRadius": "4px", "marginTop": "6px"}),
     ], style={"margin": "8px 0", "padding": "6px", "border": "1px solid #90a4ae", "borderRadius": "4px", "backgroundColor": "#f5f7f8"}),
