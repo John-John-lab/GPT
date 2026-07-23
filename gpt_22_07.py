@@ -825,10 +825,10 @@ chart_task_indicator_cache = OrderedDict()
 # Warm one neighbouring range while the user studies the current chart. The
 # source cache is byte-bounded, so this is safe on older Macs and makes the
 # first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
-CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "0") == "1"
+CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
 # Let the foreground chart read claim an older SSD before optional neighbour
 # warm-up begins.  Set to 0 only on machines with fast storage.
-CHART_PREFETCH_DELAY_SECONDS = max(0.0, float(os.environ.get("GPT_CHART_PREFETCH_DELAY", "0.75")))
+CHART_PREFETCH_DELAY_SECONDS = max(0.0, float(os.environ.get("GPT_CHART_PREFETCH_DELAY", "2.0")))
 chart_prefetch_pending = set()
 chart_prefetch_lock = threading.Lock()
 
@@ -3846,6 +3846,8 @@ document.addEventListener('click', function(e) {
         return;
     }
     if (button.id === 'prev-chart-btn' || button.id === 'next-chart-btn') {
+        markChartRenderRequested(button.id);
+        traceUi('chart navigation requested', {direction: button.id === 'prev-chart-btn' ? 'previous' : 'next'});
         highlightAdjacentVisibleChartRow(button.id === 'prev-chart-btn' ? 'prev' : 'next');
         return;
     }
@@ -7563,6 +7565,7 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
         warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
         if 0 <= warm_idx < len(events):
             prefetch_chart_source_async(tm.get_task(str(events[warm_idx].get("task_id") or "")))
+        interaction_trace(f"chart navigation target={target_id} direction={triggered} source=event_context")
         return target_id, no_update, {f"{target_id}_chart": time.time()}, updated_context, carry_chart_view_state_to_task(chart_view_state, target_id)
 
     _, chartable = get_chartable_tasks_for_navigation()
@@ -7582,6 +7585,7 @@ def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context
     warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
     if 0 <= warm_idx < len(chartable):
         prefetch_chart_source_async(chartable[warm_idx])
+    interaction_trace(f"chart navigation target={target_id} direction={triggered} source=main_table")
     return target_id, no_update, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
 register_browser_callback(
@@ -7669,6 +7673,16 @@ def set_chart_task_id(trigger_data, _table_chart_clicks, click_store):
 )
 def sync_chart_request(task_id, event_context):
     """Publish one source-aware request without changing existing chart inputs."""
+    # The direct browser chart-open path intentionally bypasses the legacy
+    # n_click callback. Schedule the same optional neighbour warm-up here so
+    # main-table opens and Next/Previous navigation share one cache strategy.
+    if task_id:
+        threading.Thread(
+            target=prefetch_chart_neighbors,
+            args=(str(task_id),),
+            name="ChartRequestPrefetch",
+            daemon=True,
+        ).start()
     return make_chart_request(task_id, event_context)
 
 def sync_chart_ui_state(*values):
