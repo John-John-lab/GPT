@@ -3289,6 +3289,9 @@ const chartToggleStores = {
     'toggle-events-btn': ['events-visible-store', false],
     'toggle-measure-btn': ['measure-mode-store', false]
 };
+// Toolbar state is written by a normal Dash callback below. This avoids
+// relying on set_props on Dash renderers where inline callbacks are disabled.
+window.__chartToolbarUsesServerCallbacks = true;
 const chartToggleState = {};
 const chartToggleLabels = {
     'toggle-rsi-btn': 'RSI',
@@ -3332,6 +3335,7 @@ function deactivateMeasureForChartAction() {
     }
 }
 function applyChartToggleImmediately(button) {
+    if (window.__chartToolbarUsesServerCallbacks) return false;
     const config = chartToggleStores[button.id];
     if (!config || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') {
         return false;
@@ -7588,6 +7592,49 @@ def update_chart_event_marks_button(event_context):
         "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer", "fontSize": "12px"
     }
     return ("Event Marks: On" if enabled else "Event Marks: Off"), style
+
+# Core toolbar controls must have a server-side Dash path.  Inline browser
+# callbacks are intentionally disabled on some Dash 4 renderers, so relying
+# only on window.dash_clientside.set_props makes every chart toggle inert.
+_CHART_TOGGLE_BUTTONS = {
+    "toggle-rsi-btn": "rsi-visible-store",
+    "toggle-stochastic-btn": "stochastic-visible-store",
+    "toggle-volume-btn": "volume-visible-store",
+    "toggle-adx-btn": "adx-visible-store",
+    "toggle-macd-btn": "macd-visible-store",
+    "toggle-disparity-btn": "disparity-visible-store",
+    "toggle-strategy-btn": "strategy-visible-store",
+    "toggle-impulses-btn": "impulse-visible-store",
+    "toggle-events-btn": "events-visible-store",
+    "toggle-measure-btn": "measure-mode-store",
+    "toggle-measure-anchor-btn": "measure-anchor-store",
+    "toggle-measure-hover-btn": "measure-hover-store",
+    "toggle-measure-oscillator-range-btn": "measure-oscillator-range-store",
+    "toggle-chart-info-box-btn": "chart-info-box-store",
+    "toggle-oscillator-info-box-btn": "oscillator-info-box-store",
+    "toggle-oscillator-sync-info-btn": "oscillator-sync-info-store",
+    "toggle-chart-extend-x-btn": "chart-extend-x-store",
+    "toggle-chart-focus-entry-btn": "chart-focus-entry-store",
+}
+
+@app.callback(
+    *[Output(store_id, "data") for store_id in _CHART_TOGGLE_BUTTONS.values()],
+    *[Input(button_id, "n_clicks") for button_id in _CHART_TOGGLE_BUTTONS],
+    *[State(store_id, "data") for store_id in _CHART_TOGGLE_BUTTONS.values()],
+    prevent_initial_call=True,
+)
+def toggle_chart_control_server(*args):
+    """Reliable Dash fallback for every chart toolbar toggle."""
+    count = len(_CHART_TOGGLE_BUTTONS)
+    current_values = args[count:]
+    triggered = ctx.triggered_id
+    if triggered not in _CHART_TOGGLE_BUTTONS:
+        return tuple(no_update for _ in range(count))
+    outputs = [no_update] * count
+    target_store = _CHART_TOGGLE_BUTTONS[triggered]
+    target_index = list(_CHART_TOGGLE_BUTTONS.values()).index(target_store)
+    outputs[target_index] = not bool(current_values[target_index])
+    return tuple(outputs)
 
 # ----- Measurement tool callbacks -----
 @app.callback(
