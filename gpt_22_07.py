@@ -3243,32 +3243,29 @@ function applyHiddenColumns() {
 }
 // ✅ OPTIMIZED: Removed MutationObserver - it was causing infinite loops and race conditions
 // Column hiding is now handled by CSS rules in the stylesheet, applied automatically on render
-// Push an action payload into a Dash Store immediately. The task table is
-// re-rendered by Dash, so this must use delegated events and wait for Dash's
-// client API to be ready instead of relying on a handler attached to an old row.
+// Push an action payload into a Dash Store immediately.  The previous
+// CustomEvent -> hidden button -> clientside callback bridge can miss clicks
+// in some Dash/browser combinations, leaving Chart/Details/Impulse buttons
+// visually clickable but with no Store update for the Python callback.
 function pushDashStore(storeId, payload, fallbackEventName) {
     const eventPayload = Object.assign({ts: Date.now()}, payload);
-    let attempts = 0;
-    function publishWhenReady() {
-        attempts += 1;
-        if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
-            try {
-                window.dash_clientside.set_props(storeId, {data: eventPayload});
-                return;
-            } catch (error) {
-                console.error('Dash set_props failed for store:', storeId, error);
-            }
-        }
-        // During initial load or a hot reload the table can appear before the
-        // Dash renderer exposes set_props. Keep the original payload (and its
-        // timestamp) across retries so one physical click produces one action.
-        if (attempts < 20) {
-            window.setTimeout(publishWhenReady, 100);
-        } else {
-            console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
+    function publish() {
+        if (!window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+        try {
+            window.dash_clientside.set_props(storeId, {data: eventPayload});
+            return true;
+        } catch (error) {
+            console.error('Dash set_props failed for store:', storeId, error);
+            return false;
         }
     }
-    publishWhenReady();
+    if (publish()) return;
+    // Dash can expose set_props a few milliseconds after the page shell and
+    // table HTML are visible. Retry once so a main-table Chart click is never
+    // lost during startup/hot reload, while keeping the same unique payload.
+    window.setTimeout(function() {
+        if (!publish()) console.error('Dash set_props is unavailable; cannot update store:', storeId, fallbackEventName);
+    }, 80);
 }
 const chartToggleStores = {
     'toggle-rsi-btn': ['rsi-visible-store', false],
@@ -3634,12 +3631,16 @@ function showNativeMeasureResultAfterMouseup() {
 document.addEventListener('mouseup', showNativeMeasureResultAfterMouseup, true);
 // Existing button feedback (unchanged) - now supports both BUTTON and DIV elements
 document.addEventListener('click', function(e) {
-    const target = e.target;
-    // Dash may place spans/icons inside a component and replaces every table
-    // row on refresh. Resolve the nearest actionable ancestor, not only an
-    // element that happens to be the direct click target.
-    if (!target || typeof target.closest !== 'function') return;
-    const button = target.closest('button, .interactive-button');
+    let target = e.target;
+    
+    // Check if the clicked element is a button or contains a button
+    let button = null;
+    if (target.tagName === 'BUTTON' || target.closest('button')) {
+        button = target.tagName === 'BUTTON' ? target : target.closest('button');
+    } else if (target.tagName === 'DIV' && target.classList.contains('interactive-button')) {
+        button = target;
+    }
+    
     if (!button) return;
 
     // Indicator, overlay and range controls replace/reposition the figure.
@@ -3750,7 +3751,7 @@ document.addEventListener('click', function(e) {
             // P1 CRITICAL: Log errors instead of silently swallowing them
             console.error('Button click handler error:', e, 'Target:', button);
         }
-}, true);
+});
 // Backspace removes the newest user-drawn rectangle while preserving figure
 // shapes (notably the yellow Signal Level). Do not intercept text editing.
 document.addEventListener('keydown', function(e) {
@@ -3780,17 +3781,14 @@ document.addEventListener('keydown', function(e) {
     }
 }, true);
 // Toggle column highlight on header click
-// Toggle row highlight on ANY cell click (not a button, not a header, not an interactive-button DIV).
-// Keep this as a named function so it can also be bound directly whenever Dash
-// replaces the table subtree after an optimized refresh.
+// Toggle row highlight on ANY cell click (not a button, not a header, not an interactive-button DIV)
+// CRITICAL FIX: Must check if click originated from inside a table cell, not just any element
 function handleTaskTableClick(e) {
     // CRITICAL: Check if we're clicking inside a TABLE first before checking for buttons
     // This ensures table clicks are handled even if they contain interactive elements
-    if (!e.target || typeof e.target.closest !== 'function') return;
-    let table = e.target.closest('#task-table-container table');
+    let table = e.target.closest('table');
     
-    // If we're NOT in the main task table, exit early (let the other tables
-    // and their buttons keep their own behaviour).
+    // If we're NOT in a table, exit early (let button handler deal with it)
     if (!table) return;
     
     // Ignore clicks inside buttons OR interactive-button DIVs within the table
@@ -3819,50 +3817,43 @@ function handleTaskTableClick(e) {
         }
     }
 }
-// Delegation handles normal page events. A direct listener is also installed
-// on each newly rendered table below; this is intentionally redundant only at
-// the event-routing level, not for a single click (the direct handler marks
-// the event as handled before it reaches this listener).
-document.addEventListener('click', function(e) {
-    if (e.__taskTableInteractionHandled) return;
-    e.__taskTableInteractionHandled = true;
-    handleTaskTableClick(e);
-}, true);
+// Fallback for tables that are already present when the page script starts.
+document.addEventListener('click', handleTaskTableClick);
 
-function bindTaskTableInteractions(table) {
-    if (!table || table.dataset.taskTableInteractionsBound === 'true') return;
-    table.dataset.taskTableInteractionsBound = 'true';
+function bindRenderedTaskTable(table) {
+    if (!table || table.dataset.taskTableClickBound === 'true') return;
+    table.dataset.taskTableClickBound = 'true';
+    // Dash/React may stop a bubbled event at its root. A listener on the table
+    // itself runs first and remains valid until this particular table is replaced.
     table.addEventListener('click', function(e) {
-        if (e.__taskTableInteractionHandled) return;
-        e.__taskTableInteractionHandled = true;
         handleTaskTableClick(e);
-    }, true);
+        // Leave controls alone: Dash buttons and the legacy JS action controls
+        // still need to bubble to their own handlers. Only table-cell clicks
+        // are stopped after their local highlight handler has run.
+        if (!e.target.closest('button, .interactive-button')) e.stopPropagation();
+    });
 }
 
-function refreshTaskTableInteractions() {
+function refreshRenderedTaskTable() {
     const container = document.getElementById('task-table-container');
     if (!container) return;
     const table = container.querySelector('table');
     if (!table) return;
-    bindTaskTableInteractions(table);
+    bindRenderedTaskTable(table);
     applyHiddenColumns();
 }
 
-// Dash replaces task-table-container children instead of updating individual
-// rows. Reinstall the listener after each replacement; observing child-list
-// changes cannot recurse when highlighting merely changes CSS classes.
-function installTaskTableInteractionObserver() {
+function installTaskTableRenderListener() {
     const container = document.getElementById('task-table-container');
-    if (!container || window.__taskTableInteractionObserver) return;
-    const sync = function() { window.requestAnimationFrame(refreshTaskTableInteractions); };
-    window.__taskTableInteractionObserver = new MutationObserver(sync);
-    window.__taskTableInteractionObserver.observe(container, {childList: true, subtree: true});
-    refreshTaskTableInteractions();
+    if (!container || window.__taskTableRenderObserver) return;
+    window.__taskTableRenderObserver = new MutationObserver(refreshRenderedTaskTable);
+    window.__taskTableRenderObserver.observe(container, {childList: true, subtree: true});
+    refreshRenderedTaskTable();
 }
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', installTaskTableInteractionObserver, {once: true});
+    document.addEventListener('DOMContentLoaded', installTaskTableRenderListener, {once: true});
 } else {
-    installTaskTableInteractionObserver();
+    installTaskTableRenderListener();
 }
 // Toggle column visibility on double-click of header (with highlight cleanup)
 document.addEventListener('dblclick', function(e) {
@@ -6534,14 +6525,14 @@ def render_task_action_buttons(t, compact=True):
             className="interactive-button",
         )
 
-    # Use a real Dash input for Chart. Unlike a JavaScript-only DIV action,
-    # this callback survives table re-renders and React event propagation.
     chart_button = html.Button(
         "Chart",
         id={"type": "task-table-chart", "task_id": task_id_str},
         n_clicks=0,
-        disabled=not is_completed,
-        title="Open this task's chart" if is_completed else "Chart is available after the task completes",
+        # Keep the original DIV behaviour: visual status does not suppress the
+        # click, because older/imported tasks may use a different completion label.
+        disabled=False,
+        title="Open this task's chart",
         style={
             "margin": "2px", "padding": "4px 8px", "backgroundColor": "#d4edda" if is_completed else "#e9ecef",
             "border": "none", "borderRadius": "3px", "cursor": btn_disabled,
@@ -7280,8 +7271,6 @@ def auto_throttle_updates(_):
     Output("chart-task-id", "data"),
     Output("chart-click-store", "data"),
     Output("chart-event-context-store", "data"),
-    # Keep the Store input for legacy/raw-HTML rows, but make the current
-    # Dash-rendered Chart button the primary, server-side path.
     Input("chart-button-trigger", "data"),
     Input({"type": "task-table-chart", "task_id": ALL}, "n_clicks"),
     State("chart-click-store", "data"),
