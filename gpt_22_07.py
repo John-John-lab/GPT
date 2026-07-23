@@ -3356,6 +3356,13 @@ function applyLocalToolbarInteraction(button) {
     if (plot && window.Plotly) {
         window.Plotly.relayout(plot, {dragmode: active ? 'drawrect' : 'pan'});
     }
+    // Give immediate visual feedback; the server Store and normal button
+    // callback later confirm the same state without making the click feel lost.
+    button.textContent = active ? '📐 Measuring' : '📐 Measure';
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.style.background = active ? '#e3f2fd' : 'transparent';
+    button.style.borderWidth = active ? '2px' : '1px';
+    button.style.fontWeight = active ? 'bold' : 'normal';
     traceUi('local measure mode', {active: active});
 }
 const chartToggleLabels = {
@@ -3759,8 +3766,12 @@ document.addEventListener('click', function(e) {
         
         // Fallback to old JSON parsing method for backward compatibility during transition
         if (!actionType || !taskId) {
-            console.warn('Using legacy JSON ID parsing. Please update button generation.');
-            let idObj = JSON.parse(button.id);
+            // Only the original pattern-ID controls use JSON IDs. Ordinary
+            // Dash toolbar/app buttons have simple string IDs; parsing those
+            // produced a noisy SyntaxError for every click.
+            const rawId = String(button.id || '');
+            if (!rawId.startsWith('{')) return;
+            let idObj = JSON.parse(rawId);
             if (idObj.type === 'pause-task' || idObj.type === 'stop-task' || idObj.type === 'save-log') {
                 taskId = idObj.index;
                 actionType = idObj.type === 'save-log' ? 'save' : (idObj.type === 'stop-task' ? 'stop' : 'pause');
@@ -7598,6 +7609,10 @@ def sync_chart_ui_state(*values):
 # Explicit migration bridge: a new control can publish a small declarative
 # action without adding another Store. The grouped state is then mirrored back
 # to the existing Store inputs until every renderer/control has migrated.
+# Disabled by default: current toolbar controls still write legacy Stores directly.
+# Enable only when a newly added control publishes chart-ui-action-store actions.
+CHART_UI_LEGACY_BRIDGE_ENABLED = os.environ.get("GPT_ENABLE_CHART_UI_BRIDGE", "0") == "1"
+
 _CHART_UI_STATE_PATHS = {
     "rsi-visible-store": ("panes", "rsi"),
     "stochastic-visible-store": ("panes", "stochastic"),
@@ -7654,6 +7669,8 @@ def apply_chart_ui_action(action, ui_state):
 )
 def bridge_chart_ui_state_to_legacy(ui_state, *legacy_values):
     """Mirror grouped state to legacy writers without feedback-loop updates."""
+    if not CHART_UI_LEGACY_BRIDGE_ENABLED:
+        return tuple(no_update for _ in _CHART_UI_STATE_PATHS)
     state = ui_state or make_chart_ui_state()
     outputs = []
     for (section, key), legacy_value in zip(_CHART_UI_STATE_PATHS.values(), legacy_values):
