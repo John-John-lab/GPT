@@ -3259,11 +3259,17 @@ th {
 // it still proves whether the page shell script reached the browser at all.
 window.__gptIndexScriptLoaded = Date.now();
 window.__gptEarlyBrowserTrace = [];
+window.__gptUiBrowserTrace = [];
+window.__gptRenderBrowserTrace = function() {
+    const panel = document.getElementById('ui-client-trace-output');
+    if (!panel) return;
+    const lines = window.__gptEarlyBrowserTrace.concat(window.__gptUiBrowserTrace).slice(-40);
+    panel.textContent = lines.join('\\n');
+};
 window.__gptEarlyTrace = function(message) {
     const line = new Date().toLocaleTimeString() + ' | EARLY | ' + message;
     window.__gptEarlyBrowserTrace.push(line);
-    const panel = document.getElementById('ui-client-trace-output');
-    if (panel) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\\n');
+    window.__gptRenderBrowserTrace();
 };
 window.__gptEarlyTrace('page shell script loaded');
 document.addEventListener('click', function(event) {
@@ -3272,8 +3278,7 @@ document.addEventListener('click', function(event) {
     window.__gptEarlyTrace('capture click target=' + (target && target.tagName ? target.tagName : '?') + ' id=' + (id || '-'));
 }, true);
 window.setInterval(function() {
-    const panel = document.getElementById('ui-client-trace-output');
-    if (panel && window.__gptEarlyBrowserTrace.length) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\\n');
+    window.__gptRenderBrowserTrace();
 }, 500);
 // Global store for hidden columns (by zero-based column index)
 let hiddenColumns = new Set();
@@ -3345,12 +3350,10 @@ window.__chartToolbarUsesServerCallbacks = false;
 const chartToggleState = {};
 function traceUi(message, details) {
     const text = new Date().toLocaleTimeString() + ' | ' + message + (details ? ' | ' + JSON.stringify(details) : '');
-    const panel = document.getElementById('ui-client-trace-output');
-    if (panel) {
-        const prior = String(panel.textContent || '').split('\\n').filter(Boolean);
-        prior.push(text);
-        panel.textContent = prior.slice(-30).join('\\n');
-    }
+    const trace = window.__gptUiBrowserTrace || (window.__gptUiBrowserTrace = []);
+    trace.push(text);
+    if (trace.length > 30) trace.splice(0, trace.length - 30);
+    if (window.__gptRenderBrowserTrace) window.__gptRenderBrowserTrace();
     if (window.localStorage && window.localStorage.getItem('gptTraceUi') === '1') {
         console.debug('[GPT UI TRACE]', message, details || '');
     }
