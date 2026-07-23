@@ -27,7 +27,7 @@ import requests
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from flask import send_file, request, jsonify
+from flask import send_file, request, jsonify, g
 import pyarrow.parquet as pq
 from strategies import detect_strategies
 from database import (
@@ -3098,6 +3098,31 @@ optimizer_mgr = OptimizerManager()
 # ---------- Dash App ----------
 app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_callbacks='initial_duplicate')
 
+
+@app.server.before_request
+def start_chart_dash_response_timer():
+    """Time the full Dash figure response, including JSON serialization."""
+    if request.path != "/_dash-update-component":
+        return
+    payload = request.get_json(silent=True) or {}
+    output = str(payload.get("output") or "")
+    if "task-chart.figure" in output:
+        g.chart_dash_output = output
+        g.chart_dash_started_at = time.perf_counter()
+
+
+@app.server.after_request
+def trace_chart_dash_response(response):
+    """Expose the gap between callback computation and the serialized response."""
+    started_at = getattr(g, "chart_dash_started_at", None)
+    if started_at is not None:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        size = response.calculate_content_length()
+        interaction_trace(
+            f"chart Dash response total_ms={elapsed_ms} bytes={size if size is not None else 'streamed'}"
+        )
+    return response
+
 # Dash 4 can intermittently fail to resolve dynamically generated inline
 # clientside callback functions after a hot reload ("undefined.apply" in the
 # renderer). This application is running on an affected Dash 4 renderer, so
@@ -3786,6 +3811,19 @@ function openTableChartImmediately(button) {
         return false;
     }
 }
+function openAdjacentChartImmediately(button) {
+    if (!button || button.getAttribute('data-direct-navigation') !== 'true') return false;
+    const taskId = String(button.getAttribute('data-target-task-id') || '');
+    if (!taskId || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+    const direction = button.id === 'prev-chart-btn' ? 'previous' : 'next';
+    markChartRenderRequested(button.id);
+    window.dash_clientside.set_props('chart-task-id', {data: taskId});
+    // The modal is already open; this store only preserves the existing
+    // click/deduplication contract without asking Dash to resolve a target.
+    window.dash_clientside.set_props('chart-click-store', {data: {[taskId + '_chart']: Date.now() / 1000}});
+    traceUi('local chart navigation', {direction: direction, taskId: taskId});
+    return true;
+}
 // Capture phase lets direct Store updates reach Dash before React queues the
 // native n_click callback. If set_props is unavailable, normal bubbling keeps
 // the server fallback fully functional.
@@ -3846,6 +3884,11 @@ document.addEventListener('click', function(e) {
         return;
     }
     if (button.id === 'prev-chart-btn' || button.id === 'next-chart-btn') {
+        if (openAdjacentChartImmediately(button)) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
         markChartRenderRequested(button.id);
         traceUi('chart navigation requested', {direction: button.id === 'prev-chart-btn' ? 'previous' : 'next'});
         highlightAdjacentVisibleChartRow(button.id === 'prev-chart-btn' ? 'prev' : 'next');
@@ -4478,7 +4521,8 @@ def build_root_layout():
                             "whiteSpace": "nowrap",
                         },
                         children=[
-                            html.Button("‹", id="prev-chart-btn", title="Previous task chart", n_clicks=0, style={
+                            html.Button("‹", id="prev-chart-btn", title="Previous task chart", n_clicks=0,
+                                **{"data-target-task-id": "", "data-direct-navigation": "false"}, style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -4488,7 +4532,8 @@ def build_root_layout():
                                 "minWidth": "34px",
                                 "whiteSpace": "nowrap"
                             }),
-                            html.Button("›", id="next-chart-btn", title="Next task chart", n_clicks=0, style={
+                            html.Button("›", id="next-chart-btn", title="Next task chart", n_clicks=0,
+                                **{"data-target-task-id": "", "data-direct-navigation": "false"}, style={
                                 "background": "transparent",
                                 "color": "black",
                                 "border": "1px solid black",
@@ -7503,6 +7548,10 @@ def page_for_task(task_id, tasks):
 @app.callback(
     Output("prev-chart-btn", "disabled"),
     Output("next-chart-btn", "disabled"),
+    Output("prev-chart-btn", "data-target-task-id"),
+    Output("next-chart-btn", "data-target-task-id"),
+    Output("prev-chart-btn", "data-direct-navigation"),
+    Output("next-chart-btn", "data-direct-navigation"),
     Input("chart-task-id", "data"),
     Input("golden-store-version", "data"),
     Input("chart-event-context-store", "data"),
@@ -7511,16 +7560,25 @@ def page_for_task(task_id, tasks):
 def update_chart_nav_buttons(task_id, version, event_context):
     if isinstance(event_context, dict) and event_context.get("events"):
         idx = int(event_context.get("index") or 0)
-        total = len(event_context.get("events") or [])
-        return idx <= 0, idx >= total - 1
+        events = event_context.get("events") or []
+        total = len(events)
+        previous = str(events[idx - 1].get("task_id") or "") if idx > 0 else ""
+        following = str(events[idx + 1].get("task_id") or "") if idx < total - 1 else ""
+        # Summary-event navigation must also move the event index/context, so
+        # it keeps the server navigation route instead of bypassing it.
+        return idx <= 0, idx >= total - 1, previous, following, "false", "false"
     if not task_id:
-        return True, True
+        return True, True, "", "", "false", "false"
     _, chartable = get_chartable_tasks_for_navigation()
     chart_ids = [str(t.task_id) for t in chartable]
     if task_id not in chart_ids:
-        return True, True
+        return True, True, "", "", "false", "false"
     idx = chart_ids.index(task_id)
-    return idx <= 0, idx >= len(chart_ids) - 1
+    previous = chart_ids[idx - 1] if idx > 0 else ""
+    following = chart_ids[idx + 1] if idx < len(chart_ids) - 1 else ""
+    # Main-table navigation needs only a new task id. Expose the already
+    # resolved adjacent ids so the browser can skip the server n_click hop.
+    return idx <= 0, idx >= len(chart_ids) - 1, previous, following, "true", "true"
 
 def carry_chart_view_state_to_task(view_state, target_task_id):
     """Carry current zoom/pan ranges to a newly selected chart task."""
