@@ -3106,6 +3106,14 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True, prevent_initial_cal
 # opt in with GPT_ENABLE_INLINE_DASH_CALLBACKS=1 after validating the deployed
 # Dash renderer version in a browser.
 INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED = os.environ.get("GPT_ENABLE_INLINE_DASH_CALLBACKS", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Legacy Stores remain authoritative during the migration. A live aggregation
+# callback adds an extra Dash request to every toolbar click, so it is opt-in
+# for future controls that genuinely consume the grouped snapshot.
+CHART_UI_STATE_LEGACY_SYNC_ENABLED = os.environ.get("GPT_ENABLE_CHART_UI_STATE_SYNC", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Debug bundles use React's development renderer and are noticeably slow when
+# replacing a large table or Plotly figure. Production mode is the safe default;
+# developers can opt in locally with GPT_DASH_DEBUG=1.
+DASH_DEBUG_ENABLED = os.environ.get("GPT_DASH_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 def register_browser_callback(*args, **kwargs):
     if INLINE_DASH_CLIENTSIDE_CALLBACKS_ENABLED:
@@ -3348,21 +3356,29 @@ function traceUi(message, details) {
 }
 traceUi('page script initialized', {loaded: window.__gptIndexScriptLoaded});
 function applyLocalToolbarInteraction(button) {
-    if (!button || button.id !== 'toggle-measure-btn') return;
-    const active = !Boolean(chartToggleState['toggle-measure-btn']);
-    chartToggleState['toggle-measure-btn'] = active;
+    if (!button || !chartToggleStores[button.id]) return;
+    const active = !Boolean(chartToggleState[button.id]);
+    chartToggleState[button.id] = active;
+    // The server remains authoritative for chart panes. Update the control
+    // immediately so a request queued behind a large Dash update is visible
+    // to the user instead of looking like a lost click.
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.style.background = active ? '#e3f2fd' : 'transparent';
+    button.style.borderWidth = active ? '2px' : '1px';
+    button.style.fontWeight = active ? 'bold' : 'normal';
+    if (chartToggleLabels[button.id]) {
+        button.textContent = chartToggleLabels[button.id] + ': ' + (active ? 'On' : 'Off');
+    }
+    if (button.id !== 'toggle-measure-btn') {
+        traceUi('local toolbar pending', {id: button.id, active: active});
+        return;
+    }
     const root = document.getElementById('task-chart');
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     if (plot && window.Plotly) {
         window.Plotly.relayout(plot, {dragmode: active ? 'drawrect' : 'pan'});
     }
-    // Give immediate visual feedback; the server Store and normal button
-    // callback later confirm the same state without making the click feel lost.
     button.textContent = active ? '📐 Measuring' : '📐 Measure';
-    button.setAttribute('aria-pressed', active ? 'true' : 'false');
-    button.style.background = active ? '#e3f2fd' : 'transparent';
-    button.style.borderWidth = active ? '2px' : '1px';
-    button.style.fontWeight = active ? 'bold' : 'normal';
     traceUi('local measure mode', {active: active});
 }
 const chartToggleLabels = {
@@ -7580,31 +7596,35 @@ def sync_chart_request(task_id, event_context):
     """Publish one source-aware request without changing existing chart inputs."""
     return make_chart_request(task_id, event_context)
 
-@app.callback(
-    Output("chart-ui-state-store", "data"),
-    Input("rsi-visible-store", "data"),
-    Input("stochastic-visible-store", "data"),
-    Input("volume-visible-store", "data"),
-    Input("adx-visible-store", "data"),
-    Input("macd-visible-store", "data"),
-    Input("disparity-visible-store", "data"),
-    Input("strategy-visible-store", "data"),
-    Input("impulse-visible-store", "data"),
-    Input("events-visible-store", "data"),
-    Input("measure-mode-store", "data"),
-    Input("measure-anchor-store", "data"),
-    Input("measure-hover-store", "data"),
-    Input("measure-oscillator-range-store", "data"),
-    Input("chart-info-box-store", "data"),
-    Input("oscillator-info-box-store", "data"),
-    Input("oscillator-sync-info-store", "data"),
-    Input("chart-extend-x-store", "data"),
-    Input("chart-focus-entry-store", "data"),
-    prevent_initial_call=False,
-)
 def sync_chart_ui_state(*values):
-    """Expose legacy control Stores as one stable UI-state contract."""
+    """Build a grouped snapshot from legacy control Stores when explicitly enabled."""
     return make_chart_ui_state(*values)
+
+
+if CHART_UI_STATE_LEGACY_SYNC_ENABLED:
+    app.callback(
+        Output("chart-ui-state-store", "data"),
+        Input("rsi-visible-store", "data"),
+        Input("stochastic-visible-store", "data"),
+        Input("volume-visible-store", "data"),
+        Input("adx-visible-store", "data"),
+        Input("macd-visible-store", "data"),
+        Input("disparity-visible-store", "data"),
+        Input("strategy-visible-store", "data"),
+        Input("impulse-visible-store", "data"),
+        Input("events-visible-store", "data"),
+        Input("measure-mode-store", "data"),
+        Input("measure-anchor-store", "data"),
+        Input("measure-hover-store", "data"),
+        Input("measure-oscillator-range-store", "data"),
+        Input("chart-info-box-store", "data"),
+        Input("oscillator-info-box-store", "data"),
+        Input("oscillator-sync-info-store", "data"),
+        Input("chart-extend-x-store", "data"),
+        Input("chart-focus-entry-store", "data"),
+        prevent_initial_call=False,
+    )(sync_chart_ui_state)
+
 
 # Explicit migration bridge: a new control can publish a small declarative
 # action without adding another Store. The grouped state is then mirrored back
@@ -13371,4 +13391,4 @@ def trigger_ui_on_recalc_complete(n_intervals, is_disabled):
 register_database_callbacks(app)
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8050)
+    app.run(debug=DASH_DEBUG_ENABLED, port=8050)
