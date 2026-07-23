@@ -825,7 +825,7 @@ chart_task_indicator_cache = OrderedDict()
 # Warm one neighbouring range while the user studies the current chart. The
 # source cache is byte-bounded, so this is safe on older Macs and makes the
 # first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
-CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
+CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "0") == "1"
 # Let the foreground chart read claim an older SSD before optional neighbour
 # warm-up begins.  Set to 0 only on machines with fast storage.
 CHART_PREFETCH_DELAY_SECONDS = max(0.0, float(os.environ.get("GPT_CHART_PREFETCH_DELAY", "0.75")))
@@ -3870,6 +3870,8 @@ function bindRenderedTable(table) {
     if (!table || table.dataset.tableClickBound === 'true') return;
     table.dataset.tableClickBound = 'true';
     table.addEventListener('click', function(e) {
+        if (e.__gptTableHighlightHandled) return;
+        e.__gptTableHighlightHandled = true;
         handleTaskTableClick(e);
         // Do not interfere with Dash buttons or legacy action controls.
         if (!e.target.closest('button, .interactive-button, a, input, select, textarea')) {
@@ -3908,8 +3910,13 @@ if (document.readyState === 'loading') {
 } else {
     installTableRenderListener();
 }
-// Fallback for page layouts that are not observed yet.
-document.addEventListener('click', handleTaskTableClick);
+// Capture phase is a reliable fallback when Dash/React stops bubbling. Mark
+// the event so a subsequently bound table handler never toggles it twice.
+document.addEventListener('click', function(e) {
+    if (e.__gptTableHighlightHandled) return;
+    e.__gptTableHighlightHandled = true;
+    handleTaskTableClick(e);
+}, true);
 // Toggle column visibility on double-click of header (with highlight cleanup)
 document.addEventListener('dblclick', function(e) {
     let th = e.target.closest('th');
@@ -9581,6 +9588,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     elapsed = time.perf_counter() - timer.start_time
     if elapsed > CHART_RENDER_PERF_BUDGET_SECONDS:
         perf_log(f"[TRACE] ⚠️ Chart render exceeded {CHART_RENDER_PERF_BUDGET_SECONDS:.1f}s: {elapsed:.4f}s")
+    interaction_trace(f"chart render complete task={task_id} elapsed={elapsed:.3f}s traces={len(fig.data)}")
     timer.end()
     return fig
 
