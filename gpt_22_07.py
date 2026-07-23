@@ -531,6 +531,12 @@ recalculation_complete_timestamp = 0
 PERF_TRACE_ENABLED = False
 # Informational only: used in optional chart tracing, never to reject or delay a render.
 CHART_RENDER_PERF_BUDGET_SECONDS = 1.0
+INTERACTION_TRACE_ENABLED = os.environ.get("GPT_INTERACTION_TRACE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def interaction_trace(message):
+    if INTERACTION_TRACE_ENABLED:
+        print(f"[UI-TRACE] {message}")
 
 
 def perf_log(message):
@@ -3293,6 +3299,22 @@ const chartToggleStores = {
 // relying on set_props on Dash renderers where inline callbacks are disabled.
 window.__chartToolbarUsesServerCallbacks = true;
 const chartToggleState = {};
+function traceUi(message, details) {
+    if (window.localStorage && window.localStorage.getItem('gptTraceUi') === '1') {
+        console.debug('[GPT UI TRACE]', message, details || '');
+    }
+}
+function applyLocalToolbarInteraction(button) {
+    if (!button || button.id !== 'toggle-measure-btn') return;
+    const active = !Boolean(chartToggleState['toggle-measure-btn']);
+    chartToggleState['toggle-measure-btn'] = active;
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (plot && window.Plotly) {
+        window.Plotly.relayout(plot, {dragmode: active ? 'drawrect' : 'pan'});
+    }
+    traceUi('local measure mode', {active: active});
+}
 const chartToggleLabels = {
     'toggle-rsi-btn': 'RSI',
     'toggle-stochastic-btn': 'Stoch',
@@ -3648,6 +3670,8 @@ document.addEventListener('click', function(e) {
     }
     
     if (!button) return;
+    traceUi('button click', {id: button.id, action: button.getAttribute('data-action')});
+    applyLocalToolbarInteraction(button);
 
     // Indicator, overlay and range controls replace/reposition the figure.
     // They therefore leave drawing mode before their own action runs, so the
@@ -3802,6 +3826,7 @@ function handleTaskTableClick(e) {
     
     let cell = e.target.closest('th, td');
     if (!cell) return;
+    traceUi('table cell click', {tag: cell.tagName, table: table.id || '(no-id)'});
     
     // Column header click: toggle yellow highlight on the whole column
     if (cell.tagName === 'TH') {
@@ -7458,6 +7483,7 @@ def set_chart_task_id(trigger_data, _table_chart_clicks, click_store):
     if current_time - float(click_store.get(key, 0) or 0) < 0.5:
         return no_update, no_update, no_update
     click_store[key] = current_time
+    interaction_trace(f"chart open task={task_id} source=main_table")
     # Discovering neighbours can walk the full task snapshot. Keep it off the
     # click callback so the modal and figure callback are released immediately.
     threading.Thread(
@@ -7703,6 +7729,7 @@ def toggle_chart_control_server(*args):
     outputs = [no_update] * count
     target_store = _CHART_TOGGLE_BUTTONS[triggered]
     target_index = list(_CHART_TOGGLE_BUTTONS.values()).index(target_store)
+    interaction_trace(f"toolbar click={triggered} store={target_store} old={current_values[target_index]!r}")
     outputs[target_index] = not bool(current_values[target_index])
     return tuple(outputs)
 
@@ -9015,6 +9042,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     if not task_id:
         return go.Figure()
     task = tm.get_task(task_id)
+    interaction_trace(f"chart render start task={task_id} request={getattr(chart_request, 'get', lambda *_: None)('source') if isinstance(chart_request, dict) else None}")
     timer = PerfTimer(f"Chart render {task_id}").start()
     chart_window = load_chart_task_window(task)
     if not chart_window:
