@@ -3255,7 +3255,7 @@ window.__gptEarlyTrace = function(message) {
     const line = new Date().toLocaleTimeString() + ' | EARLY | ' + message;
     window.__gptEarlyBrowserTrace.push(line);
     const panel = document.getElementById('ui-client-trace-output');
-    if (panel) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\n');
+    if (panel) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\\n');
 };
 window.__gptEarlyTrace('page shell script loaded');
 document.addEventListener('click', function(event) {
@@ -3265,7 +3265,7 @@ document.addEventListener('click', function(event) {
 }, true);
 window.setInterval(function() {
     const panel = document.getElementById('ui-client-trace-output');
-    if (panel && window.__gptEarlyBrowserTrace.length) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\n');
+    if (panel && window.__gptEarlyBrowserTrace.length) panel.textContent = window.__gptEarlyBrowserTrace.slice(-30).join('\\n');
 }, 500);
 // Global store for hidden columns (by zero-based column index)
 let hiddenColumns = new Set();
@@ -3338,9 +3338,9 @@ function traceUi(message, details) {
     const text = new Date().toLocaleTimeString() + ' | ' + message + (details ? ' | ' + JSON.stringify(details) : '');
     const panel = document.getElementById('ui-client-trace-output');
     if (panel) {
-        const prior = String(panel.textContent || '').split('\n').filter(Boolean);
+        const prior = String(panel.textContent || '').split('\\n').filter(Boolean);
         prior.push(text);
-        panel.textContent = prior.slice(-30).join('\n');
+        panel.textContent = prior.slice(-30).join('\\n');
     }
     if (window.localStorage && window.localStorage.getItem('gptTraceUi') === '1') {
         console.debug('[GPT UI TRACE]', message, details || '');
@@ -3521,7 +3521,7 @@ function installChartCrosshairFallback() {
             const axis = plot._fullLayout['yaxis' + axisId.slice(1)];
             if (!axis || !Number.isFinite(axis._offset)) return;
             const label = document.createElement('div');
-            label.dataset.taskChartOscillatorSyncLabel = 'true'; label.textContent = valuesByAxis[axisId].join('\n');
+            label.dataset.taskChartOscillatorSyncLabel = 'true'; label.textContent = valuesByAxis[axisId].join('\\n');
             label.style.cssText = 'position:absolute;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
             label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px'; label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px'; root.appendChild(label);
         });
@@ -8343,7 +8343,7 @@ function(figure, oscillatorSyncInfo, candleInfo) {
             if (!axis || !Number.isFinite(axis._offset)) return;
             const label = document.createElement('div');
             label.dataset.taskChartOscillatorSyncLabel = 'true';
-            label.textContent = valuesByAxis[axisId].join('\n');
+            label.textContent = valuesByAxis[axisId].join('\\n');
             label.style.position = 'absolute';
             label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px';
             label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px';
