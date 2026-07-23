@@ -17,7 +17,7 @@ Now with signal‑based downloading, candle analysis, and per‑task interactive
 # intentionally explicit so the main app can be reorganized without changing math.
 
 import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functools, sys, bisect, math
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 import dash
 from dash import dcc, html, Input, Output, State, MATCH, ALL, no_update, ctx, clientside_callback as dash_clientside_callback
@@ -532,11 +532,15 @@ PERF_TRACE_ENABLED = False
 # Informational only: used in optional chart tracing, never to reject or delay a render.
 CHART_RENDER_PERF_BUDGET_SECONDS = 1.0
 INTERACTION_TRACE_ENABLED = os.environ.get("GPT_INTERACTION_TRACE", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Always retain a small in-app diagnostic history; printing remains opt-in.
+UI_INTERACTION_TRACE_EVENTS = deque(maxlen=120)
 
 
 def interaction_trace(message):
+    event = f"{datetime.now().strftime('%H:%M:%S')} | {message}"
+    UI_INTERACTION_TRACE_EVENTS.append(event)
     if INTERACTION_TRACE_ENABLED:
-        print(f"[UI-TRACE] {message}")
+        print(f"[UI-TRACE] {event}")
 
 
 def perf_log(message):
@@ -3108,6 +3112,17 @@ def register_browser_callback(*args, **kwargs):
         return dash_clientside_callback(*args, **kwargs)
     return None
 
+@app.callback(
+    Output("ui-trace-output", "children"),
+    Input("ui-trace-interval", "n_intervals"),
+    prevent_initial_call=False,
+)
+def render_ui_trace(_):
+    """Show recent server-side chart interactions for non-technical debugging."""
+    events = list(UI_INTERACTION_TRACE_EVENTS)
+    return "\n".join(events[-40:]) if events else "No chart events yet. Open a chart or click a toolbar button."
+
+
 # ----- Flask route for task actions (stop/pause/save) – unchanged -----
 @app.server.route('/task-action', methods=['POST'])
 def task_action():
@@ -4217,6 +4232,12 @@ def build_root_layout():
     html.Button(id="chart-event-dummy", style={"display": "none"}, n_clicks=0),
     html.Button(id="details-event-dummy", style={"display": "none"}, n_clicks=0),
     html.Button(id="impulse-event-dummy", style={"display": "none"}, n_clicks=0),
+    dcc.Interval(id="ui-trace-interval", interval=1000, n_intervals=0),
+    html.Details([
+        html.Summary("🩺 Chart diagnostics (click to open)", style={"cursor": "pointer", "fontWeight": "bold"}),
+        html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events.", style={"fontSize": "12px", "margin": "6px 0"}),
+        html.Pre(id="ui-trace-output", children="No chart events yet.", style={"maxHeight": "180px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
+    ], style={"margin": "8px 0", "padding": "6px", "border": "1px solid #90a4ae", "borderRadius": "4px", "backgroundColor": "#f5f7f8"}),
     dcc.Tabs(id="main-tabs", value="tab-tasks", children=[
         dcc.Tab(label="Tasks", value="tab-tasks"),
         dcc.Tab(label="Data Analysis", value="tab-analysis"),
