@@ -3968,6 +3968,77 @@ def serve_task_card(task_id):
 '''
     return html_str
 
+# Canonical source profiles keep chart-open behaviour declarative.  They do
+# not alter task/strategy math; they only describe chart presentation defaults.
+CHART_SOURCE_PROFILES = {
+    "main_table": {
+        "navigation": "task",
+        "focus": "signal",
+        "default_panes": (),
+        "default_overlays": (),
+        "show_trade_details": False,
+    },
+    "dynamic_oscillator_summary": {
+        "navigation": "event_group",
+        "focus": "event_interval",
+        "default_panes": ("rsi", "stochastic"),
+        "default_overlays": ("event_marks", "trade_details"),
+        "show_trade_details": True,
+    },
+    # Future strategy summaries can reuse this profile without adding another
+    # chart-opening code path.  Their selected event supplies entry/exit/P&L.
+    "strategy_summary": {
+        "navigation": "event_group",
+        "focus": "event_interval",
+        "default_panes": (),
+        "default_overlays": ("event_marks", "trade_details"),
+        "show_trade_details": True,
+    },
+}
+
+
+def make_chart_context(source="main_table", *, events=None, index=0, overlay=None, **extra):
+    """Return normalized source context for every chart-opening path."""
+    source = source if source in CHART_SOURCE_PROFILES else "main_table"
+    profile = CHART_SOURCE_PROFILES[source]
+    try:
+        normalized_index = max(0, int(index or 0))
+    except (TypeError, ValueError):
+        normalized_index = 0
+    context = {
+        "source": source,
+        "events": list(events or []),
+        "index": normalized_index,
+        "overlay": bool(profile["default_overlays"]) if overlay is None else bool(overlay),
+    }
+    context.update(extra)
+    return context
+
+
+def make_chart_request(task_id, context=None):
+    """Build the canonical, UI-only chart request from task and source state."""
+    context = dict(context or make_chart_context())
+    source = context.get("source", "main_table")
+    source = source if source in CHART_SOURCE_PROFILES else "main_table"
+    profile = CHART_SOURCE_PROFILES[source]
+    events = context.get("events") or []
+    try:
+        requested_index = int(context.get("index") or 0)
+    except (TypeError, ValueError):
+        requested_index = 0
+    index = max(0, min(requested_index, len(events) - 1)) if events else 0
+    selected_event = events[index] if events and 0 <= index < len(events) else None
+    return {
+        "task_id": str(task_id) if task_id else None,
+        "source": source,
+        "profile": profile,
+        "context": {**context, "source": source, "index": index},
+        # This is deliberately the original event payload so strategy-summary
+        # charts retain entry, exit, reasons, and P&L for marks/tooltips.
+        "selected_event": selected_event,
+    }
+
+
 CHART_PANEL_STYLE = {
     "position": "relative",
     "width": "100%",
@@ -4000,7 +4071,9 @@ def build_root_layout():
     dcc.Store(id="chart-click-store", data={}),   # NEW: store for chart button click deduplication
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
-    dcc.Store(id="chart-event-context-store", data={"source": "main_table", "events": [], "index": 0, "overlay": False}),
+    dcc.Store(id="chart-event-context-store", data=make_chart_context()),
+    # Canonical request used by future source-aware chart controls/renderers.
+    dcc.Store(id="chart-request-store", data=make_chart_request(None)),
     dcc.Store(id="chart-view-state-store", data={}),  # preserves user zoom/pan while toolbar buttons rebuild the chart
     dcc.Store(id="chart-dragmode-enforcer-store", data=None),  # keeps Measure draw-rectangle mode synced with Plotly modebar
     dcc.Store(id="chart-crosshair-listener-store", data=None),  # installs browser-side full-height chart crosshair overlay
@@ -7309,7 +7382,17 @@ def set_chart_task_id(trigger_data, _table_chart_clicks, click_store):
         name="ChartNeighbourPrefetch",
         daemon=True,
     ).start()
-    return str(task_id), click_store, {"source": "main_table", "events": [], "index": 0, "overlay": False}
+    return str(task_id), click_store, make_chart_context("main_table")
+
+@app.callback(
+    Output("chart-request-store", "data"),
+    Input("chart-task-id", "data"),
+    Input("chart-event-context-store", "data"),
+    prevent_initial_call=False,
+)
+def sync_chart_request(task_id, event_context):
+    """Publish one source-aware request without changing existing chart inputs."""
+    return make_chart_request(task_id, event_context)
 
 # ----- Modal display callback -----
 @app.callback(
@@ -7337,7 +7420,7 @@ def toggle_chart_modal(task_id, click_store, close_clicks):
 )
 def clear_chart_context_on_close(_):
     """Drop the selected chart and click trigger history when the modal closes."""
-    return None, None, {}, {"source": "main_table", "events": [], "index": 0, "overlay": False}
+    return None, None, {}, make_chart_context("main_table")
 
 @app.callback(
     Output("chart-task-id", "data", allow_duplicate=True),
@@ -7375,7 +7458,7 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     task_id = str(events[event_index].get("task_id") or "")
     if not task_id:
         return no_update, no_update, no_update, no_update, no_update
-    context = {"source": "dynamic_oscillator_summary", "category": category, "events": events, "index": event_index, "overlay": True}
+    context = make_chart_context("dynamic_oscillator_summary", category=category, events=events, index=event_index, overlay=True)
     return task_id, {f"{task_id}_chart": time.time()}, context, True, True
 
 @app.callback(
