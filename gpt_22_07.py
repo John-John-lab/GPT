@@ -830,6 +830,10 @@ CHART_WEBGL_RSI_ENABLED = os.environ.get("GPT_CHART_WEBGL_RSI", "1") == "1"
 # line panes. Keep this separate from RSI so it can be rolled back without
 # affecting other oscillators or the main candle chart.
 CHART_WEBGL_STOCHASTIC_ENABLED = os.environ.get("GPT_CHART_WEBGL_STOCHASTIC", "1") == "1"
+# Encode dense trace timestamps as epoch milliseconds on an explicitly dated
+# Plotly axis. This avoids repeating long ISO timestamp strings in every pane.
+# Disable for an immediate compatibility rollback on an unusual Plotly bundle.
+CHART_COMPACT_TIME_AXIS_ENABLED = os.environ.get("GPT_CHART_COMPACT_TIME_AXIS", "1") == "1"
 # Native Plotly spikes are disabled and the chart installs its own DOM-based
 # full-pane crosshair.  The old invisible Bar helper repeated the complete
 # timestamp/value/base arrays for every oscillator pane, increasing both the
@@ -9436,6 +9440,11 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     start_ms = chart_window["start_ms"]
     end_ms = chart_window["end_ms"]
     df = chart_window["df"]
+    # Every visible pane uses the same timestamps. Epoch milliseconds are much
+    # smaller on the wire than repeated ISO strings while remaining exact on a
+    # Plotly date axis. Keep df['x'] for focus ranges and date arithmetic.
+    trace_x = (df['timestamp'].astype('int64').tolist()
+               if CHART_COMPACT_TIME_AXIS_ENABLED else df['x'])
     chart_event_context = resolve_chart_request_context(task_id, chart_request, chart_event_context)
     # Retain the canonical UI snapshot in the model for new render helpers;
     # legacy Inputs remain authoritative until the next migration step.
@@ -9501,7 +9510,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
 
     def add_main_candles(target_fig):
         target_fig.add_trace(go.Candlestick(
-            x=df['x'], open=df['open'], high=df['high'],
+            x=trace_x, open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
             customdata=df[['close', 'timestamp']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
@@ -9519,7 +9528,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         # Snap a capture-only preference rather than a reason to rebuild a
         # potentially large candle chart.
         target_fig.add_trace(go.Scatter(
-            x=df['x'], y=df['close'], mode='markers',
+            x=trace_x, y=df['close'], mode='markers',
             name='_measure_click_points', showlegend=False, hoverinfo='skip',
             marker=dict(size=18, color='rgba(0,0,0,0)')
         ), row=1, col=1)
@@ -9543,7 +9552,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
             y0, y1 = 0.0, 1.0
         low, high = (min(y0, y1), max(y0, y1))
         target_fig.add_trace(go.Bar(
-            x=df['x'], y=[high - low] * len(df), base=[low] * len(df),
+            x=trace_x, y=[high - low] * len(df), base=[low] * len(df),
             name=name, showlegend=False, opacity=0.001, marker_color='rgba(0,0,0,0.001)',
             marker_line_width=0, hoverinfo='skip'
         ), row=row, col=1)
@@ -9552,7 +9561,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         add_hover_spike_bar(target_fig, row, 0, float(df['volume'].max() or 1), f'_spike_hover_volume_{row}')
         colors = np.where(df['close'] >= df['open'], '#26a69a', '#ef5350')
         target_fig.add_trace(go.Bar(
-            x=df['x'], y=df['volume'], name="Volume",
+            x=trace_x, y=df['volume'], name="Volume",
             marker_color=colors, showlegend=False,
             hovertemplate='Volume: %{y:,.0f}<extra></extra>'
         ), row=row, col=1)
@@ -9564,15 +9573,16 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         # WebGL migration. Its values, hover template, pane range, and all
         # underlying indicator math remain exactly the same.
         target_fig.add_trace(make_chart_rsi_trace(
-            x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
+            x=trace_x, y=df['rsi'], mode='lines', name='RSI (14)',
             line=dict(color='purple', width=1.5), connectgaps=True,
             hovertemplate='RSI: %{y:.2f}<extra></extra>'
         ), row=row, col=1)
-        target_fig.add_trace(go.Scatter(
-            x=df['x'], y=[50] * len(df), mode='lines',
-            name=f'_spike_helper_rsi_{row}', showlegend=False, hoverinfo='skip',
-            line=dict(width=1, color='rgba(0,0,0,0.01)')
-        ), row=row, col=1)
+        if CHART_SPIKE_HELPER_TRACES_ENABLED:
+            target_fig.add_trace(go.Scatter(
+                x=trace_x, y=[50] * len(df), mode='lines',
+                name=f'_spike_helper_rsi_{row}', showlegend=False, hoverinfo='skip',
+                line=dict(width=1, color='rgba(0,0,0,0.01)')
+            ), row=row, col=1)
         target_fig.add_hline(y=70, line_dash="dash", line_color="red", row=row, col=1)
         target_fig.add_hline(y=30, line_dash="dash", line_color="green", row=row, col=1)
         target_fig.update_yaxes(title_text="RSI", row=row, col=1, range=[0, 100])
@@ -9582,7 +9592,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         # Only the %D curve is visible and used for strategy checks.  Keep k_col
         # in the signature so existing indicator_specs tuples remain readable.
         target_fig.add_trace(make_chart_stochastic_trace(
-            x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
+            x=trace_x, y=df[d_col], mode='lines', name=f'{title} %D',
             line=dict(color=color, width=1.4), connectgaps=True,
             hovertemplate=f'{title} %D: %{{y:.2f}}<extra></extra>'
         ), row=row, col=1)
@@ -9592,9 +9602,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
 
     def add_adx_trace(target_fig, row):
         add_hover_spike_bar(target_fig, row, 0, 100, f'_spike_hover_adx_{row}')
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['adx_14_1'], mode='lines', name='ADX 14/1', line=dict(color='#6d4c41', width=1.4), connectgaps=True, hovertemplate='ADX: %{y:.2f}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['plus_di_14'], mode='lines', name='+DI 14', line=dict(color='#2e7d32', width=1.0), connectgaps=True, hovertemplate='+DI: %{y:.2f}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['minus_di_14'], mode='lines', name='-DI 14', line=dict(color='#c62828', width=1.0), connectgaps=True, hovertemplate='-DI: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['adx_14_1'], mode='lines', name='ADX 14/1', line=dict(color='#6d4c41', width=1.4), connectgaps=True, hovertemplate='ADX: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['plus_di_14'], mode='lines', name='+DI 14', line=dict(color='#2e7d32', width=1.0), connectgaps=True, hovertemplate='+DI: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['minus_di_14'], mode='lines', name='-DI 14', line=dict(color='#c62828', width=1.0), connectgaps=True, hovertemplate='-DI: %{y:.2f}<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=25, line_dash="dash", line_color="#999", row=row, col=1)
         target_fig.update_yaxes(title_text="ADX", row=row, col=1, range=[0, 100])
 
@@ -9603,9 +9613,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         macd_max = float(pd.concat([df['macd_hist'], df['macd_line'], df['macd_signal']], axis=1).max().max())
         add_hover_spike_bar(target_fig, row, macd_min, macd_max, f'_spike_hover_macd_{row}')
         colors = np.where(df['macd_hist'] >= 0, '#26a69a', '#ef5350')
-        target_fig.add_trace(go.Bar(x=df['x'], y=df['macd_hist'], name='MACD Hist', marker_color=colors, showlegend=False, hovertemplate='Hist: %{y:.6g}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Bar(x=trace_x, y=df['macd_hist'], name='MACD Hist', marker_color=colors, showlegend=False, hovertemplate='Hist: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=0, line_dash="dash", line_color="#999", row=row, col=1)
         target_fig.update_yaxes(title_text="MACD", row=row, col=1)
 
@@ -9615,9 +9625,9 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         dix_min = float(dix_range.min().min())
         dix_max = float(dix_range.max().max())
         add_hover_spike_bar(target_fig, row, dix_min, dix_max, f'_spike_hover_disparity_{row}')
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['disparity_50'], mode='lines', name='DIX 1 (EMA 50)', line=dict(color='red', width=1.3), connectgaps=True, hovertemplate='DIX 1: %{y:.4f}%<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['disparity_25'], mode='lines', name='DIX 2 (EMA 25)', line=dict(color='blue', width=1.3), connectgaps=True, hovertemplate='DIX 2: %{y:.4f}%<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=df['x'], y=df['disparity_9'], mode='lines', name='DIX 3 (EMA 9)', line=dict(color='green', width=1.3), connectgaps=True, hovertemplate='DIX 3: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['disparity_50'], mode='lines', name='DIX 1 (EMA 50)', line=dict(color='red', width=1.3), connectgaps=True, hovertemplate='DIX 1: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['disparity_25'], mode='lines', name='DIX 2 (EMA 25)', line=dict(color='blue', width=1.3), connectgaps=True, hovertemplate='DIX 2: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(go.Scatter(x=trace_x, y=df['disparity_9'], mode='lines', name='DIX 3 (EMA 9)', line=dict(color='green', width=1.3), connectgaps=True, hovertemplate='DIX 3: %{y:.4f}%<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=0, line_dash="dot", line_color="yellow", row=row, col=1)
         target_fig.update_yaxes(title_text="CMOa DIX", row=row, col=1)
 
@@ -9907,6 +9917,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
     # X-axis tick format. Native Plotly spikes are disabled because the
     # browser-side crosshair overlay supplies the single full-pane dashed line.
     fig.update_xaxes(
+        type="date",
         tickformat="%H:%M",
         hoverformat="%Y-%m-%d %H:%M",
         ticklabelmode="period",
