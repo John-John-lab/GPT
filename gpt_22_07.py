@@ -822,6 +822,10 @@ CHART_FILE_END_CACHE_MAX = 48
 chart_file_end_cache = OrderedDict()
 CHART_TASK_INDICATOR_CACHE_MAX = 2
 chart_task_indicator_cache = OrderedDict()
+# Phase 1 rendering optimization: migrate one low-risk oscillator line first.
+# The toggle offers an immediate rollback path on an unusual browser/GPU while
+# leaving candle, bar, marker, measurement, and strategy rendering unchanged.
+CHART_WEBGL_RSI_ENABLED = os.environ.get("GPT_CHART_WEBGL_RSI", "1") == "1"
 # Warm one neighbouring range while the user studies the current chart. The
 # source cache is byte-bounded, so this is safe on older Macs and makes the
 # first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
@@ -838,6 +842,20 @@ def _chart_dataframe_bytes(df):
         return int(df.memory_usage(index=True, deep=True).sum())
     except Exception:
         return 0
+
+
+def make_chart_rsi_trace(**kwargs):
+    """Return the Phase-1 WebGL RSI trace, with a conservative SVG fallback."""
+    if CHART_WEBGL_RSI_ENABLED:
+        scattergl = getattr(go, "Scattergl", None)
+        if scattergl is not None:
+            try:
+                return scattergl(**kwargs)
+            except (TypeError, ValueError):
+                # Do not sacrifice a chart for renderer compatibility; SVG is
+                # functionally identical for the RSI line.
+                pass
+    return go.Scatter(**kwargs)
 
 def retain_chart_task_indicator_cache(task):
     """Keep lazy indicator data for only the active chart and one recent chart."""
@@ -9476,7 +9494,10 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
 
     def add_rsi_trace(target_fig, row):
         add_hover_spike_bar(target_fig, row, 0, 100, f'_spike_hover_rsi_{row}')
-        target_fig.add_trace(go.Scatter(
+        # Phase 1: RSI is a single independent line and is the safest first
+        # WebGL migration. Its values, hover template, pane range, and all
+        # underlying indicator math remain exactly the same.
+        target_fig.add_trace(make_chart_rsi_trace(
             x=df['x'], y=df['rsi'], mode='lines', name='RSI (14)',
             line=dict(color='purple', width=1.5), connectgaps=True,
             hovertemplate='RSI: %{y:.2f}<extra></extra>'
