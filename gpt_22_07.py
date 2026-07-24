@@ -826,6 +826,13 @@ chart_task_indicator_cache = OrderedDict()
 # The toggle offers an immediate rollback path on an unusual browser/GPU while
 # leaving candle, bar, marker, measurement, and strategy rendering unchanged.
 CHART_WEBGL_RSI_ENABLED = os.environ.get("GPT_CHART_WEBGL_RSI", "1") == "1"
+# Native Plotly spikes are disabled and the chart installs its own DOM-based
+# full-pane crosshair.  The old invisible Bar helper repeated the complete
+# timestamp/value/base arrays for every oscillator pane, increasing both the
+# Dash response and browser Plotly work without contributing visible output.
+# Keep an opt-in rollback for any unusual browser that still needs the legacy
+# hit targets while the lighter default is validated.
+CHART_SPIKE_HELPER_TRACES_ENABLED = os.environ.get("GPT_CHART_SPIKE_HELPERS", "0") == "1"
 # Warm one neighbouring range while the user studies the current chart. The
 # source cache is byte-bounded, so this is safe on older Macs and makes the
 # first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
@@ -9519,7 +9526,15 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         ), row=1, col=1)
 
     def add_hover_spike_bar(target_fig, row, y0, y1, name):
-        """Transparent full-pane hover target so x-spikes work anywhere in a subplot."""
+        """Add the legacy invisible hover target only when explicitly enabled.
+
+        Native Plotly spikes are disabled below and a browser-side crosshair
+        handles pane-wide guidance. Avoiding this trace normally removes three
+        full-length arrays from every optional pane and keeps the chart payload
+        proportional to visible analytical data rather than invisible helpers.
+        """
+        if not CHART_SPIKE_HELPER_TRACES_ENABLED:
+            return
         try:
             y0 = float(y0)
             y1 = float(y1)
