@@ -826,6 +826,10 @@ chart_task_indicator_cache = OrderedDict()
 # The toggle offers an immediate rollback path on an unusual browser/GPU while
 # leaving candle, bar, marker, measurement, and strategy rendering unchanged.
 CHART_WEBGL_RSI_ENABLED = os.environ.get("GPT_CHART_WEBGL_RSI", "1") == "1"
+# Phase 2 rendering optimization: Stochastic uses four independent, dense
+# line panes. Keep this separate from RSI so it can be rolled back without
+# affecting other oscillators or the main candle chart.
+CHART_WEBGL_STOCHASTIC_ENABLED = os.environ.get("GPT_CHART_WEBGL_STOCHASTIC", "1") == "1"
 # Native Plotly spikes are disabled and the chart installs its own DOM-based
 # full-pane crosshair.  The old invisible Bar helper repeated the complete
 # timestamp/value/base arrays for every oscillator pane, increasing both the
@@ -851,18 +855,27 @@ def _chart_dataframe_bytes(df):
         return 0
 
 
-def make_chart_rsi_trace(**kwargs):
-    """Return the Phase-1 WebGL RSI trace, with a conservative SVG fallback."""
-    if CHART_WEBGL_RSI_ENABLED:
+def make_chart_line_trace(webgl_enabled, **kwargs):
+    """Build a line trace with an opt-in WebGL path and safe SVG fallback."""
+    if webgl_enabled:
         scattergl = getattr(go, "Scattergl", None)
         if scattergl is not None:
             try:
                 return scattergl(**kwargs)
             except (TypeError, ValueError):
-                # Do not sacrifice a chart for renderer compatibility; SVG is
-                # functionally identical for the RSI line.
+                # Rendering compatibility must never prevent a chart opening.
                 pass
     return go.Scatter(**kwargs)
+
+
+def make_chart_rsi_trace(**kwargs):
+    """Return the Phase-1 WebGL RSI trace, with a conservative SVG fallback."""
+    return make_chart_line_trace(CHART_WEBGL_RSI_ENABLED, **kwargs)
+
+
+def make_chart_stochastic_trace(**kwargs):
+    """Return the Phase-2 WebGL Stochastic trace, with an SVG fallback."""
+    return make_chart_line_trace(CHART_WEBGL_STOCHASTIC_ENABLED, **kwargs)
 
 def retain_chart_task_indicator_cache(task):
     """Keep lazy indicator data for only the active chart and one recent chart."""
@@ -9582,7 +9595,7 @@ def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, 
         add_hover_spike_bar(target_fig, row, 0, 100, f'_spike_hover_{title}_{row}')
         # Only the %D curve is visible and used for strategy checks.  Keep k_col
         # in the signature so existing indicator_specs tuples remain readable.
-        target_fig.add_trace(go.Scatter(
+        target_fig.add_trace(make_chart_stochastic_trace(
             x=df['x'], y=df[d_col], mode='lines', name=f'{title} %D',
             line=dict(color=color, width=1.4), connectgaps=True,
             hovertemplate=f'{title} %D: %{{y:.2f}}<extra></extra>'
