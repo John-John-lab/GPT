@@ -3386,6 +3386,44 @@ const chartToggleStores = {
     'toggle-events-btn': ['events-visible-store', false],
     'toggle-measure-btn': ['measure-mode-store', false]
 };
+const chartToggleActions = {
+    'toggle-rsi-btn': ['panes', 'rsi'],
+    'toggle-stochastic-btn': ['panes', 'stochastic'],
+    'toggle-volume-btn': ['panes', 'volume'],
+    'toggle-adx-btn': ['panes', 'adx'],
+    'toggle-macd-btn': ['panes', 'macd'],
+    'toggle-disparity-btn': ['panes', 'disparity'],
+    'toggle-strategy-btn': ['overlays', 'strategy'],
+    'toggle-impulses-btn': ['overlays', 'impulses'],
+    'toggle-events-btn': ['overlays', 'events'],
+    'toggle-measure-btn': ['measurement', 'enabled'],
+    'toggle-measure-anchor-btn': ['measurement', 'snap_to_candle'],
+    'toggle-measure-hover-btn': ['measurement', 'show_hover'],
+    'toggle-measure-oscillator-range-btn': ['measurement', 'shade_oscillator_range'],
+    'toggle-chart-info-box-btn': ['information', 'candle'],
+    'toggle-oscillator-info-box-btn': ['information', 'oscillator'],
+    'toggle-oscillator-sync-info-btn': ['information', 'oscillator_sync'],
+    'toggle-chart-extend-x-btn': ['viewport', 'extend_x'],
+    'toggle-chart-focus-entry-btn': ['viewport', 'focus_entry']
+};
+const chartQueuedActions = {};
+let chartActionFlushTimer = null;
+function queueChartToggleAction(buttonId, active) {
+    const path = chartToggleActions[buttonId];
+    if (!path || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+    chartQueuedActions[path[0] + '.' + path[1]] = {type: 'set', section: path[0], key: path[1], value: Boolean(active)};
+    if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
+    chartActionFlushTimer = window.setTimeout(function() {
+        const actions = Object.keys(chartQueuedActions).map(function(key) { return chartQueuedActions[key]; });
+        Object.keys(chartQueuedActions).forEach(function(key) { delete chartQueuedActions[key]; });
+        chartActionFlushTimer = null;
+        if (!actions.length) return;
+        markChartRenderRequested(actions.length === 1 ? 'toolbar-' + actions[0].key : 'toolbar-batch');
+        window.dash_clientside.set_props('chart-ui-action-store', {data: {actions: actions, ts: Date.now()}});
+        traceUi('toolbar batch submitted', {count: actions.length});
+    }, 180);
+    return true;
+}
 // Dash 4 exposes set_props even when dynamically registered clientside callbacks
 // are disabled. Use it for immediate Store writes; a capture listener stops the
 // native button event so the server fallback cannot toggle the Store twice.
@@ -3565,8 +3603,7 @@ function applyChartToggleImmediately(button) {
         active = !Boolean(chartToggleState[button.id]);
     }
     chartToggleState[button.id] = active;
-    markChartRenderRequested(button.id);
-    window.dash_clientside.set_props(config[0], {data: active});
+    if (!queueChartToggleAction(button.id, active)) return false;
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
     const warm = button.id === 'toggle-chart-info-box-btn' || button.id === 'toggle-measure-hover-btn';
     const green = button.id === 'toggle-measure-anchor-btn';
@@ -7828,13 +7865,6 @@ if CHART_UI_STATE_LEGACY_SYNC_ENABLED:
     )(sync_chart_ui_state)
 
 
-# Explicit migration bridge: a new control can publish a small declarative
-# action without adding another Store. The grouped state is then mirrored back
-# to the existing Store inputs until every renderer/control has migrated.
-# Disabled by default: current toolbar controls still write legacy Stores directly.
-# Enable only when a newly added control publishes chart-ui-action-store actions.
-CHART_UI_LEGACY_BRIDGE_ENABLED = os.environ.get("GPT_ENABLE_CHART_UI_BRIDGE", "0") == "1"
-
 _CHART_UI_STATE_PATHS = {
     "rsi-visible-store": ("panes", "rsi"),
     "stochastic-visible-store": ("panes", "stochastic"),
@@ -7875,30 +7905,37 @@ def reduce_chart_ui_action(ui_state, action):
 
 @app.callback(
     Output("chart-ui-state-store", "data", allow_duplicate=True),
+    *[Output(store_id, "data", allow_duplicate=True) for store_id in _CHART_UI_STATE_PATHS],
     Input("chart-ui-action-store", "data"),
     State("chart-ui-state-store", "data"),
-    prevent_initial_call=True,
-)
-def apply_chart_ui_action(action, ui_state):
-    return reduce_chart_ui_action(ui_state, action)
-
-
-@app.callback(
-    *[Output(store_id, "data", allow_duplicate=True) for store_id in _CHART_UI_STATE_PATHS],
-    Input("chart-ui-state-store", "data"),
     *[State(store_id, "data") for store_id in _CHART_UI_STATE_PATHS],
     prevent_initial_call=True,
 )
-def bridge_chart_ui_state_to_legacy(ui_state, *legacy_values):
-    """Mirror grouped state to legacy writers without feedback-loop updates."""
-    if not CHART_UI_LEGACY_BRIDGE_ENABLED:
-        return tuple(no_update for _ in _CHART_UI_STATE_PATHS)
+def apply_chart_ui_action(action, ui_state, *legacy_values):
+    """Apply a debounced action batch and publish its legacy changes atomically.
+
+    The chart callback still accepts legacy Stores during migration. Returning
+    all changed Store values from one Dash response prevents a burst of toolbar
+    clicks from producing one full figure request per button.
+    """
+    actions = action.get("actions") if isinstance(action, dict) else None
+    if not isinstance(actions, list):
+        actions = [action] if isinstance(action, dict) else []
     state = ui_state or make_chart_ui_state()
-    outputs = []
-    for (section, key), legacy_value in zip(_CHART_UI_STATE_PATHS.values(), legacy_values):
-        desired = bool((state.get(section) or {}).get(key, False))
-        outputs.append(no_update if desired == bool(legacy_value) else desired)
-    return tuple(outputs)
+    outputs = [no_update] * len(_CHART_UI_STATE_PATHS)
+    path_indexes = {path: index for index, path in enumerate(_CHART_UI_STATE_PATHS.values())}
+    for item in actions:
+        if not isinstance(item, dict):
+            continue
+        state = reduce_chart_ui_action(state, item)
+        path = (item.get("section"), item.get("key"))
+        index = path_indexes.get(path)
+        if index is None:
+            continue
+        desired = bool((state.get(path[0]) or {}).get(path[1], False))
+        if desired != bool(legacy_values[index]):
+            outputs[index] = desired
+    return (state, *outputs)
 
 
 # ----- Modal display callback -----
