@@ -4156,8 +4156,17 @@ function bindTablesBelow(node) {
 }
 
 function installTableRenderListener() {
-    if (window.__tableRenderObserver || !document.body) return;
-    document.querySelectorAll('table').forEach(bindRenderedTable);
+    if (window.__tableRenderObserver) return;
+    const container = document.getElementById('task-table-container');
+    if (!container) {
+        // Dash mounts dynamic tab content after the page shell. Retry only
+        // until the dedicated table container exists; never observe the whole
+        // document while Plotly is creating thousands of SVG nodes.
+        window.__tableRenderObserverRetryCount = (window.__tableRenderObserverRetryCount || 0) + 1;
+        if (window.__tableRenderObserverRetryCount <= 50) window.setTimeout(installTableRenderListener, 100);
+        return;
+    }
+    container.querySelectorAll('table').forEach(bindRenderedTable);
     window.__tableRenderObserver = new MutationObserver(function(mutations) {
         let tableAdded = false;
         mutations.forEach(function(mutation) {
@@ -4172,7 +4181,11 @@ function installTableRenderListener() {
         // table work on every interaction.
         if (tableAdded) applyHiddenColumns();
     });
-    window.__tableRenderObserver.observe(document.body, {childList: true, subtree: true});
+    // The previous document.body observer processed every Plotly SVG mutation
+    // and could compete with chart paint. Table binding only needs changes
+    // below the task table container; all other tables retain the capture
+    // phase highlight fallback below.
+    window.__tableRenderObserver.observe(container, {childList: true, subtree: true});
 }
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', installTableRenderListener, {once: true});
