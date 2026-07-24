@@ -3513,7 +3513,10 @@ function installChartBrowserRenderTrace() {
             const elapsedMs = request ? Math.round(performance.now() - request.startedAt) : null;
             // A figure may emit more than one afterplot event while Plotly
             // settles its layout. Report the first paint for this request.
-            if (request) window.__gptChartRenderRequest = null;
+            if (request) {
+                window.__gptChartRenderRequest = null;
+                window.__gptPendingChartTaskId = '';
+            }
             window.requestAnimationFrame(function() {
                 traceUi('chart browser applied', {
                     kind: request ? request.kind : 'external',
@@ -3930,6 +3933,14 @@ function openAdjacentChartImmediately(button) {
     const taskId = String(button.getAttribute('data-target-task-id') || '');
     if (!taskId || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
     const direction = button.id === 'prev-chart-btn' ? 'previous' : 'next';
+    if (window.__gptPendingChartTaskId === taskId) {
+        traceUi('duplicate chart navigation ignored', {direction: direction, taskId: taskId});
+        return true;
+    }
+    window.__gptPendingChartTaskId = taskId;
+    window.setTimeout(function() {
+        if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
+    }, 30000);
     markChartRenderRequested(button.id);
     window.dash_clientside.set_props('chart-task-id', {data: taskId});
     // The modal is already open; this store only preserves the existing
@@ -8378,59 +8389,43 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     // appended after these, so Clear/Backspace cannot delete Signal Level.
     plot.__dashBaseShapeCount = ((figure.layout && figure.layout.shapes) || []).length;
 
-    // Do not deep-clone and return the complete chart. Large candle figures
-    // made that old path serialize/reconcile every point for a UI-only toggle.
-    const layoutUpdate = {dragmode: effectiveMeasureMode ? 'drawrect' : 'pan'};
+    // The server figure already contains normal drag, hover, spike, and axis
+    // values. Issue a second Plotly layout pass only when a live interaction
+    // preference actually differs from the rendered layout.
+    const layoutUpdate = {};
     const showHover = (!effectiveMeasureMode || effectiveMeasureHover);
-    layoutUpdate.hovermode = showHover ? 'x' : false;
-    layoutUpdate.hoversubplots = showHover ? 'axis' : false;
+    const desiredDragMode = effectiveMeasureMode ? 'drawrect' : 'pan';
+    const currentLayout = plot.layout || {};
+    if (currentLayout.dragmode !== desiredDragMode) layoutUpdate.dragmode = desiredDragMode;
+    const desiredHoverMode = showHover ? 'x' : false;
+    if (currentLayout.hovermode !== desiredHoverMode) layoutUpdate.hovermode = desiredHoverMode;
+    const desiredHoverSubplots = showHover ? 'axis' : false;
+    if (currentLayout.hoversubplots !== desiredHoverSubplots) layoutUpdate.hoversubplots = desiredHoverSubplots;
 
     const meta = figure.layout.meta || {};
     const hasEventFocus = Array.isArray(meta.event_focus_xrange) && meta.event_focus_xrange.length === 2;
     const targetRange = hasEventFocus ? meta.event_focus_xrange : (focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange));
-    Object.keys(figure.layout).forEach(function(key) {
-        if (/^xaxis[0-9]*$/.test(key)) {
-            layoutUpdate[key + '.showspikes'] = false;
-            layoutUpdate[key + '.spikemode'] = 'across+toaxis';
-            layoutUpdate[key + '.spikecolor'] = '#666';
-            layoutUpdate[key + '.spikethickness'] = 1;
-            layoutUpdate[key + '.spikedash'] = 'dash';
-            layoutUpdate[key + '.spikesnap'] = 'cursor';
-            if ((extendX || focusEntry || hasEventFocus) && targetRange && targetRange.length === 2) {
+    if ((extendX || focusEntry || hasEventFocus) && targetRange && targetRange.length === 2) {
+        Object.keys(figure.layout).forEach(function(key) {
+            if (/^xaxis[0-9]*$/.test(key)) {
                 layoutUpdate[key + '.range'] = targetRange;
                 layoutUpdate[key + '.autorange'] = false;
             }
-        }
-        if (/^yaxis[0-9]*$/.test(key)) {
-            layoutUpdate[key + '.showspikes'] = false;
-        }
-    });
-    if (!extendX && !focusEntry && !hasEventFocus && viewState && String(viewState.task_id || '') === String(chartTaskId || '')) {
-        const axes = viewState.axes || {};
-        Object.keys(axes).forEach(function(axisName) {
-            if (/^yaxis[0-9]+$/.test(axisName)) return;
-            const axisState = axes[axisName] || {};
-            if (axisState.range && axisState.range.length === 2) {
-                layoutUpdate[axisName + '.range'] = axisState.range.slice();
-                layoutUpdate[axisName + '.autorange'] = false;
-            } else if (axisState.autorange) {
-                layoutUpdate[axisName + '.autorange'] = true;
-            }
         });
     }
-    window.Plotly.relayout(plot, layoutUpdate);
-    if (measureMode) {
-        // A server-rendered figure can arrive just after the Store becomes
-        // active. Reassert drawrect after Plotly has reconciled that figure,
-        // without registering a second callback for the same Dash output.
-        function enforceDrawRect() {
-            if (plot.layout && plot.layout.dragmode !== 'drawrect') {
-                window.Plotly.relayout(plot, {dragmode: 'drawrect'});
+    // Plotly uirevision preserves zoom/pan for same-task figure changes, so
+    // replaying chart-view-state here only caused a redundant full redraw.
+    if (Object.keys(layoutUpdate).length) window.Plotly.relayout(plot, layoutUpdate);
+    if (effectiveMeasureMode) {
+        // The optimistic Measure click already updates the current plot. Retry
+        // once only if Dash replaced that node while the mode was active.
+        window.setTimeout(function() {
+            const currentRoot = document.getElementById('task-chart');
+            const currentPlot = currentRoot ? (currentRoot.querySelector('.js-plotly-plot') || currentRoot) : null;
+            if (currentPlot && currentPlot.layout && currentPlot.layout.dragmode !== 'drawrect') {
+                window.Plotly.relayout(currentPlot, {dragmode: 'drawrect'});
             }
-        }
-        window.setTimeout(enforceDrawRect, 0);
-        window.setTimeout(enforceDrawRect, 60);
-        window.setTimeout(enforceDrawRect, 200);
+        }, 120);
     }
     const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
     if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
@@ -8452,67 +8447,58 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
     const expectedTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
     function applyHoverVisibility(targetPlot) {
-        if (!targetPlot || !window.Plotly) return;
+        if (!targetPlot || !window.Plotly) return false;
         const actualTaskId = String(((targetPlot.layout || {}).meta || {}).task_id || '');
-        // A navigation callback can run before React replaces the Plotly DOM.
-        // Never restyle the old coin with settings intended for the new coin.
-        if (expectedTaskId && actualTaskId && expectedTaskId !== actualTaskId) return;
+        if (expectedTaskId && actualTaskId && expectedTaskId !== actualTaskId) return false;
+        const policyKey = [expectedTaskId, showHover, candleInfo, oscillatorInfo, oscillatorSyncInfo,
+            (targetPlot.data || []).length].join('|');
+        if (targetPlot.__gptHoverPolicyKey === policyKey) return true;
+        const indices = [];
+        const hoverInfos = [];
+        const templateGroups = {};
         (targetPlot.data || []).forEach(function(trace, index) {
-        const traceName = trace.name ? String(trace.name) : '';
-        const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
-        const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
-        const isDynamicStrategyEvent = traceName === 'Dynamic strategy entry' || traceName === 'Dynamic strategy exit';
-        // Dynamic event traces already carry their full, server-built reason
-        // hovertemplate. Do not overwrite it during a zoom/pan/toggle update.
-        if (isDynamicStrategyEvent && showHover && !oscillatorSyncInfo) return;
-        // Main-pane entry/exit markers are candle information, not oscillator
-        // information. Keep the two toggles independent even at an entry x.
-        const isMainPane = !trace.yaxis || trace.yaxis === 'y';
-        let hoverinfo = null;
-        let hovertemplate = null;
-        if (!showHover || isHelper) {
-            hoverinfo = 'skip';
-        } else if (isSpikeHoverHelper) {
-            // The dark gray crosshair already shows time. Suppress this
-            // transparent helper's duplicate white timestamp tooltip.
-            hoverinfo = 'skip';
-        } else if (isMainPane && (oscillatorSyncInfo || (!candleInfo && !isDynamicStrategyEvent))) {
-            hoverinfo = 'skip';
-        } else if (!isMainPane && !(oscillatorInfo || oscillatorSyncInfo)) {
-            hoverinfo = 'skip';
-        } else {
-            // Explicitly restore hover after an Osc Info/Osc All toggle. A
-            // trace may previously have been set to skip, and leaving the
-            // property unchanged would keep every synchronized box hidden.
-            hoverinfo = 'all';
-            if (trace.type === 'candlestick') {
-                hovertemplate = candleTemplate;
-            } else if (trace.name && String(trace.name).includes('Volume')) {
-                hovertemplate = 'Volume: %{y:,.0f}<extra></extra>';
-            } else if (trace.name && String(trace.name).includes('RSI')) {
-                hovertemplate = 'RSI: %{y:.2f}<extra></extra>';
-            } else if (trace.name && (String(trace.name).includes('%K') || String(trace.name).includes('%D'))) {
-                const cleanName = String(trace.name).replace(' %K', '').replace(' %D', '');
-                hovertemplate = cleanName + ': %{y:.2f}<extra></extra>';
+            const traceName = trace.name ? String(trace.name) : '';
+            const isSpikeHoverHelper = traceName.startsWith('_spike_hover_');
+            const isHelper = traceName.startsWith('_') && !isSpikeHoverHelper;
+            const isDynamicStrategyEvent = traceName === 'Dynamic strategy entry' || traceName === 'Dynamic strategy exit';
+            if (isDynamicStrategyEvent && showHover && !oscillatorSyncInfo) return;
+            const isMainPane = !trace.yaxis || trace.yaxis === 'y';
+            let hoverinfo = 'all';
+            if (!showHover || isHelper || isSpikeHoverHelper) hoverinfo = 'skip';
+            else if (isMainPane && (oscillatorSyncInfo || (!candleInfo && !isDynamicStrategyEvent))) hoverinfo = 'skip';
+            else if (!isMainPane && !(oscillatorInfo || oscillatorSyncInfo)) hoverinfo = 'skip';
+            indices.push(index);
+            hoverInfos.push(hoverinfo);
+            if (hoverinfo !== 'skip') {
+                let template = null;
+                if (trace.type === 'candlestick') template = candleTemplate;
+                else if (traceName.includes('Volume')) template = 'Volume: %{y:,.0f}<extra></extra>';
+                else if (traceName.includes('RSI')) template = 'RSI: %{y:.2f}<extra></extra>';
+                else if (traceName.includes('%K') || traceName.includes('%D')) {
+                    const cleanName = traceName.replace(' %K', '').replace(' %D', '');
+                    template = cleanName + ': %{y:.2f}<extra></extra>';
+                }
+                if (template) (templateGroups[template] || (templateGroups[template] = [])).push(index);
             }
-        }
-            const update = {};
-            if (hoverinfo !== null) update.hoverinfo = hoverinfo;
-            if (hovertemplate !== null) update.hovertemplate = hovertemplate;
-            if (Object.keys(update).length) window.Plotly.restyle(targetPlot, update, [index]);
         });
+        if (indices.length) window.Plotly.restyle(targetPlot, {hoverinfo: hoverInfos}, indices);
+        Object.keys(templateGroups).forEach(function(template) {
+            window.Plotly.restyle(targetPlot, {hovertemplate: template}, templateGroups[template]);
+        });
+        targetPlot.__gptHoverPolicyKey = policyKey;
+        return true;
     }
-    applyHoverVisibility(plot);
-    // Figure replacement and Plotly trace creation are asynchronous. Reapply
-    // the hover policy after those phases so Candle Info stays Off when an
-    // oscillator, Focus Entry, or another figure-changing control is used.
-    [0, 60, 200].forEach(function(delay) {
+    // Default hover behavior is already encoded in the server figure. Avoid
+    // any post-render restyle during normal Next/Previous navigation.
+    const needsHoverPolicy = !showHover || !oscillatorInfo || Boolean(oscillatorSyncInfo) || Boolean(plot.__gptHoverPolicyKey);
+    if (needsHoverPolicy) {
+        applyHoverVisibility(plot);
         window.setTimeout(function() {
             const currentRoot = document.getElementById('task-chart');
             const currentPlot = currentRoot ? (currentRoot.querySelector('.js-plotly-plot') || currentRoot) : null;
             applyHoverVisibility(currentPlot);
-        }, delay);
-    });
+        }, 120);
+    }
     if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup();
     return {ts: Date.now(), measure: Boolean(effectiveMeasureMode), hover: Boolean(showHover)};
 }
