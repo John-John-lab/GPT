@@ -3953,11 +3953,11 @@ function openAdjacentChartImmediately(button) {
         if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
     }, 30000);
     markChartRenderRequested(button.id);
+    // Navigation needs only the selected task. Unlike a table Chart action,
+    // the modal is already open, so updating chart-click-store merely schedules
+    // an additional modal callback while the large figure request is pending.
     window.dash_clientside.set_props('chart-task-id', {data: taskId});
-    // The modal is already open; this store only preserves the existing
-    // click/deduplication contract without asking Dash to resolve a target.
-    window.dash_clientside.set_props('chart-click-store', {data: {[taskId + '_chart']: Date.now() / 1000}});
-    traceUi('local chart navigation', {direction: direction, taskId: taskId});
+    traceUi('local chart navigation', {direction: direction, taskId: taskId, storeWrites: 1});
     return true;
 }
 // Capture phase lets direct Store updates reach Dash before React queues the
