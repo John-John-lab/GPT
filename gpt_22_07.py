@@ -3421,7 +3421,9 @@ function queueChartToggleAction(buttonId, active) {
         markChartRenderRequested(actions.length === 1 ? 'toolbar-' + actions[0].key : 'toolbar-batch');
         window.dash_clientside.set_props('chart-ui-action-store', {data: {actions: actions, ts: Date.now()}});
         traceUi('toolbar batch submitted', {count: actions.length});
-    }, 180);
+    // A half-second quiet period is comfortable for deliberate multi-pane
+    // selection while still giving a single click immediate visual feedback.
+    }, 500);
     return true;
 }
 // Dash 4 exposes set_props even when dynamically registered clientside callbacks
