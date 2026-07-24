@@ -841,10 +841,11 @@ CHART_COMPACT_TIME_AXIS_ENABLED = os.environ.get("GPT_CHART_COMPACT_TIME_AXIS", 
 # Keep an opt-in rollback for any unusual browser that still needs the legacy
 # hit targets while the lighter default is validated.
 CHART_SPIKE_HELPER_TRACES_ENABLED = os.environ.get("GPT_CHART_SPIKE_HELPERS", "0") == "1"
-# Warm one neighbouring range while the user studies the current chart. The
-# source cache is byte-bounded, so this is safe on older Macs and makes the
-# first Next/Previous action much faster. Set GPT_CHART_PREFETCH=0 to disable.
-CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "1") == "1"
+# Optional neighbour warming is disabled by default. Runtime traces show cold
+# reads take only tens of milliseconds, while a delayed background read can
+# overlap the much more expensive Dash/Plotly response and paint. Enable with
+# GPT_CHART_PREFETCH=1 only when measurements show cold storage is dominant.
+CHART_PREFETCH_ENABLED = os.environ.get("GPT_CHART_PREFETCH", "0") == "1"
 # Let the foreground chart read claim an older SSD before optional neighbour
 # warm-up begins.  Set to 0 only on machines with fast storage.
 CHART_PREFETCH_DELAY_SECONDS = max(0.0, float(os.environ.get("GPT_CHART_PREFETCH_DELAY", "2.0")))
@@ -3189,7 +3190,7 @@ def register_browser_callback(*args, **kwargs):
 
 @app.callback(
     Output("ui-trace-output", "children"),
-    Input("ui-trace-interval", "n_intervals"),
+    Input("ui-trace-refresh-btn", "n_clicks"),
     prevent_initial_call=False,
 )
 def render_ui_trace(_):
@@ -3344,9 +3345,15 @@ document.addEventListener('click', function(event) {
     const id = target && target.closest ? (target.closest('button, th, td') || {}).id : '';
     window.__gptEarlyTrace('capture click target=' + (target && target.tagName ? target.tagName : '?') + ' id=' + (id || '-'));
 }, true);
-window.setInterval(function() {
+// The trace functions repaint immediately when a new event is recorded. Only
+// poll briefly while Dash mounts the diagnostics panel; a permanent 500 ms DOM
+// rewrite competed with Plotly on the browser main thread.
+(function waitForBrowserTracePanel(attempt) {
     window.__gptRenderBrowserTrace();
-}, 500);
+    if (!document.getElementById('ui-client-trace-output') && attempt < 40) {
+        window.setTimeout(function() { waitForBrowserTracePanel(attempt + 1); }, 250);
+    }
+})(0);
 // Global store for hidden columns (by zero-based column index)
 let hiddenColumns = new Set();
 // Function to apply hidden column classes to the current table
@@ -4556,12 +4563,14 @@ def build_root_layout():
     html.Button(id="chart-event-dummy", style={"display": "none"}, n_clicks=0),
     html.Button(id="details-event-dummy", style={"display": "none"}, n_clicks=0),
     html.Button(id="impulse-event-dummy", style={"display": "none"}, n_clicks=0),
-    dcc.Interval(id="ui-trace-interval", interval=5000, n_intervals=0),
     html.Details([
         html.Summary("🩺 Chart diagnostics (click to open)", style={"cursor": "pointer", "fontWeight": "bold"}),
-        html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events. The blue area is read-only; use the test button below to verify browser click tracing.", style={"fontSize": "12px", "margin": "6px 0"}),
-        html.Button("Test browser click tracing", id="ui-client-trace-test-btn", n_clicks=0, style={"fontSize": "12px", "marginBottom": "6px"}),
-        html.Pre(id="ui-trace-output", children="No server chart events yet.", style={"maxHeight": "140px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
+        html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events. Click Refresh server trace after testing; the panel does not poll while you use the chart. The blue area updates directly in the browser.", style={"fontSize": "12px", "margin": "6px 0"}),
+        html.Div([
+            html.Button("Test browser click tracing", id="ui-client-trace-test-btn", n_clicks=0, style={"fontSize": "12px", "marginRight": "6px"}),
+            html.Button("Refresh server trace", id="ui-trace-refresh-btn", n_clicks=0, style={"fontSize": "12px"}),
+        ], style={"marginBottom": "6px"}),
+        html.Pre(id="ui-trace-output", children="No server chart events yet. Click Refresh server trace after testing.", style={"maxHeight": "140px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
         html.Pre(id="ui-client-trace-output", children="Browser click trace: waiting for page script.", style={"maxHeight": "100px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#102027", "color": "#b2ebf2", "padding": "8px", "fontSize": "11px", "borderRadius": "4px", "marginTop": "6px"}),
     ], style={"margin": "8px 0", "padding": "6px", "border": "1px solid #90a4ae", "borderRadius": "4px", "backgroundColor": "#f5f7f8"}),
     dcc.Tabs(id="main-tabs", value="tab-tasks", children=[
