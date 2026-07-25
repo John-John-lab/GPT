@@ -830,6 +830,9 @@ CHART_WEBGL_RSI_ENABLED = os.environ.get("GPT_CHART_WEBGL_RSI", "1") == "1"
 # line panes. Keep this separate from RSI so it can be rolled back without
 # affecting other oscillators or the main candle chart.
 CHART_WEBGL_STOCHASTIC_ENABLED = os.environ.get("GPT_CHART_WEBGL_STOCHASTIC", "1") == "1"
+# Phase 3 rendering optimization: ADX has three dense line series in one pane.
+# Keep an independent rollback because browser/GPU behavior can vary.
+CHART_WEBGL_ADX_ENABLED = os.environ.get("GPT_CHART_WEBGL_ADX", "1") == "1"
 # Encode dense trace timestamps as epoch milliseconds on an explicitly dated
 # Plotly axis. This avoids repeating long ISO timestamp strings in every pane.
 # Disable for an immediate compatibility rollback on an unusual Plotly bundle.
@@ -881,6 +884,12 @@ def make_chart_rsi_trace(**kwargs):
 def make_chart_stochastic_trace(**kwargs):
     """Return the Phase-2 WebGL Stochastic trace, with an SVG fallback."""
     return make_chart_line_trace(CHART_WEBGL_STOCHASTIC_ENABLED, **kwargs)
+
+
+def make_chart_adx_trace(**kwargs):
+    """Return a Phase-3 WebGL ADX line, with an SVG fallback."""
+    return make_chart_line_trace(CHART_WEBGL_ADX_ENABLED, **kwargs)
+
 
 def retain_chart_task_indicator_cache(task):
     """Keep lazy indicator data for only the active chart and one recent chart."""
@@ -9707,9 +9716,9 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
 
     def add_adx_trace(target_fig, row):
         add_hover_spike_bar(target_fig, row, 0, 100, f'_spike_hover_adx_{row}')
-        target_fig.add_trace(go.Scatter(x=trace_x, y=df['adx_14_1'], mode='lines', name='ADX 14/1', line=dict(color='#6d4c41', width=1.4), connectgaps=True, hovertemplate='ADX: %{y:.2f}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=trace_x, y=df['plus_di_14'], mode='lines', name='+DI 14', line=dict(color='#2e7d32', width=1.0), connectgaps=True, hovertemplate='+DI: %{y:.2f}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=trace_x, y=df['minus_di_14'], mode='lines', name='-DI 14', line=dict(color='#c62828', width=1.0), connectgaps=True, hovertemplate='-DI: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_adx_trace(x=trace_x, y=df['adx_14_1'], mode='lines', name='ADX 14/1', line=dict(color='#6d4c41', width=1.4), connectgaps=True, hovertemplate='ADX: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_adx_trace(x=trace_x, y=df['plus_di_14'], mode='lines', name='+DI 14', line=dict(color='#2e7d32', width=1.0), connectgaps=True, hovertemplate='+DI: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_adx_trace(x=trace_x, y=df['minus_di_14'], mode='lines', name='-DI 14', line=dict(color='#c62828', width=1.0), connectgaps=True, hovertemplate='-DI: %{y:.2f}<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=25, line_dash="dash", line_color="#999", row=row, col=1)
         target_fig.update_yaxes(title_text="ADX", row=row, col=1, range=[0, 100])
 
