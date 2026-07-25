@@ -7829,15 +7829,22 @@ function(taskId, page) {
 
 @app.callback(
     Output("progress-interval", "disabled"),
-    Output("analysis-interval", "disabled"),  # 🔧 Enable analysis-interval during recalc
+    Output("analysis-interval", "disabled"),
     Input("progress-interval", "n_intervals"),
-    prevent_initial_call=True
+    Input("chart-task-id", "data"),
+    prevent_initial_call=True,
 )
-def auto_throttle_updates(_):
-    """Keep interval always enabled. 
-    The 'update_summary' callback handles performance by returning 'no_update' 
-    when the table hasn't actually changed."""
-    return False, False  # 🔧 Keep both intervals enabled
+def auto_throttle_updates(_interval, chart_task_id):
+    """Pause background UI polling while an interactive chart is open.
+
+    The ten-second progress tick fans out to task logs, selectors, monitors,
+    Golden Store synchronization, and recalculation status callbacks. Those
+    responses compete with large Plotly updates in Dash's browser queue. The
+    underlying workers continue running; closing the chart resumes UI polling.
+    """
+    if chart_task_id:
+        return True, True
+    return False, False
 
 # ----- NEW: Callback for chart button using data-action pattern -----
 # This callback listens to the hidden trigger that JS sets when chart button is clicked
