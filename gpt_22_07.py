@@ -3928,6 +3928,16 @@ function openTableChartImmediately(button) {
         const id = JSON.parse(rawId);
         if (id.type !== 'task-table-chart' || !id.task_id) return false;
         const taskId = String(id.task_id);
+        // A double-click previously submitted two identical ~1 MB figures.
+        // Consume the repeated click while the same task is still rendering.
+        if (window.__gptPendingChartTaskId === taskId) {
+            traceUi('duplicate table chart ignored', {taskId: taskId});
+            return true;
+        }
+        window.__gptPendingChartTaskId = taskId;
+        window.setTimeout(function() {
+            if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
+        }, 30000);
         markChartRenderRequested('main-table-chart');
         window.dash_clientside.set_props('chart-task-id', {data: taskId});
         window.dash_clientside.set_props('chart-click-store', {data: {[taskId + '_chart']: Date.now() / 1000}});
