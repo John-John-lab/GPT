@@ -7972,6 +7972,53 @@ def reduce_chart_ui_action(ui_state, action):
     return state
 
 
+_CHART_RENDER_ACTION_PATHS = {
+    ("panes", "rsi"): "rsi_visible",
+    ("panes", "stochastic"): "stochastic_visible",
+    ("panes", "volume"): "volume_visible",
+    ("panes", "adx"): "adx_visible",
+    ("panes", "macd"): "macd_visible",
+    ("panes", "disparity"): "disparity_visible",
+    ("overlays", "strategy"): "strategy_visible",
+    ("overlays", "impulses"): "impulse_visible",
+    ("overlays", "events"): "events_visible",
+    ("information", "candle"): "candle_info_enabled",
+    ("viewport", "focus_entry"): "focus_entry",
+}
+
+
+def chart_action_affects_render(payload):
+    """Return whether a toolbar payload changes traces or server layout."""
+    actions = payload.get("actions") if isinstance(payload, dict) else None
+    if not isinstance(actions, list):
+        actions = [payload] if isinstance(payload, dict) else []
+    return any(
+        isinstance(action, dict)
+        and (action.get("section"), action.get("key")) in _CHART_RENDER_ACTION_PATHS
+        for action in actions
+    )
+
+
+def apply_chart_render_actions(values, payload):
+    """Overlay the newest toolbar intent on legacy values for immediate render.
+
+    The action Store and legacy compatibility bridge are triggered together.
+    Rendering from this payload avoids waiting for the bridge round trip while
+    the legacy Stores continue to support existing labels and callbacks.
+    """
+    resolved = dict(values)
+    actions = payload.get("actions") if isinstance(payload, dict) else None
+    if not isinstance(actions, list):
+        actions = [payload] if isinstance(payload, dict) else []
+    for action in actions:
+        if not isinstance(action, dict) or action.get("type") != "set":
+            continue
+        name = _CHART_RENDER_ACTION_PATHS.get((action.get("section"), action.get("key")))
+        if name:
+            resolved[name] = bool(action.get("value"))
+    return resolved
+
+
 @app.callback(
     Output("chart-ui-state-store", "data", allow_duplicate=True),
     *[Output(store_id, "data", allow_duplicate=True) for store_id in _CHART_UI_STATE_PATHS],
@@ -8125,6 +8172,7 @@ _CHART_TOGGLE_BUTTONS = {
 
 @app.callback(
     *[Output(store_id, "data") for store_id in _CHART_TOGGLE_BUTTONS.values()],
+    Output("chart-ui-action-store", "data", allow_duplicate=True),
     *[Input(button_id, "n_clicks") for button_id in _CHART_TOGGLE_BUTTONS],
     *[State(store_id, "data") for store_id in _CHART_TOGGLE_BUTTONS.values()],
     prevent_initial_call=True,
@@ -8135,13 +8183,16 @@ def toggle_chart_control_server(*args):
     current_values = args[count:]
     triggered = ctx.triggered_id
     if triggered not in _CHART_TOGGLE_BUTTONS:
-        return tuple(no_update for _ in range(count))
+        return tuple(no_update for _ in range(count + 1))
     outputs = [no_update] * count
     target_store = _CHART_TOGGLE_BUTTONS[triggered]
     target_index = list(_CHART_TOGGLE_BUTTONS.values()).index(target_store)
     interaction_trace(f"toolbar click={triggered} store={target_store} old={current_values[target_index]!r}")
-    outputs[target_index] = not bool(current_values[target_index])
-    return tuple(outputs)
+    desired = not bool(current_values[target_index])
+    outputs[target_index] = desired
+    section, key = _CHART_UI_STATE_PATHS[target_store]
+    action = {"actions": [{"type": "set", "section": section, "key": key, "value": desired}], "ts": time.time()}
+    return (*outputs, action)
 
 # ----- Measurement tool callbacks -----
 @app.callback(
@@ -9414,32 +9465,60 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
 @app.callback(
     Output("task-chart", "figure"),
     Input("chart-task-id", "data"),
-    Input("rsi-visible-store", "data"),
-    Input("stochastic-visible-store", "data"),
-    Input("volume-visible-store", "data"),
-    Input("adx-visible-store", "data"),
-    Input("macd-visible-store", "data"),
-    Input("disparity-visible-store", "data"),
-    Input("strategy-visible-store", "data"),
-    Input("impulse-visible-store", "data"),
-    Input("events-visible-store", "data"),
+    # Toolbar actions trigger rendering directly. Legacy Stores below are
+    # compatibility State, so their bridge update cannot queue a second figure.
+    Input("chart-ui-action-store", "data"),
     Input("chart-event-context-store", "data"),
-    Input("chart-focus-entry-store", "data"),
-    # Candle Info is a rendering input, not only clientside state. Keeping it
-    # as an Input ensures Candle Info: Off is authoritative even when the
-    # optional inline Dash callbacks are disabled for renderer compatibility.
-    Input("chart-info-box-store", "data"),
-    # During migration these are States: legacy inputs retain exact timing,
-    # while render helpers can consume the canonical contracts safely.
+    State("rsi-visible-store", "data"),
+    State("stochastic-visible-store", "data"),
+    State("volume-visible-store", "data"),
+    State("adx-visible-store", "data"),
+    State("macd-visible-store", "data"),
+    State("disparity-visible-store", "data"),
+    State("strategy-visible-store", "data"),
+    State("impulse-visible-store", "data"),
+    State("events-visible-store", "data"),
+    State("chart-focus-entry-store", "data"),
+    State("chart-info-box-store", "data"),
     State("chart-request-store", "data"),
     State("chart-ui-state-store", "data"),
     State("chart-view-state-store", "data"),
     State("measure-mode-store", "data"),
-    prevent_initial_call=True
+    prevent_initial_call=True,
 )
-def update_task_chart(task_id, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, chart_event_context, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode):
+def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode):
     if not task_id:
         return go.Figure()
+    # Measure, Snap, hover, oscillator information, and similar browser-only
+    # controls share the action Store but must not rebuild a large figure.
+    if ctx.triggered_id == "chart-ui-action-store" and not chart_action_affects_render(chart_action):
+        return no_update
+    render_values = apply_chart_render_actions({
+        "rsi_visible": rsi_visible,
+        "stochastic_visible": stochastic_visible,
+        "volume_visible": volume_visible,
+        "adx_visible": adx_visible,
+        "macd_visible": macd_visible,
+        "disparity_visible": disparity_visible,
+        "strategy_visible": strategy_visible,
+        "impulse_visible": impulse_visible,
+        "events_visible": events_visible,
+        "focus_entry": focus_entry,
+        "candle_info_enabled": candle_info_enabled,
+        "measure_mode": measure_mode,
+    }, chart_action)
+    rsi_visible = render_values["rsi_visible"]
+    stochastic_visible = render_values["stochastic_visible"]
+    volume_visible = render_values["volume_visible"]
+    adx_visible = render_values["adx_visible"]
+    macd_visible = render_values["macd_visible"]
+    disparity_visible = render_values["disparity_visible"]
+    strategy_visible = render_values["strategy_visible"]
+    impulse_visible = render_values["impulse_visible"]
+    events_visible = render_values["events_visible"]
+    focus_entry = render_values["focus_entry"]
+    candle_info_enabled = render_values["candle_info_enabled"]
+    measure_mode = render_values["measure_mode"]
     task = tm.get_task(task_id)
     interaction_trace(f"chart render start task={task_id} request={getattr(chart_request, 'get', lambda *_: None)('source') if isinstance(chart_request, dict) else None}")
     timer = PerfTimer(f"Chart render {task_id}").start()
