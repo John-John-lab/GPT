@@ -907,6 +907,23 @@ def make_chart_disparity_trace(**kwargs):
     return make_chart_line_trace(CHART_WEBGL_DISPARITY_ENABLED, **kwargs)
 
 
+def compute_chart_macd(close, fast_length=12, slow_length=26, signal_length=9):
+    """Return standard MACD in the same price units as ``close``.
+
+    MACD is EMA(fast) minus EMA(slow); it is not divided by 100 or normalized
+    to a percentage. Low-priced coins can therefore legitimately produce
+    values such as 0.005. The signal is an EMA of MACD and histogram is their
+    difference.
+    """
+    close = pd.Series(close, dtype="float64")
+    fast_ema = close.ewm(span=fast_length, adjust=False, min_periods=fast_length).mean()
+    slow_ema = close.ewm(span=slow_length, adjust=False, min_periods=slow_length).mean()
+    macd_line = fast_ema - slow_ema
+    signal_line = macd_line.ewm(span=signal_length, adjust=False, min_periods=signal_length).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
 def retain_chart_task_indicator_cache(task):
     """Keep lazy indicator data for only the active chart and one recent chart."""
     task_id = str(getattr(task, "task_id", ""))
@@ -9622,15 +9639,6 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
         adx = dx.ewm(alpha=1 / max(int(adx_smoothing or 1), 1), adjust=False, min_periods=max(int(adx_smoothing or 1), 1)).mean()
         return adx, plus_di, minus_di
 
-    def compute_macd(close, fast_length=12, slow_length=26, signal_length=9):
-        close = pd.Series(close, dtype="float64")
-        fast_ema = close.ewm(span=fast_length, adjust=False, min_periods=fast_length).mean()
-        slow_ema = close.ewm(span=slow_length, adjust=False, min_periods=slow_length).mean()
-        macd_line = fast_ema - slow_ema
-        signal_line = macd_line.ewm(span=signal_length, adjust=False, min_periods=signal_length).mean()
-        hist = macd_line - signal_line
-        return macd_line, signal_line, hist
-
     def compute_disparity_index(close, length):
         close = pd.Series(close, dtype="float64")
         ema = close.ewm(span=length, adjust=False, min_periods=length).mean().replace(0, np.nan)
@@ -9642,7 +9650,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
         target_fig.add_trace(go.Candlestick(
             x=trace_x, open=df['open'], high=df['high'],
             low=df['low'], close=df['close'], name="OHLC",
-            customdata=df[['close', 'timestamp']].values,
+            customdata=df[['close']].values,
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
             hoverinfo='all' if candle_info_enabled else 'skip',
             # Plotly applies hovertemplate ahead of hoverinfo for some OHLC
@@ -9747,7 +9755,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
         target_fig.add_trace(make_chart_macd_trace(x=trace_x, y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.add_trace(make_chart_macd_trace(x=trace_x, y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=0, line_dash="dash", line_color="#999", row=row, col=1)
-        target_fig.update_yaxes(title_text="MACD", row=row, col=1)
+        target_fig.update_yaxes(title_text="MACD (price units)", row=row, col=1)
 
     def add_disparity_trace(target_fig, row):
         dix_cols = ['disparity_50', 'disparity_25', 'disparity_9']
@@ -9793,7 +9801,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
     if adx_visible and not {'adx_14_1', 'plus_di_14', 'minus_di_14'}.issubset(df.columns):
         df['adx_14_1'], df['plus_di_14'], df['minus_di_14'] = compute_adx(df['high'], df['low'], df['close'], 14, 1)
     if macd_visible and not {'macd_line', 'macd_signal', 'macd_hist'}.issubset(df.columns):
-        df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_macd(df['close'], 12, 26, 9)
+        df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_chart_macd(df['close'], 12, 26, 9)
     if disparity_visible:
         if 'disparity_50' not in df.columns:
             df['disparity_50'] = compute_disparity_index(df['close'], 50)
