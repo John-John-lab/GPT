@@ -833,6 +833,9 @@ CHART_WEBGL_STOCHASTIC_ENABLED = os.environ.get("GPT_CHART_WEBGL_STOCHASTIC", "1
 # Phase 3 rendering optimization: ADX has three dense line series in one pane.
 # Keep an independent rollback because browser/GPU behavior can vary.
 CHART_WEBGL_ADX_ENABLED = os.environ.get("GPT_CHART_WEBGL_ADX", "1") == "1"
+# Phase 4 rendering optimization: only the two dense MACD lines use WebGL;
+# the histogram remains a normal Bar trace to preserve its exact appearance.
+CHART_WEBGL_MACD_ENABLED = os.environ.get("GPT_CHART_WEBGL_MACD", "1") == "1"
 # Encode dense trace timestamps as epoch milliseconds on an explicitly dated
 # Plotly axis. This avoids repeating long ISO timestamp strings in every pane.
 # Disable for an immediate compatibility rollback on an unusual Plotly bundle.
@@ -889,6 +892,11 @@ def make_chart_stochastic_trace(**kwargs):
 def make_chart_adx_trace(**kwargs):
     """Return a Phase-3 WebGL ADX line, with an SVG fallback."""
     return make_chart_line_trace(CHART_WEBGL_ADX_ENABLED, **kwargs)
+
+
+def make_chart_macd_trace(**kwargs):
+    """Return a Phase-4 WebGL MACD line, with an SVG fallback."""
+    return make_chart_line_trace(CHART_WEBGL_MACD_ENABLED, **kwargs)
 
 
 def retain_chart_task_indicator_cache(task):
@@ -9728,8 +9736,8 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
         add_hover_spike_bar(target_fig, row, macd_min, macd_max, f'_spike_hover_macd_{row}')
         colors = np.where(df['macd_hist'] >= 0, '#26a69a', '#ef5350')
         target_fig.add_trace(go.Bar(x=trace_x, y=df['macd_hist'], name='MACD Hist', marker_color=colors, showlegend=False, hovertemplate='Hist: %{y:.6g}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=trace_x, y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
-        target_fig.add_trace(go.Scatter(x=trace_x, y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_macd_trace(x=trace_x, y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_macd_trace(x=trace_x, y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=0, line_dash="dash", line_color="#999", row=row, col=1)
         target_fig.update_yaxes(title_text="MACD", row=row, col=1)
 
