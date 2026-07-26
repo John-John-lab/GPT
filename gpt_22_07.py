@@ -850,6 +850,17 @@ CHART_COMPACT_TIME_AXIS_ENABLED = os.environ.get("GPT_CHART_COMPACT_TIME_AXIS", 
 # Keep an opt-in rollback for any unusual browser that still needs the legacy
 # hit targets while the lighter default is validated.
 CHART_SPIKE_HELPER_TRACES_ENABLED = os.environ.get("GPT_CHART_SPIKE_HELPERS", "0") == "1"
+
+# =============================================================================
+# CHART INCREMENTAL NAVIGATION — GUARDED FOUNDATION
+# =============================================================================
+# Keep this section self-contained so it can later move to chart/incremental.py
+# without touching indicator or strategy calculations. The optimization remains
+# disabled until the schema, client patcher, fallback, and browser tests are all
+# complete. Full-figure rendering below stays the authoritative safe path.
+CHART_INCREMENTAL_SCHEMA_VERSION = 1
+CHART_INCREMENTAL_NAV_ENABLED = os.environ.get("GPT_CHART_INCREMENTAL_NAV", "0") == "1"
+CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
 # Optional neighbour warming is disabled by default. Runtime traces show cold
 # reads take only tens of milliseconds, while a delayed background read can
 # overlap the much more expensive Dash/Plotly response and paint. Enable with
@@ -922,6 +933,63 @@ def compute_chart_macd(close, fast_length=12, slow_length=26, signal_length=9):
     signal_line = macd_line.ewm(span=signal_length, adjust=False, min_periods=signal_length).mean()
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
+
+
+def _chart_trace_schema_key(trace, occurrence):
+    """Return a stable semantic key for one rendered Plotly trace."""
+    trace_type = str(getattr(trace, "type", "trace") or "trace")
+    trace_name = str(getattr(trace, "name", "") or trace_type)
+    normalized_name = re.sub(r"[^a-z0-9]+", "_", trace_name.lower()).strip("_") or trace_type
+    return f"{trace_type}:{normalized_name}:{occurrence}"
+
+
+def attach_chart_trace_schema(fig, source):
+    """Tag a full figure with the schema required by future incremental updates.
+
+    No data, math, trace order, or layout is changed. A later client patcher may
+    update only when this exact signature matches; otherwise it must request the
+    existing full renderer.
+    """
+    occurrences = {}
+    trace_keys = []
+    for trace in fig.data:
+        base = (str(getattr(trace, "type", "trace") or "trace"),
+                str(getattr(trace, "name", "") or ""))
+        occurrence = occurrences.get(base, 0)
+        occurrences[base] = occurrence + 1
+        key = _chart_trace_schema_key(trace, occurrence)
+        existing_meta = getattr(trace, "meta", None)
+        trace.meta = {**(existing_meta if isinstance(existing_meta, dict) else {}),
+                      "chart_trace_key": key}
+        trace_keys.append(key)
+    normalized_source = str(source or "main_table")
+    signature = f"v{CHART_INCREMENTAL_SCHEMA_VERSION}|{normalized_source}|" + "|".join(trace_keys)
+    schema = {
+        "version": CHART_INCREMENTAL_SCHEMA_VERSION,
+        "source": normalized_source,
+        "trace_keys": trace_keys,
+        "signature": signature,
+        "incremental_eligible": bool(
+            CHART_INCREMENTAL_NAV_ENABLED
+            and normalized_source in CHART_INCREMENTAL_SUPPORTED_SOURCES
+        ),
+    }
+    layout_meta = fig.layout.meta if isinstance(fig.layout.meta, dict) else {}
+    fig.layout.meta = {**layout_meta, "render_schema": schema}
+    return schema
+
+
+def chart_schemas_match(current_schema, requested_schema):
+    """Conservative gate: only identical, enabled schemas may use patching."""
+    if not isinstance(current_schema, dict) or not isinstance(requested_schema, dict):
+        return False
+    return bool(
+        current_schema.get("incremental_eligible")
+        and requested_schema.get("incremental_eligible")
+        and current_schema.get("version") == requested_schema.get("version")
+        and current_schema.get("source") == requested_schema.get("source")
+        and current_schema.get("signature") == requested_schema.get("signature")
+    )
 
 
 def retain_chart_task_indicator_cache(task):
@@ -10091,6 +10159,9 @@ def update_task_chart(task_id, chart_action, chart_event_context, rsi_visible, s
         fig.update_yaxes(range=entry_focus_yrange, autorange=False, row=1, col=1)
     else:
         apply_chart_view_state_to_figure(fig, chart_view_state, task_id)
+    # The full renderer remains authoritative. This metadata only establishes a
+    # stable, conservative contract for a later opt-in incremental navigation path.
+    attach_chart_trace_schema(fig, chart_model["source"])
     timer.check(f"Layout and view state traces={len(fig.data)}")
     elapsed = time.perf_counter() - timer.start_time
     if elapsed > CHART_RENDER_PERF_BUDGET_SECONDS:
