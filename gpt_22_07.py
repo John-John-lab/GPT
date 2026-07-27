@@ -856,10 +856,11 @@ CHART_SPIKE_HELPER_TRACES_ENABLED = os.environ.get("GPT_CHART_SPIKE_HELPERS", "0
 # =============================================================================
 # Keep this section self-contained so it can later move to chart/incremental.py
 # without touching indicator or strategy calculations. The optimization remains
-# restricted to identical main-table schemas and automatically falls back to
-# the full renderer. Set GPT_CHART_INCREMENTAL_NAV=0 for immediate rollback.
+# experimental and disabled by default: measurements showed that replacing all
+# trace objects in a Patch can be larger and more CPU-intensive than the full
+# response. Set GPT_CHART_INCREMENTAL_NAV=1 only for controlled profiling.
 CHART_INCREMENTAL_SCHEMA_VERSION = 1
-CHART_INCREMENTAL_NAV_ENABLED = os.environ.get("GPT_CHART_INCREMENTAL_NAV", "1") == "1"
+CHART_INCREMENTAL_NAV_ENABLED = os.environ.get("GPT_CHART_INCREMENTAL_NAV", "0") == "1"
 CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
 # Optional neighbour warming is disabled by default. Runtime traces show cold
 # reads take only tens of milliseconds, while a delayed background read can
@@ -996,9 +997,9 @@ def build_incremental_chart_patch(fig):
     """Return a conservative Dash Patch for an identical trace schema.
 
     All trace objects are replaced so candles, indicators, marker positions,
-    hover data, and source marks stay authoritative. Only static top-level
-    layout configuration is retained in the browser. Task-specific layout and
-    every axis are patched from the newly built reference figure.
+    hover data, and source marks stay authoritative. This is a correctness
+    prototype, not yet a speed path: the full reference figure is still built
+    and serialized trace replacement may exceed a normal figure response.
     """
     patch = Patch()
     patch["data"] = [trace.to_plotly_json() for trace in fig.data]
