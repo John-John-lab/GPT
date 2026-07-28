@@ -3711,22 +3711,33 @@ const chartToggleActions = {
 };
 const chartQueuedActions = {};
 let chartActionFlushTimer = null;
+window.__gptToolbarRenderPending = false;
+function flushQueuedChartActions() {
+    if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
+    chartActionFlushTimer = null;
+    const actions = Object.keys(chartQueuedActions).map(function(key) { return chartQueuedActions[key]; });
+    Object.keys(chartQueuedActions).forEach(function(key) { delete chartQueuedActions[key]; });
+    if (!actions.length) return false;
+    const renderPaths = new Set([
+        'panes.rsi', 'panes.stochastic', 'panes.volume', 'panes.adx', 'panes.macd', 'panes.disparity',
+        'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry'
+    ]);
+    const needsRender = actions.some(function(action) { return renderPaths.has(action.section + '.' + action.key); });
+    window.__gptToolbarRenderPending = needsRender;
+    markChartRenderRequested(actions.length === 1 ? 'toolbar-' + actions[0].key : 'toolbar-batch');
+    window.dash_clientside.set_props('chart-ui-action-store', {data: {actions: actions, ts: Date.now()}});
+    traceUi('toolbar batch submitted', {count: actions.length});
+    return needsRender;
+}
 function queueChartToggleAction(buttonId, active) {
     const path = chartToggleActions[buttonId];
     if (!path || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
     chartQueuedActions[path[0] + '.' + path[1]] = {type: 'set', section: path[0], key: path[1], value: Boolean(active)};
     if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
-    chartActionFlushTimer = window.setTimeout(function() {
-        const actions = Object.keys(chartQueuedActions).map(function(key) { return chartQueuedActions[key]; });
-        Object.keys(chartQueuedActions).forEach(function(key) { delete chartQueuedActions[key]; });
-        chartActionFlushTimer = null;
-        if (!actions.length) return;
-        markChartRenderRequested(actions.length === 1 ? 'toolbar-' + actions[0].key : 'toolbar-batch');
-        window.dash_clientside.set_props('chart-ui-action-store', {data: {actions: actions, ts: Date.now()}});
-        traceUi('toolbar batch submitted', {count: actions.length});
+    chartActionFlushTimer = window.setTimeout(flushQueuedChartActions,
     // A half-second quiet period is comfortable for deliberate multi-pane
     // selection while still giving a single click immediate visual feedback.
-    }, 500);
+    500);
     return true;
 }
 // Dash 4 exposes set_props even when dynamically registered clientside callbacks
@@ -3799,6 +3810,9 @@ function installChartBrowserRenderTrace() {
             if (request) {
                 window.__gptChartRenderRequest = null;
                 window.__gptPendingChartTaskId = '';
+                if (String(request.kind || '').indexOf('toolbar-') === 0) {
+                    window.__gptToolbarRenderPending = false;
+                }
             }
             window.requestAnimationFrame(function() {
                 traceUi('chart browser applied', {
@@ -3806,6 +3820,11 @@ function installChartBrowserRenderTrace() {
                     elapsed_ms: elapsedMs,
                     traces: (plot.data || []).length
                 });
+                if (!window.__gptToolbarRenderPending && window.__gptQueuedChartNavigation) {
+                    const queued = window.__gptQueuedChartNavigation;
+                    window.__gptQueuedChartNavigation = null;
+                    submitAdjacentChartNavigation(queued.taskId, queued.direction, queued.buttonId);
+                }
             });
         });
     }
@@ -3997,18 +4016,26 @@ function installChartCrosshairFallback() {
         if (!firstTrace || range.length !== 2) return;
         const start = asMillis(range[0]), end = asMillis(range[1]);
         if (start === null || end === null || start === end) return;
-        const index = nearestIndex(firstTrace.x, start + (end - start) * ((event.clientX - rect.left) / Math.max(1, rect.width)));
+        const svg = plot.querySelector('.main-svg');
+        const svgRect = svg ? svg.getBoundingClientRect() : rect;
+        const axisLeft = svgRect.left + Number(xaxis._offset || 0);
+        const axisWidth = Math.max(1, Number(xaxis._length || rect.width));
+        const axisRatio = Math.max(0, Math.min(1, (event.clientX - axisLeft) / axisWidth));
+        const index = nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
         if (index === null) return;
         clearLabels(root);
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
-        const svg = plot.querySelector('.main-svg'), svgRect = svg ? svg.getBoundingClientRect() : rect, rootRect = root.getBoundingClientRect(), valuesByAxis = {};
-        plot.data.forEach(function(trace) {
+        const rootRect = root.getBoundingClientRect(), valuesByAxis = {};
+        plot.data.forEach(function(trace, curveNumber) {
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             const name = trace && trace.name ? String(trace.name) : '';
             if (!trace || axisId === 'y' || !trace.y || index >= trace.y.length || trace.visible === false || name.startsWith('_')) return;
-            const value = Number(trace.y[index]);
+            const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][index];
+            const value = Number(calcPoint && Number.isFinite(Number(calcPoint.y)) ? calcPoint.y : trace.y[index]);
             if (!Number.isFinite(value)) return;
-            (valuesByAxis[axisId] || (valuesByAxis[axisId] = [])).push((name || 'Value') + ': ' + value.toFixed(Math.abs(value) >= 100 ? 1 : 2));
+            const magnitude = Math.abs(value);
+            const formatted = magnitude !== 0 && magnitude < 0.01 ? value.toPrecision(5) : value.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4);
+            (valuesByAxis[axisId] || (valuesByAxis[axisId] = [])).push((name || 'Value') + ': ' + formatted);
         });
         Object.keys(valuesByAxis).forEach(function(axisId) {
             const axis = plot._fullLayout['yaxis' + axisId.slice(1)];
@@ -4366,11 +4393,8 @@ function openTableChartImmediately(button) {
         return false;
     }
 }
-function openAdjacentChartImmediately(button) {
-    if (!button || button.getAttribute('data-direct-navigation') !== 'true') return false;
-    const taskId = String(button.getAttribute('data-target-task-id') || '');
+function submitAdjacentChartNavigation(taskId, direction, buttonId) {
     if (!taskId || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
-    const direction = button.id === 'prev-chart-btn' ? 'previous' : 'next';
     if (window.__gptPendingChartTaskId === taskId) {
         traceUi('duplicate chart navigation ignored', {direction: direction, taskId: taskId});
         return true;
@@ -4379,13 +4403,34 @@ function openAdjacentChartImmediately(button) {
     window.setTimeout(function() {
         if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
     }, 30000);
-    markChartRenderRequested(button.id);
+    markChartRenderRequested(buttonId);
     // Navigation needs only the selected task. Unlike a table Chart action,
     // the modal is already open, so updating chart-click-store merely schedules
     // an additional modal callback while the large figure request is pending.
     window.dash_clientside.set_props('chart-task-id', {data: taskId});
     traceUi('local chart navigation', {direction: direction, taskId: taskId, storeWrites: 1});
     return true;
+}
+function openAdjacentChartImmediately(button) {
+    if (!button || button.getAttribute('data-direct-navigation') !== 'true') return false;
+    const taskId = String(button.getAttribute('data-target-task-id') || '');
+    if (!taskId || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+    const direction = button.id === 'prev-chart-btn' ? 'previous' : 'next';
+    // A pane-toggle batch changes the trace schema. Navigating before that
+    // render settles used stale Store values, leaving buttons On while the next
+    // chart omitted those panes. Flush the batch and retain only the latest
+    // requested destination; afterplot resumes navigation with the new schema.
+    if (chartActionFlushTimer || Object.keys(chartQueuedActions).length || window.__gptToolbarRenderPending) {
+        window.__gptQueuedChartNavigation = {taskId: taskId, direction: direction, buttonId: button.id};
+        const waitingForRender = flushQueuedChartActions();
+        traceUi('chart navigation queued for toolbar', {direction: direction, taskId: taskId});
+        if (!waitingForRender && !window.__gptToolbarRenderPending) {
+            window.__gptQueuedChartNavigation = null;
+            return submitAdjacentChartNavigation(taskId, direction, button.id);
+        }
+        return true;
+    }
+    return submitAdjacentChartNavigation(taskId, direction, button.id);
 }
 // Capture phase lets direct Store updates reach Dash before React queues the
 // native n_click callback. If set_props is unavailable, normal bubbling keeps
@@ -9128,13 +9173,18 @@ function(figure, oscillatorSyncInfo, candleInfo) {
         const rootRect = root.getBoundingClientRect();
         const svgRect = svg.getBoundingClientRect();
         const valuesByAxis = {};
-        plot.data.forEach(function(trace) {
+        plot.data.forEach(function(trace, curveNumber) {
             const traceName = trace && trace.name ? String(trace.name) : '';
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             if (!trace || axisId === 'y' || !trace.x || !trace.y || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
             if (traceName.startsWith('_') || traceName === 'Signal Time') return;
             if (trace.mode === 'markers' && trace.showlegend === false) return;
-            const value = formatOscillatorValue(trace.y[pointIndex]);
+            // Plotly hover reads its calculated point data, which can differ
+            // from the raw trace array after WebGL/restyle updates. Use that
+            // same authoritative value so Osc All boxes exactly match hover.
+            const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][pointIndex];
+            const renderedValue = calcPoint && Number.isFinite(Number(calcPoint.y)) ? calcPoint.y : trace.y[pointIndex];
+            const value = formatOscillatorValue(renderedValue);
             if (value === null) return;
             if (!valuesByAxis[axisId]) valuesByAxis[axisId] = [];
             valuesByAxis[axisId].push((traceName || 'Value') + ': ' + value);
@@ -9788,6 +9838,27 @@ def get_active_chart_source_event(task_id, chart_context):
     return event if str(event.get("task_id")) == str(task_id) else None
 
 
+def normalize_chart_timestamp_ms(value):
+    """Normalize strategy-event timestamps to epoch milliseconds."""
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        try:
+            numeric = float(pd.Timestamp(value).timestamp() * 1000)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not np.isfinite(numeric):
+        return None
+    magnitude = abs(numeric)
+    if magnitude < 100_000_000_000:  # epoch seconds
+        numeric *= 1000
+    elif magnitude > 100_000_000_000_000:  # epoch nanoseconds
+        numeric /= 1_000_000
+    return numeric
+
+
 def build_source_trade_mark_specs(event):
     """Normalize source trade timestamps for synchronized pane guides."""
     if not isinstance(event, dict):
@@ -9797,11 +9868,8 @@ def build_source_trade_mark_specs(event):
         ("entry", "entry_time", "#00c853"),
         ("exit", "exit_time", "#d50000"),
     ):
-        try:
-            timestamp = float(event.get(time_key))
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(timestamp):
+        timestamp = normalize_chart_timestamp_ms(event.get(time_key))
+        if timestamp is not None:
             marks.append({"kind": kind, "timestamp": timestamp, "color": color})
     return marks
 
@@ -9848,17 +9916,20 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     details = build_source_trade_details(event)
     if entry_time is not None and entry_price is not None:
         try:
-            entry_dt, entry_value = to_datetime(float(entry_time)), float(entry_price)
+            entry_ms = normalize_chart_timestamp_ms(entry_time)
+            entry_dt, entry_value = (to_datetime(entry_ms) if entry_ms is not None else None), float(entry_price)
         except (TypeError, ValueError):
             entry_dt = entry_value = None
         if entry_dt is not None:
+            entry_reason_html = str(details['entry_reason']).replace('; ', '<br>')
             fig.add_trace(go.Scatter(
                 x=[entry_dt], y=[entry_value], mode="markers+text",
                 text=[f"ENTRY {details['direction']}".strip()], textposition="top center",
                 marker=dict(size=14, color="#00c853", symbol="triangle-up", line=dict(width=2, color="white")),
                 name="Dynamic strategy entry", showlegend=False,
+                hoverlabel=dict(align="left"),
                 hovertemplate=(f"<b>{details['label']}</b><br>Entry {details['direction'] or 'trade'}: %{{y:.6g}}"
-                               f"<br>Why entered: {details['entry_reason']}"
+                               f"<br>Why entered:<br>{entry_reason_html}"
                                f"<br>Time: %{{x|%Y-%m-%d %H:%M}}<extra></extra>"),
             ), row=1, col=1)
             fig.add_trace(go.Scatter(
@@ -9868,22 +9939,23 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
             ), row=1, col=1)
     if exit_time is not None and exit_price is not None:
         try:
-            exit_dt, exit_value = to_datetime(float(exit_time)), float(exit_price)
+            exit_ms = normalize_chart_timestamp_ms(exit_time)
+            exit_dt, exit_value = (to_datetime(exit_ms) if exit_ms is not None else None), float(exit_price)
         except (TypeError, ValueError):
             exit_dt = exit_value = None
         if exit_dt is not None:
-            exit_text = ("TP CHECKPOINT" if details["is_tp_checkpoint"]
-                         else f"EXIT {details['exit_reason_label']}: {details['return_text']}")
+            exit_text = ("TP" if details["is_tp_checkpoint"] else f"EXIT {details['return_text']}")
             exit_color = "#ff9800" if details["is_tp_checkpoint"] else ("#00c853" if details["return_text"].startswith("+") else "#d50000")
             exit_hover = (f"{details['label']}<br>TP checkpoint: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}"
                           if details["is_tp_checkpoint"] else
                           f"<b>{details['label']}</b><br>Exit reason: {details['exit_reason_label']}"
-                          f"<br>Why exited: {details['exit_conditions']}<br>Return: {details['return_text']}"
+                          f"<br>Why exited:<br>{str(details['exit_conditions']).replace('; ', '<br>')}<br>Return: {details['return_text']}"
                           f"<br>Exit: %{{y:.6g}}<br>Time: %{{x|%Y-%m-%d %H:%M}}")
             fig.add_trace(go.Scatter(
                 x=[exit_dt], y=[exit_value], mode="markers+text", text=[exit_text], textposition="bottom center",
                 marker=dict(size=14, color=exit_color, symbol="x", line=dict(width=2, color="white")),
-                name="Dynamic strategy exit", showlegend=False, hovertemplate=exit_hover + "<extra></extra>",
+                name="Dynamic strategy exit", showlegend=False, hoverlabel=dict(align="left"),
+                hovertemplate=exit_hover + "<extra></extra>",
             ), row=1, col=1)
             fig.add_trace(go.Scatter(
                 x=[exit_dt, exit_dt], y=[y_min, y_max], mode="lines",
@@ -10332,11 +10404,15 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if source_trade_event:
         selected_event = source_trade_event
         try:
-            event_entry_ms = float(selected_event.get("entry_time"))
-            event_exit_ms = float(selected_event.get("exit_time"))
+            event_entry_ms = normalize_chart_timestamp_ms(selected_event.get("entry_time"))
+            event_exit_ms = normalize_chart_timestamp_ms(selected_event.get("exit_time"))
             event_entry_price = float(selected_event.get("entry_price"))
             event_exit_price = float(selected_event.get("exit_price"))
-            if len(df) and all(np.isfinite(value) for value in (event_entry_ms, event_exit_ms, event_entry_price, event_exit_price)):
+            interaction_trace(
+                f"chart source trade task={task_id} entry_ms={event_entry_ms} entry_price={event_entry_price:.8g} "
+                f"exit_ms={event_exit_ms} exit_price={event_exit_price:.8g} category={selected_event.get('category')}"
+            )
+            if len(df) and event_entry_ms is not None and event_exit_ms is not None and all(np.isfinite(value) for value in (event_entry_ms, event_exit_ms, event_entry_price, event_exit_price)):
                 timestamps = df['timestamp'].to_numpy()
                 start_idx = int(np.searchsorted(timestamps, min(event_entry_ms, event_exit_ms), side='left'))
                 end_idx = int(np.searchsorted(timestamps, max(event_entry_ms, event_exit_ms), side='right')) - 1
