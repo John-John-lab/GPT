@@ -867,7 +867,7 @@ CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
 # already mounted graph. Any schema/browser mismatch requests the authoritative
 # full renderer immediately.
 CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "1") == "1"
-CHART_FAST_CANDLE_SCHEMA_VERSION = 2
+CHART_FAST_CANDLE_SCHEMA_VERSION = 3
 CHART_FAST_NAV_SUPPORTED_NAMES = frozenset({
     "ohlc", "measure_click_points", "rsi_14",
     "stoch_14_1_3_d", "stoch_40_1_4_d", "stoch_60_1_10_d", "stoch_300_1_10_d",
@@ -1103,12 +1103,11 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         name = key.rsplit(":", 1)[0].split(":", 1)[-1]
         if name == "ohlc":
             trace_updates.append({
-                "key": key, "x": x_values,
+                "key": key, "x_kind": "shared",
                 "open": _chart_json_series(df["open"]),
                 "high": _chart_json_series(df["high"]),
                 "low": _chart_json_series(df["low"]),
                 "close": close_values,
-                "customdata": [[value] for value in close_values],
             })
             continue
         if name == "di_14":
@@ -1118,9 +1117,9 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
             values = x_values_by_name.get(name)
         if values is None:
             raise ValueError(f"fast chart trace data unavailable: {name}")
-        update_x = ([signal_ms, signal_ms] if name == "signal_time" else
-                    [signal_ms] if name == "signal_time_marker" else x_values)
-        update = {"key": key, "x": update_x, "y": values}
+        x_kind = ("signal_line" if name == "signal_time" else
+                  "signal_marker" if name == "signal_time_marker" else "shared")
+        update = {"key": key, "x_kind": x_kind, "y": values}
         if name == "macd_hist":
             update["marker_color"] = ["#26a69a" if value is not None and value >= 0 else "#ef5350" for value in values]
         elif name == "volume":
@@ -1134,6 +1133,10 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         "revision": time.time_ns(),
         "task_id": str(task_id),
         "trace_keys": list(current_schema.get("trace_keys") or []),
+        # All candles and oscillators share one date axis. Sending it once
+        # avoids repeating 1,861 timestamps for every visible trace.
+        "shared_x": x_values,
+        "signal_x": signal_ms,
         "traces": trace_updates,
         "signal_price": signal_price,
         "title": f"{symbol} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
@@ -4202,7 +4205,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
     let payload = rawPayload;
     try {
         if (typeof payload === 'string') payload = JSON.parse(payload);
-        if (!payload || payload.version !== 2 || !payload.task_id) return false;
+        if (!payload || payload.version !== 3 || !payload.task_id || !Array.isArray(payload.shared_x)) return false;
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
         if (!plot || !window.Plotly || !Array.isArray(plot.data)) {
@@ -4223,15 +4226,27 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             return false;
         }
         const startedAt = performance.now();
+        let candleAppliedAt = startedAt;
+        let valuesAppliedAt = startedAt;
+        let colorsAppliedAt = startedAt;
+        function traceX(update) {
+            if (update.x_kind === 'signal_line') return [payload.signal_x, payload.signal_x];
+            if (update.x_kind === 'signal_marker') return [payload.signal_x];
+            return payload.shared_x;
+        }
         const candleUpdate = updates[0];
         if (!candleUpdate || actualKeys[0].indexOf('candlestick:ohlc:') !== 0) {
             requestFullChartFallback(payload.task_id, 'OHLC trace unavailable');
             return false;
         }
+        // customdata is derived locally from close values rather than repeated
+        // in the Dash response. Candle hover still receives the identical data.
+        const candleCustomData = candleUpdate.close.map(function(value) { return [value]; });
         await window.Plotly.restyle(plot, {
-            x: [candleUpdate.x], open: [candleUpdate.open], high: [candleUpdate.high],
-            low: [candleUpdate.low], close: [candleUpdate.close], customdata: [candleUpdate.customdata]
+            x: [payload.shared_x], open: [candleUpdate.open], high: [candleUpdate.high],
+            low: [candleUpdate.low], close: [candleUpdate.close], customdata: [candleCustomData]
         }, [0]);
+        candleAppliedAt = performance.now();
         const valueIndices = [];
         const xUpdates = [];
         const yUpdates = [];
@@ -4240,7 +4255,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         updates.slice(1).forEach(function(update, offset) {
             const index = offset + 1;
             valueIndices.push(index);
-            xUpdates.push(update.x);
+            xUpdates.push(traceX(update));
             yUpdates.push(update.y);
             if (Array.isArray(update.marker_color)) {
                 colorIndices.push(index);
@@ -4248,7 +4263,9 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             }
         });
         if (valueIndices.length) await window.Plotly.restyle(plot, {x: xUpdates, y: yUpdates}, valueIndices);
+        valuesAppliedAt = performance.now();
         if (colorIndices.length) await window.Plotly.restyle(plot, {'marker.color': colorUpdates}, colorIndices);
+        colorsAppliedAt = performance.now();
         const currentLayout = plot.layout || {};
         const shapes = (currentLayout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
         const annotations = (currentLayout.annotations || []).map(function(annotation) { return Object.assign({}, annotation); });
@@ -4277,7 +4294,11 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         traceUi('fast chart browser applied', {
             taskId: payload.task_id,
             elapsed_ms: Math.round(performance.now() - startedAt),
-            points: Array.isArray(candleUpdate.x) ? candleUpdate.x.length : 0,
+            candle_ms: Math.round(candleAppliedAt - startedAt),
+            values_ms: Math.round(valuesAppliedAt - candleAppliedAt),
+            colors_ms: Math.round(colorsAppliedAt - valuesAppliedAt),
+            layout_ms: Math.round(performance.now() - colorsAppliedAt),
+            points: payload.shared_x.length,
             traces: actualKeys.length
         });
         return true;
