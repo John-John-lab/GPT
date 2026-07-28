@@ -862,18 +862,19 @@ CHART_SPIKE_HELPER_TRACES_ENABLED = os.environ.get("GPT_CHART_SPIKE_HELPERS", "0
 CHART_INCREMENTAL_SCHEMA_VERSION = 1
 CHART_INCREMENTAL_NAV_ENABLED = os.environ.get("GPT_CHART_INCREMENTAL_NAV", "0") == "1"
 CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
-# A genuinely compact navigation path is enabled only for the stable four-trace
-# candle schema. It bypasses Plotly Figure construction and sends raw candle
-# arrays to the already mounted graph. Any schema/browser mismatch requests the
-# authoritative full renderer immediately.
+# A genuinely compact navigation path updates stable candle/oscillator schemas.
+# It bypasses Plotly Figure construction and sends raw trace arrays to the
+# already mounted graph. Any schema/browser mismatch requests the authoritative
+# full renderer immediately.
 CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "1") == "1"
-CHART_FAST_CANDLE_SCHEMA_VERSION = 1
-CHART_FAST_CANDLE_TRACE_KEYS = (
-    "candlestick:ohlc:0",
-    "scatter:measure_click_points:0",
-    "scatter:signal_time:0",
-    "scatter:signal_time_marker:0",
-)
+CHART_FAST_CANDLE_SCHEMA_VERSION = 2
+CHART_FAST_NAV_SUPPORTED_NAMES = frozenset({
+    "ohlc", "measure_click_points", "rsi_14",
+    "stoch_14_1_3_d", "stoch_40_1_4_d", "stoch_60_1_10_d", "stoch_300_1_10_d",
+    "adx_14_1", "di_14", "macd_hist", "macd_12_26", "signal_9",
+    "dix_1_ema_50", "dix_2_ema_25", "dix_3_ema_9", "volume",
+    "signal_time", "signal_time_marker",
+})
 # Optional neighbour warming is disabled by default. Runtime traces show cold
 # reads take only tens of milliseconds, while a delayed background read can
 # overlap the much more expensive Dash/Plotly response and paint. Enable with
@@ -1027,11 +1028,11 @@ def build_incremental_chart_patch(fig):
 
 
 def chart_fast_candle_navigation_eligible(current_schema, source, render_values, triggered_id):
-    """Return whether navigation can safely update the mounted candle chart.
+    """Return whether navigation can safely update the mounted chart traces.
 
-    This deliberately supports only the invariant four-trace main-table chart.
-    Optional panes and overlays retain the full renderer until their compact
-    payload mappings are implemented and validated independently.
+    Source/strategy/event overlays retain the full renderer because their trace
+    count is task-dependent. Registered candle and oscillator panes are safe
+    when every semantic trace name has a compact payload mapping.
     """
     if not CHART_FAST_CANDLE_NAV_ENABLED or triggered_id != "chart-task-id":
         return False
@@ -1039,17 +1040,24 @@ def chart_fast_candle_navigation_eligible(current_schema, source, render_values,
         return False
     if current_schema.get("source") != "main_table":
         return False
-    if tuple(current_schema.get("trace_keys") or ()) != CHART_FAST_CANDLE_TRACE_KEYS:
+    trace_keys = tuple(current_schema.get("trace_keys") or ())
+    if not trace_keys:
+        return False
+    trace_names = {key.rsplit(":", 1)[0].split(":", 1)[-1] for key in trace_keys}
+    if not trace_names.issubset(CHART_FAST_NAV_SUPPORTED_NAMES):
         return False
     return not any(bool(render_values.get(key)) for key in (
-        "rsi_visible", "stochastic_visible", "volume_visible", "adx_visible",
-        "macd_visible", "disparity_visible", "strategy_visible",
-        "impulse_visible", "events_visible", "focus_entry",
+        "strategy_visible", "impulse_visible", "events_visible", "focus_entry",
     ))
 
 
+def _chart_json_series(series):
+    """Return JSON-safe scalar values while retaining indicator gaps as null."""
+    return [None if pd.isna(value) else float(value) for value in series]
+
+
 def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_schema):
-    """Build compact task-dependent arrays without constructing a Plotly Figure."""
+    """Build compact task-dependent trace arrays without a Plotly Figure."""
     y_min = float(df["low"].min())
     y_max = float(df["high"].max())
     y_padding = (y_max - y_min) * 0.05
@@ -1060,7 +1068,7 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
     # The mounted Plotly date axis accepts epoch milliseconds regardless of
     # whether the full-render compatibility path uses ISO-like timestamps.
     x_values = df["timestamp"].astype("int64").tolist()
-    close_values = df["close"].astype(float).tolist()
+    close_values = _chart_json_series(df["close"])
     default_xrange = [int(df["timestamp"].iloc[0]), int(df["timestamp"].iloc[-1])]
     extended_xrange = None
     if len(df) > 1:
@@ -1068,21 +1076,65 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         if candle_step > 0:
             right_padding_bars = max(20, min(120, int(len(df) * 0.25)))
             extended_xrange = [default_xrange[0], default_xrange[1] + candle_step * right_padding_bars]
+    x_values_by_name = {
+        "measure_click_points": close_values,
+        "rsi_14": _chart_json_series(df["rsi"]) if "rsi" in df else None,
+        "stoch_14_1_3_d": _chart_json_series(df["stoch_d_14_1_3"]) if "stoch_d_14_1_3" in df else None,
+        "stoch_40_1_4_d": _chart_json_series(df["stoch_d_40_1_4"]) if "stoch_d_40_1_4" in df else None,
+        "stoch_60_1_10_d": _chart_json_series(df["stoch_d_60_1_10"]) if "stoch_d_60_1_10" in df else None,
+        "stoch_300_1_10_d": _chart_json_series(df["stoch_d_300_1_10"]) if "stoch_d_300_1_10" in df else None,
+        "adx_14_1": _chart_json_series(df["adx_14_1"]) if "adx_14_1" in df else None,
+        "macd_hist": _chart_json_series(df["macd_hist"]) if "macd_hist" in df else None,
+        "macd_12_26": _chart_json_series(df["macd_line"]) if "macd_line" in df else None,
+        "signal_9": _chart_json_series(df["macd_signal"]) if "macd_signal" in df else None,
+        "dix_1_ema_50": _chart_json_series(df["disparity_50"]) if "disparity_50" in df else None,
+        "dix_2_ema_25": _chart_json_series(df["disparity_25"]) if "disparity_25" in df else None,
+        "dix_3_ema_9": _chart_json_series(df["disparity_9"]) if "disparity_9" in df else None,
+        "volume": _chart_json_series(df["volume"]) if "volume" in df else None,
+        "signal_time": [y_min, y_max],
+        "signal_time_marker": [signal_price],
+    }
+    di_values = []
+    if "plus_di_14" in df and "minus_di_14" in df:
+        di_values = [_chart_json_series(df["plus_di_14"]), _chart_json_series(df["minus_di_14"])]
+    di_index = 0
+    trace_updates = []
+    for key in current_schema.get("trace_keys") or []:
+        name = key.rsplit(":", 1)[0].split(":", 1)[-1]
+        if name == "ohlc":
+            trace_updates.append({
+                "key": key, "x": x_values,
+                "open": _chart_json_series(df["open"]),
+                "high": _chart_json_series(df["high"]),
+                "low": _chart_json_series(df["low"]),
+                "close": close_values,
+                "customdata": [[value] for value in close_values],
+            })
+            continue
+        if name == "di_14":
+            values = di_values[di_index] if di_index < len(di_values) else None
+            di_index += 1
+        else:
+            values = x_values_by_name.get(name)
+        if values is None:
+            raise ValueError(f"fast chart trace data unavailable: {name}")
+        update_x = ([signal_ms, signal_ms] if name == "signal_time" else
+                    [signal_ms] if name == "signal_time_marker" else x_values)
+        update = {"key": key, "x": update_x, "y": values}
+        if name == "macd_hist":
+            update["marker_color"] = ["#26a69a" if value is not None and value >= 0 else "#ef5350" for value in values]
+        elif name == "volume":
+            update["marker_color"] = [
+                "#26a69a" if close_value >= open_value else "#ef5350"
+                for close_value, open_value in zip(close_values, _chart_json_series(df["open"]))
+            ]
+        trace_updates.append(update)
     return {
         "version": CHART_FAST_CANDLE_SCHEMA_VERSION,
         "revision": time.time_ns(),
         "task_id": str(task_id),
-        "trace_keys": list(CHART_FAST_CANDLE_TRACE_KEYS),
-        "x": x_values,
-        "open": df["open"].astype(float).tolist(),
-        "high": df["high"].astype(float).tolist(),
-        "low": df["low"].astype(float).tolist(),
-        "close": close_values,
-        "customdata": [[value] for value in close_values],
-        "signal_x": [signal_ms, signal_ms],
-        "signal_y": [y_min, y_max],
-        "signal_marker_x": [signal_ms],
-        "signal_marker_y": [signal_price],
+        "trace_keys": list(current_schema.get("trace_keys") or []),
+        "traces": trace_updates,
         "signal_price": signal_price,
         "title": f"{symbol} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         "meta": {
@@ -4150,7 +4202,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
     let payload = rawPayload;
     try {
         if (typeof payload === 'string') payload = JSON.parse(payload);
-        if (!payload || payload.version !== 1 || !payload.task_id) return false;
+        if (!payload || payload.version !== 2 || !payload.task_id) return false;
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
         if (!plot || !window.Plotly || !Array.isArray(plot.data)) {
@@ -4161,28 +4213,57 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             return String((((trace || {}).meta || {}).chart_trace_key) || '');
         });
         const expectedKeys = Array.isArray(payload.trace_keys) ? payload.trace_keys.map(String) : [];
+        const updates = Array.isArray(payload.traces) ? payload.traces : [];
         if (actualKeys.length !== expectedKeys.length || actualKeys.some(function(key, index) { return key !== expectedKeys[index]; })) {
             requestFullChartFallback(payload.task_id, 'trace schema mismatch');
             return false;
         }
+        if (updates.length !== actualKeys.length || updates.some(function(update, index) { return String((update || {}).key || '') !== actualKeys[index]; })) {
+            requestFullChartFallback(payload.task_id, 'trace payload mismatch');
+            return false;
+        }
         const startedAt = performance.now();
+        const candleUpdate = updates[0];
+        if (!candleUpdate || actualKeys[0].indexOf('candlestick:ohlc:') !== 0) {
+            requestFullChartFallback(payload.task_id, 'OHLC trace unavailable');
+            return false;
+        }
         await window.Plotly.restyle(plot, {
-            x: [payload.x], open: [payload.open], high: [payload.high],
-            low: [payload.low], close: [payload.close], customdata: [payload.customdata]
+            x: [candleUpdate.x], open: [candleUpdate.open], high: [candleUpdate.high],
+            low: [candleUpdate.low], close: [candleUpdate.close], customdata: [candleUpdate.customdata]
         }, [0]);
-        await window.Plotly.restyle(plot, {x: [payload.x], y: [payload.close]}, [1]);
-        await window.Plotly.restyle(plot, {x: [payload.signal_x], y: [payload.signal_y]}, [2]);
-        await window.Plotly.restyle(plot, {x: [payload.signal_marker_x], y: [payload.signal_marker_y]}, [3]);
+        const valueIndices = [];
+        const xUpdates = [];
+        const yUpdates = [];
+        const colorIndices = [];
+        const colorUpdates = [];
+        updates.slice(1).forEach(function(update, offset) {
+            const index = offset + 1;
+            valueIndices.push(index);
+            xUpdates.push(update.x);
+            yUpdates.push(update.y);
+            if (Array.isArray(update.marker_color)) {
+                colorIndices.push(index);
+                colorUpdates.push(update.marker_color);
+            }
+        });
+        if (valueIndices.length) await window.Plotly.restyle(plot, {x: xUpdates, y: yUpdates}, valueIndices);
+        if (colorIndices.length) await window.Plotly.restyle(plot, {'marker.color': colorUpdates}, colorIndices);
         const currentLayout = plot.layout || {};
         const shapes = (currentLayout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
         const annotations = (currentLayout.annotations || []).map(function(annotation) { return Object.assign({}, annotation); });
-        if (shapes.length) {
-            shapes[0].y0 = payload.signal_price;
-            shapes[0].y1 = payload.signal_price;
+        const signalShape = shapes.find(function(shape) {
+            const line = (shape || {}).line || {};
+            return String(shape.yref || '') === 'y' && String(line.color || '').toLowerCase() === 'yellow';
+        });
+        if (signalShape) {
+            signalShape.y0 = payload.signal_price;
+            signalShape.y1 = payload.signal_price;
         }
-        if (annotations.length && String(annotations[0].text || '').indexOf('Signal Level') >= 0) {
-            annotations[0].y = payload.signal_price;
-        }
+        const signalAnnotation = annotations.find(function(annotation) {
+            return String((annotation || {}).text || '').indexOf('Signal Level') >= 0;
+        });
+        if (signalAnnotation) signalAnnotation.y = payload.signal_price;
         const meta = Object.assign({}, currentLayout.meta || {}, payload.meta || {});
         await window.Plotly.relayout(plot, {
             title: {text: payload.title}, meta: meta, shapes: shapes, annotations: annotations,
@@ -4196,7 +4277,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         traceUi('fast chart browser applied', {
             taskId: payload.task_id,
             elapsed_ms: Math.round(performance.now() - startedAt),
-            points: Array.isArray(payload.x) ? payload.x.length : 0,
+            points: Array.isArray(candleUpdate.x) ? candleUpdate.x.length : 0,
             traces: actualKeys.length
         });
         return true;
@@ -9872,22 +9953,6 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
                if CHART_COMPACT_TIME_AXIS_ENABLED else df['x'])
     chart_event_context = resolve_chart_request_context(task_id, chart_request, chart_event_context)
     chart_source = (chart_event_context or {}).get("source", "main_table") if isinstance(chart_event_context, dict) else "main_table"
-    if chart_fast_candle_navigation_eligible(
-        current_render_schema, chart_source, render_values, ctx.triggered_id
-    ):
-        payload_started = time.perf_counter()
-        payload = build_fast_candle_navigation_payload(
-            task, task_id, chart_window["symbol"], df, current_render_schema
-        )
-        payload_json = json.dumps(payload, separators=(",", ":"), allow_nan=False)
-        elapsed = time.perf_counter() - timer.start_time
-        payload_ms = round((time.perf_counter() - payload_started) * 1000)
-        interaction_trace(
-            f"chart fast payload complete task={task_id} elapsed={elapsed:.3f}s "
-            f"build_ms={payload_ms} points={len(df)} bytes={len(payload_json.encode('utf-8'))}"
-        )
-        timer.end()
-        return no_update, current_render_schema, payload_json
     # Retain the canonical UI snapshot in the model for new render helpers;
     # legacy Inputs remain authoritative until the next migration step.
     chart_ui_state = chart_ui_state if isinstance(chart_ui_state, dict) else make_chart_ui_state()
@@ -10079,6 +10144,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     df = task._chart_cache[cache_key]
     retain_chart_task_indicator_cache(task)
 
+    indicator_started = time.perf_counter()
     if volume_visible and has_volume:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
     if rsi_visible and 'rsi' not in df.columns:
@@ -10118,7 +10184,34 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     has_volume = chart_model["has_volume"]
     volume_enabled = bool(volume_visible and has_volume)
     indicator_specs = chart_model["indicator_specs"]
+    indicator_ms = round((time.perf_counter() - indicator_started) * 1000)
     timer.check(f"Render model source={chart_model['source']} panes={len(indicator_specs)}")
+
+    # Same-schema task navigation can stop here: indicator arrays have been
+    # calculated with the original formulas, but no Plotly Figure, subplots,
+    # traces, annotations, or layout have been constructed or serialized.
+    if chart_fast_candle_navigation_eligible(
+        current_render_schema, chart_source, render_values, ctx.triggered_id
+    ):
+        payload_started = time.perf_counter()
+        try:
+            payload = build_fast_candle_navigation_payload(
+                task, task_id, chart_window["symbol"], df, current_render_schema
+            )
+            payload_json = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+        except (KeyError, TypeError, ValueError) as exc:
+            interaction_trace(f"chart fast payload unavailable task={task_id} reason={exc}")
+        else:
+            elapsed = time.perf_counter() - timer.start_time
+            payload_ms = round((time.perf_counter() - payload_started) * 1000)
+            interaction_trace(
+                f"chart fast payload complete task={task_id} elapsed={elapsed:.3f}s "
+                f"indicator_ms={indicator_ms} build_ms={payload_ms} "
+                f"points={len(df)} traces={len(payload['traces'])} "
+                f"bytes={len(payload_json.encode('utf-8'))}"
+            )
+            timer.end()
+            return no_update, current_render_schema, payload_json
 
     total_rows = 1 + len(indicator_specs)
     if total_rows == 1:
