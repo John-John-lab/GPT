@@ -4229,10 +4229,15 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         let candleAppliedAt = startedAt;
         let valuesAppliedAt = startedAt;
         let colorsAppliedAt = startedAt;
+        // ISO strings keep Plotly's shared x axes explicitly in date mode.
+        // Passing bare epoch numbers through restyle can make some Plotly
+        // bundles infer a linear axis and display long integer tick labels.
+        const sharedDates = payload.shared_x.map(function(value) { return new Date(Number(value)).toISOString(); });
+        const signalDate = new Date(Number(payload.signal_x)).toISOString();
         function traceX(update) {
-            if (update.x_kind === 'signal_line') return [payload.signal_x, payload.signal_x];
-            if (update.x_kind === 'signal_marker') return [payload.signal_x];
-            return payload.shared_x;
+            if (update.x_kind === 'signal_line') return [signalDate, signalDate];
+            if (update.x_kind === 'signal_marker') return [signalDate];
+            return sharedDates;
         }
         const candleUpdate = updates[0];
         if (!candleUpdate || actualKeys[0].indexOf('candlestick:ohlc:') !== 0) {
@@ -4243,29 +4248,22 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         // in the Dash response. Candle hover still receives the identical data.
         const candleCustomData = candleUpdate.close.map(function(value) { return [value]; });
         await window.Plotly.restyle(plot, {
-            x: [payload.shared_x], open: [candleUpdate.open], high: [candleUpdate.high],
+            x: [sharedDates], open: [candleUpdate.open], high: [candleUpdate.high],
             low: [candleUpdate.low], close: [candleUpdate.close], customdata: [candleCustomData]
         }, [0]);
         candleAppliedAt = performance.now();
         const valueIndices = [];
         const xUpdates = [];
         const yUpdates = [];
-        const colorIndices = [];
-        const colorUpdates = [];
+        const markerColorUpdates = [];
         updates.slice(1).forEach(function(update, offset) {
             const index = offset + 1;
             valueIndices.push(index);
             xUpdates.push(traceX(update));
             yUpdates.push(update.y);
-            if (Array.isArray(update.marker_color)) {
-                colorIndices.push(index);
-                colorUpdates.push(update.marker_color);
-            }
+            const currentMarker = ((plot.data[index] || {}).marker || {}).color;
+            markerColorUpdates.push(Array.isArray(update.marker_color) ? update.marker_color : currentMarker);
         });
-        if (valueIndices.length) await window.Plotly.restyle(plot, {x: xUpdates, y: yUpdates}, valueIndices);
-        valuesAppliedAt = performance.now();
-        if (colorIndices.length) await window.Plotly.restyle(plot, {'marker.color': colorUpdates}, colorIndices);
-        colorsAppliedAt = performance.now();
         const currentLayout = plot.layout || {};
         const shapes = (currentLayout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
         const annotations = (currentLayout.annotations || []).map(function(annotation) { return Object.assign({}, annotation); });
@@ -4282,11 +4280,22 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         });
         if (signalAnnotation) signalAnnotation.y = payload.signal_price;
         const meta = Object.assign({}, currentLayout.meta || {}, payload.meta || {});
-        await window.Plotly.relayout(plot, {
+        const layoutUpdate = {
             title: {text: payload.title}, meta: meta, shapes: shapes, annotations: annotations,
             uirevision: 'task-chart-preserve-view-' + payload.task_id,
             'xaxis.autorange': true, 'yaxis.autorange': true
-        });
+        };
+        // Plotly.update applies oscillator arrays and task-dependent layout in
+        // one calculation pass instead of a restyle followed by a relayout.
+        if (valueIndices.length) {
+            await window.Plotly.update(plot, {
+                x: xUpdates, y: yUpdates, 'marker.color': markerColorUpdates
+            }, layoutUpdate, valueIndices);
+        } else {
+            await window.Plotly.relayout(plot, layoutUpdate);
+        }
+        valuesAppliedAt = performance.now();
+        colorsAppliedAt = performance.now();
         window.__gptPendingChartTaskId = '';
         window.__taskChartMeasureShapes = [];
         window.__taskChartMeasureTaskId = payload.task_id;
@@ -4295,9 +4304,9 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             taskId: payload.task_id,
             elapsed_ms: Math.round(performance.now() - startedAt),
             candle_ms: Math.round(candleAppliedAt - startedAt),
-            values_ms: Math.round(valuesAppliedAt - candleAppliedAt),
+            values_layout_ms: Math.round(valuesAppliedAt - candleAppliedAt),
             colors_ms: Math.round(colorsAppliedAt - valuesAppliedAt),
-            layout_ms: Math.round(performance.now() - colorsAppliedAt),
+            final_ms: Math.round(performance.now() - colorsAppliedAt),
             points: payload.shared_x.length,
             traces: actualKeys.length
         });
@@ -10136,7 +10145,10 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         target_fig.add_trace(make_chart_macd_trace(x=trace_x, y=df['macd_line'], mode='lines', name='MACD 12/26', line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='MACD: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.add_trace(make_chart_macd_trace(x=trace_x, y=df['macd_signal'], mode='lines', name='Signal 9', line=dict(color='#ef6c00', width=1.1), connectgaps=True, hovertemplate='Signal: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.add_hline(y=0, line_dash="dash", line_color="#999", row=row, col=1)
-        target_fig.update_yaxes(title_text="MACD (price units)", row=row, col=1)
+        # MACD is expressed in price units and can legitimately be only a few
+        # thousandths for low-priced pairs. Significant-digit formatting keeps
+        # values such as 0.005 visible instead of rounding every tick to 0.
+        target_fig.update_yaxes(title_text="MACD (price units)", tickformat=".6~g", row=row, col=1)
 
     def add_disparity_trace(target_fig, row):
         dix_cols = ['disparity_50', 'disparity_25', 'disparity_9']
