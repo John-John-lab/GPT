@@ -20,7 +20,7 @@ import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functo
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 import dash
-from dash import dcc, html, Input, Output, State, MATCH, ALL, Patch, no_update, ctx, clientside_callback as dash_clientside_callback
+from dash import dcc, html, Input, Output, State, MATCH, ALL, Patch, ClientsideFunction, no_update, ctx, clientside_callback as dash_clientside_callback
 import pandas as pd
 import numpy as np
 import requests
@@ -3803,6 +3803,16 @@ window.__gptToolbarRenderPending = false;
 function flushQueuedChartActions() {
     if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
     chartActionFlushTimer = null;
+    if (window.__gptToolbarRenderPending) {
+        // Never submit a second large figure while Plotly is still applying
+        // the first toolbar result. Keep only the newest requested value for
+        // each control and flush it after the current afterplot event.
+        if (performance.now() - Number(window.__gptToolbarRenderPendingSince || 0) < 30000) {
+            chartActionFlushTimer = window.setTimeout(flushQueuedChartActions, 120);
+            return true;
+        }
+        window.__gptToolbarRenderPending = false;
+    }
     const actions = Object.keys(chartQueuedActions).map(function(key) { return chartQueuedActions[key]; });
     Object.keys(chartQueuedActions).forEach(function(key) { delete chartQueuedActions[key]; });
     if (!actions.length) return false;
@@ -3812,6 +3822,7 @@ function flushQueuedChartActions() {
     ]);
     const needsRender = actions.some(function(action) { return renderPaths.has(action.section + '.' + action.key); });
     window.__gptToolbarRenderPending = needsRender;
+    window.__gptToolbarRenderPendingSince = needsRender ? performance.now() : 0;
     markChartRenderRequested(actions.length === 1 ? 'toolbar-' + actions[0].key : 'toolbar-batch');
     window.dash_clientside.set_props('chart-ui-action-store', {data: {actions: actions, ts: Date.now()}});
     traceUi('toolbar batch submitted', {count: actions.length});
@@ -3927,8 +3938,13 @@ function validateChartDiagnosticFingerprint(plot) {
     if (!expected || !plot) return {status: 'unavailable', issues: ['missing fingerprint']};
     const issues = [];
     const fullData = plot._fullData || plot.data || [];
+    function missingValue(value) {
+        if (value == null) return true;
+        if (typeof value === 'number') return !Number.isFinite(value);
+        return String(value).toLowerCase() === 'nan';
+    }
     function numericEqual(left, right) {
-        if (left == null && right == null) return true;
+        if (missingValue(left) || missingValue(right)) return missingValue(left) && missingValue(right);
         const a = Number(left), b = Number(right);
         if (!Number.isFinite(a) || !Number.isFinite(b)) return String(left) === String(right);
         return Math.abs(a - b) <= Math.max(1e-10, Math.abs(b) * 1e-8);
@@ -3994,15 +4010,20 @@ function installChartBrowserRenderTrace() {
                 window.__gptPendingChartTaskId = '';
                 if (String(request.kind || '').indexOf('toolbar-') === 0) {
                     window.__gptToolbarRenderPending = false;
+                    window.__gptToolbarRenderPendingSince = 0;
                 }
             }
             window.requestAnimationFrame(function() {
-                const integrity = validateChartDiagnosticFingerprint(plot);
-                traceUi('chart integrity', {
-                    id: request ? request.id : (plot.layout && plot.layout.meta && plot.layout.meta.diagnostic_id) || 'external',
-                    status: integrity.status,
-                    issues: integrity.issues
-                });
+                const fingerprintId = (plot.layout && plot.layout.meta && plot.layout.meta.diagnostic_id) || 'external';
+                if (request || plot.__gptLastValidatedFingerprintId !== fingerprintId) {
+                    const integrity = validateChartDiagnosticFingerprint(plot);
+                    plot.__gptLastValidatedFingerprintId = fingerprintId;
+                    traceUi('chart integrity', {
+                        id: request ? request.id : fingerprintId,
+                        status: integrity.status,
+                        issues: integrity.issues
+                    });
+                }
                 traceUi('chart browser applied', {
                     id: request ? request.id : 'external',
                     kind: request ? request.kind : 'external',
@@ -4718,6 +4739,40 @@ function openAdjacentChartImmediately(button) {
     }
     return submitAdjacentChartNavigation(taskId, direction, button.id);
 }
+window.dash_clientside = window.dash_clientside || {};
+window.dash_clientside.chart_navigation = {
+    navigate: function(prevClicks, nextClicks, currentTaskId, eventContext, viewState, previousTarget, nextTarget) {
+        const callbackContext = window.dash_clientside.callback_context || {};
+        const triggered = callbackContext.triggered_id;
+        if ((triggered !== 'prev-chart-btn' && triggered !== 'next-chart-btn') || !currentTaskId) {
+            return Array(5).fill(window.dash_clientside.no_update);
+        }
+        const targetId = String(triggered === 'prev-chart-btn' ? (previousTarget || '') : (nextTarget || ''));
+        if (!targetId) return Array(5).fill(window.dash_clientside.no_update);
+        let nextContext = window.dash_clientside.no_update;
+        if (eventContext && Array.isArray(eventContext.events) && eventContext.events.length) {
+            const currentIndex = Math.max(0, Number(eventContext.index || 0));
+            const nextIndex = currentIndex + (triggered === 'prev-chart-btn' ? -1 : 1);
+            if (nextIndex < 0 || nextIndex >= eventContext.events.length || String(eventContext.events[nextIndex].task_id || '') !== targetId) {
+                traceUi('chart navigation rejected', {reason: 'event context mismatch', targetId: targetId, nextIndex: nextIndex});
+                return Array(5).fill(window.dash_clientside.no_update);
+            }
+            nextContext = Object.assign({}, eventContext, {index: nextIndex});
+        }
+        let nextViewState = window.dash_clientside.no_update;
+        if (viewState && viewState.axes) {
+            nextViewState = Object.assign({}, viewState, {task_id: targetId, carried_to_task_ts: Date.now() / 1000});
+        }
+        traceUi('local source chart navigation', {direction: triggered === 'prev-chart-btn' ? 'previous' : 'next', taskId: targetId});
+        return [
+            targetId,
+            window.dash_clientside.no_update,
+            {[targetId + '_chart']: Date.now() / 1000},
+            nextContext,
+            nextViewState
+        ];
+    }
+};
 // Capture phase lets direct Store updates reach Dash before React queues the
 // native n_click callback. If set_props is unavailable, normal bubbling keeps
 // the server fallback fully functional.
@@ -6256,45 +6311,45 @@ def build_tasks_tab_layout():
                     html.H5("UP-toward oscillator group (resistance → reverse SELL)", style={"margin": "8px 0", "color": "#6a1b9a"}),
                     html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
                     dcc.Input(id="osc-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
                     dcc.Input(id="osc-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                     dcc.Input(id="osc-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
                     dcc.Input(id="osc-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
                     dcc.Input(id="osc-rsi-level-input", type="number", value=70, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                 ], style={"marginBottom": "12px"}),
                 html.Div([
                     html.H5("DOWN-toward oscillator group (support → reverse BUY)", style={"margin": "8px 0", "color": "#1565c0"}),
                     html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
                     dcc.Input(id="osc-down-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-down-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-down-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
                     dcc.Input(id="osc-down-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-down-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-down-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                     dcc.Input(id="osc-down-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-down-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                     html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
                     dcc.Input(id="osc-down-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-down-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-down-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("RSI(14,14):", style={"width": "120px", "display": "inline-block"}),
                     dcc.Input(id="osc-down-rsi-level-input", type="number", value=30, min=0, max=100, step=0.5, style={"width": "80px"}),
-                    dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                    dcc.Dropdown(id="osc-down-rsi-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="disabled", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("Initial SL %:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-sl-input", type="number", value=0.5, min=0, step=0.05, style={"width": "90px"}),
@@ -6325,35 +6380,35 @@ def build_tasks_tab_layout():
                             html.H5("Close SELL positions (resistance entries)", style={"margin": "8px 0", "color": "#6a1b9a"}),
                             html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
                             dcc.Input(id="osc-exit-sell-stoch-14-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-sell-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
                             dcc.Input(id="osc-exit-sell-stoch-40-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-sell-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                         ], style={"marginBottom": "8px"}),
                         html.Div([
                             html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                             dcc.Input(id="osc-exit-sell-stoch-60-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
                             dcc.Input(id="osc-exit-sell-stoch-300-level-input", type="number", value=13, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-sell-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-sell-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_up", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                         ], style={"marginBottom": "10px"}),
                         html.Div([
                             html.H5("Close BUY positions (support entries)", style={"margin": "8px 0", "color": "#1565c0"}),
                             html.Label("Stoch 14/1/3:", style={"width": "120px", "display": "inline-block"}),
                             dcc.Input(id="osc-exit-buy-stoch-14-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-buy-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-14-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             html.Label("Stoch 40/1/4:", style={"width": "120px", "display": "inline-block", "marginLeft": "18px"}),
                             dcc.Input(id="osc-exit-buy-stoch-40-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-buy-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-40-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                         ], style={"marginBottom": "8px"}),
                         html.Div([
                             html.Label("Stoch 60/1/10:", style={"width": "120px", "display": "inline-block"}),
                             dcc.Input(id="osc-exit-buy-stoch-60-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-60-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                             html.Label("Stoch 300/1/10:", style={"width": "125px", "display": "inline-block", "marginLeft": "18px"}),
                             dcc.Input(id="osc-exit-buy-stoch-300-level-input", type="number", value=87, min=0, max=100, step=0.5, style={"width": "80px"}),
-                            dcc.Dropdown(id="osc-exit-buy-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
+                            dcc.Dropdown(id="osc-exit-buy-stoch-300-condition-input", options=[{"label": "Cross down", "value": "cross_down"}, {"label": "Cross up", "value": "cross_up"}, {"label": "Above", "value": "above"}, {"label": "Below", "value": "below"}, {"label": "Disabled", "value": "disabled"}], value="cross_down", clearable=False, searchable=False, style={"width": "140px", "display": "inline-block", "verticalAlign": "middle", "marginLeft": "8px"}),
                         ], style={"marginBottom": "4px"}),
                     ], style={"padding": "8px", "backgroundColor": "#f8edff", "border": "1px solid #ce93d8", "borderRadius": "4px", "margin": "8px 0"})
                 ], open=False, style={"marginBottom": "10px"}),
@@ -8506,8 +8561,9 @@ def update_chart_nav_buttons(task_id, version, event_context):
         total = len(events)
         previous = str(events[idx - 1].get("task_id") or "") if idx > 0 else ""
         following = str(events[idx + 1].get("task_id") or "") if idx < total - 1 else ""
-        # Summary-event navigation must also move the event index/context, so
-        # it keeps the server navigation route instead of bypassing it.
+        # Summary-event navigation must move task id and event index together.
+        # The named clientside callback below does that atomically; these stay
+        # false only to prevent the simpler main-table capture handler running.
         return idx <= 0, idx >= total - 1, previous, following, "false", "false"
     if not task_id:
         return True, True, "", "", "false", "false"
@@ -8522,16 +8578,8 @@ def update_chart_nav_buttons(task_id, version, event_context):
     # resolved adjacent ids so the browser can skip the server n_click hop.
     return idx <= 0, idx >= len(chart_ids) - 1, previous, following, "true", "true"
 
-def carry_chart_view_state_to_task(view_state, target_task_id):
-    """Carry current zoom/pan ranges to a newly selected chart task."""
-    if not isinstance(view_state, dict) or not view_state.get("axes") or not target_task_id:
-        return no_update
-    next_state = dict(view_state)
-    next_state["task_id"] = str(target_task_id)
-    next_state["carried_to_task_ts"] = time.time()
-    return next_state
-
-@app.callback(
+app.clientside_callback(
+    ClientsideFunction(namespace="chart_navigation", function_name="navigate"),
     Output("chart-task-id", "data", allow_duplicate=True),
     Output("task-page-store", "data", allow_duplicate=True),
     Output("chart-click-store", "data", allow_duplicate=True),
@@ -8542,51 +8590,10 @@ def carry_chart_view_state_to_task(view_state, target_task_id):
     State("chart-task-id", "data"),
     State("chart-event-context-store", "data"),
     State("chart-view-state-store", "data"),
-    prevent_initial_call=True
+    State("prev-chart-btn", "data-target-task-id"),
+    State("next-chart-btn", "data-target-task-id"),
+    prevent_initial_call=True,
 )
-def navigate_chart_task(prev_clicks, next_clicks, current_task_id, event_context, chart_view_state):
-    triggered = ctx.triggered_id
-    if triggered not in ("prev-chart-btn", "next-chart-btn") or not current_task_id:
-        return no_update, no_update, no_update, no_update, no_update
-
-    if isinstance(event_context, dict) and event_context.get("events"):
-        events = event_context.get("events") or []
-        current_idx = int(event_context.get("index") or 0)
-        next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
-        if next_idx < 0 or next_idx >= len(events):
-            return no_update, no_update, no_update, no_update, no_update
-        target_id = str(events[next_idx].get("task_id") or "")
-        if not target_id:
-            return no_update, no_update, no_update, no_update, no_update
-        # Event-group navigation is opened from summary tables and can include many
-        # rows.  Do not force the task table to jump pages here; that expensive
-        # table rebuild made left/right chart navigation feel very slow.
-        updated_context = dict(event_context, index=next_idx)
-        warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
-        if 0 <= warm_idx < len(events):
-            prefetch_chart_source_async(tm.get_task(str(events[warm_idx].get("task_id") or "")))
-        interaction_trace(f"chart navigation target={target_id} direction={triggered} source=event_context")
-        return target_id, no_update, {f"{target_id}_chart": time.time()}, updated_context, carry_chart_view_state_to_task(chart_view_state, target_id)
-
-    _, chartable = get_chartable_tasks_for_navigation()
-    chart_ids = [str(t.task_id) for t in chartable]
-    if current_task_id not in chart_ids:
-        return no_update, no_update, no_update, no_update, no_update
-
-    current_idx = chart_ids.index(current_task_id)
-    next_idx = current_idx - 1 if triggered == "prev-chart-btn" else current_idx + 1
-    if next_idx < 0 or next_idx >= len(chartable):
-        return no_update, no_update, no_update, no_update, no_update
-
-    target_id = str(chartable[next_idx].task_id)
-    # Keep chart navigation independent from the main task table.  Jumping the
-    # table page here triggers an expensive table rebuild and makes the chart's
-    # left/right buttons feel delayed on large task sets.
-    warm_idx = next_idx - 1 if triggered == "prev-chart-btn" else next_idx + 1
-    if 0 <= warm_idx < len(chartable):
-        prefetch_chart_source_async(chartable[warm_idx])
-    interaction_trace(f"chart navigation target={target_id} direction={triggered} source=main_table")
-    return target_id, no_update, {f"{target_id}_chart": time.time()}, no_update, carry_chart_view_state_to_task(chart_view_state, target_id)
 
 register_browser_callback(
     """
@@ -10291,9 +10298,12 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
                                f"<br>Why entered:<br>{entry_reason_html}"
                                f"<br>Time: %{{x|%Y-%m-%d %H:%M}}<extra></extra>"),
             ), row=1, col=1)
-            # A layout guide is cheaper than another full Plotly trace and
-            # cannot participate in hover selection for the nearby marker.
-            fig.add_vline(x=entry_dt, row=1, col=1, line_color="#00c853", line_width=1, line_dash="dot")
+            # One paper-height shape spans the main and every oscillator pane.
+            # Repeating add_vline for every subplot created 12–16 separately
+            # validated shapes and dominated dynamic-summary overlay time.
+            fig.add_shape(type="line", x0=entry_dt, x1=entry_dt, y0=0, y1=1,
+                          xref="x", yref="paper",
+                          line=dict(color="#00c853", width=1, dash="dot"))
     if exit_time is not None and exit_price is not None:
         try:
             exit_ms = normalize_chart_timestamp_ms(exit_time)
@@ -10314,7 +10324,9 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
                 name="Dynamic strategy exit", showlegend=False, hoverlabel=dict(align="left"),
                 hovertemplate=exit_hover + "<extra></extra>",
             ), row=1, col=1)
-            fig.add_vline(x=exit_dt, row=1, col=1, line_color="#d50000", line_width=1, line_dash="dot")
+            fig.add_shape(type="line", x0=exit_dt, x1=exit_dt, y0=0, y1=1,
+                          xref="x", yref="paper",
+                          line=dict(color="#d50000", width=1, dash="dot"))
 
 
 # ----- Chart figure callback (light theme) -----
@@ -10434,7 +10446,6 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     source_trade_event = get_active_chart_source_event(task_id, chart_event_context)
     if source_trade_event:
         source_trade_event = align_source_trade_event_to_candles(source_trade_event, df)
-    source_trade_marks = build_source_trade_mark_specs(source_trade_event)
     trace_chart_phase("resolve_context", source=chart_source, source_trade=bool(source_trade_event))
     # UTC conversion remains local because the figure renderer uses it for
     # source marks, signals, and tooltips.
@@ -10865,17 +10876,8 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     ), row=1, col=1)
     # Source-aware main-pane entry/exit markers retain detailed reasons and P&L.
     add_source_trade_overlay(fig, source_trade_event, ms_to_chart_x, y_min, y_max)
-    # Source-entry/exit guides are repeated in each visible oscillator pane.
-    # This gives strategy-summary charts one aligned time reference without
-    # changing oscillator values, calculations, or main-pane trade tooltips.
-    if source_trade_marks and total_rows > 1:
-        for mark in source_trade_marks:
-            mark_time = ms_to_chart_x(mark["timestamp"])
-            for row in range(2, total_rows + 1):
-                fig.add_vline(
-                    x=mark_time, row=row, col=1,
-                    line=dict(color=mark["color"], width=1, dash="dot"),
-                )
+    # add_source_trade_overlay uses two paper-height shapes, so entry/exit
+    # guides already span the main plot and every visible oscillator pane.
 
     # ----- Strategy markers (separate: impulse vs other) -----
     if hasattr(task, 'strategy_signals') and task.strategy_signals:
