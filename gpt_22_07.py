@@ -3620,6 +3620,34 @@ document.addEventListener('click', function(event) {
     const id = target && target.closest ? (target.closest('button, th, td') || {}).id : '';
     window.__gptEarlyTrace('capture click target=' + (target && target.tagName ? target.tagName : '?') + ' id=' + (id || '-'));
 }, true);
+function copyChartDiagnostics() {
+    const server = document.getElementById('ui-trace-output');
+    const browser = document.getElementById('ui-client-trace-output');
+    const status = document.getElementById('ui-trace-copy-status');
+    const text = '=== SERVER CHART DIAGNOSTICS ===\\n' + String((server && server.textContent) || '') +
+        '\\n\\n=== BROWSER CHART DIAGNOSTICS ===\\n' + String((browser && browser.textContent) || '');
+    function report(ok) {
+        if (!status) return;
+        status.textContent = ok ? 'Copied both diagnostic fields.' : 'Copy failed; select the fields manually.';
+        status.style.color = ok ? '#2e7d32' : '#c62828';
+    }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).then(function() { report(true); }).catch(function() { report(false); });
+        return;
+    }
+    const area = document.createElement('textarea');
+    area.value = text; area.style.position = 'fixed'; area.style.opacity = '0';
+    document.body.appendChild(area); area.select();
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch (_) {}
+    area.remove(); report(copied);
+}
+document.addEventListener('click', function(event) {
+    const button = event.target && event.target.closest ? event.target.closest('#ui-trace-copy-btn') : null;
+    if (!button) return;
+    event.preventDefault();
+    copyChartDiagnostics();
+}, true);
 // The trace functions repaint immediately when a new event is recorded. Only
 // poll briefly while Dash mounts the diagnostics panel; a permanent 500 ms DOM
 // rewrite competed with Plotly on the browser main thread.
@@ -4055,7 +4083,10 @@ function installChartCrosshairFallback() {
             // Absolute children of the graph could be hidden by the plot over
             // the data area and appear only beside the y axis.
             label.style.cssText = 'position:fixed;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
-            label.style.left = Math.max(0, axisLeft + 8) + 'px'; label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px'; document.body.appendChild(label);
+            // Follow the dashed cursor instead of sitting on the y axis. Clamp
+            // approximately to the viewport so multi-value ADX/MACD boxes stay visible.
+            label.style.left = Math.max(4, Math.min(window.innerWidth - 210, event.clientX + 12)) + 'px';
+            label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px'; document.body.appendChild(label);
         });
     }, true);
 }
@@ -5063,7 +5094,9 @@ def build_root_layout():
         html.Div("Use this panel when a chart button is slow or opens the wrong task. It records server-side chart and toolbar events. Click Refresh server trace after testing; the panel does not poll while you use the chart. The blue area updates directly in the browser.", style={"fontSize": "12px", "margin": "6px 0"}),
         html.Div([
             html.Button("Test browser click tracing", id="ui-client-trace-test-btn", n_clicks=0, style={"fontSize": "12px", "marginRight": "6px"}),
-            html.Button("Refresh server trace", id="ui-trace-refresh-btn", n_clicks=0, style={"fontSize": "12px"}),
+            html.Button("Refresh server trace", id="ui-trace-refresh-btn", n_clicks=0, style={"fontSize": "12px", "marginRight": "6px"}),
+            html.Button("📋 Copy both diagnostics", id="ui-trace-copy-btn", n_clicks=0, style={"fontSize": "12px", "marginRight": "6px"}),
+            html.Span(id="ui-trace-copy-status", style={"fontSize": "12px"}),
         ], style={"marginBottom": "6px"}),
         html.Pre(id="ui-trace-output", children="No server chart events yet. Click Refresh server trace after testing.", style={"maxHeight": "140px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#111", "color": "#d7ffd9", "padding": "8px", "fontSize": "11px", "borderRadius": "4px"}),
         html.Pre(id="ui-client-trace-output", children="Browser click trace: waiting for page script.", style={"maxHeight": "100px", "overflowY": "auto", "whiteSpace": "pre-wrap", "backgroundColor": "#102027", "color": "#b2ebf2", "padding": "8px", "fontSize": "11px", "borderRadius": "4px", "marginTop": "6px"}),
@@ -9877,6 +9910,47 @@ def normalize_chart_timestamp_ms(value):
     return numeric
 
 
+def align_source_trade_event_to_candles(event, df):
+    """Snap source marks to their nearest rendered candle and report validity.
+
+    Strategy prices are never modified: an execution price outside its selected
+    candle is diagnostic evidence, not something the renderer should hide.
+    """
+    if not isinstance(event, dict) or df is None or df.empty or "timestamp" not in df:
+        return event
+    aligned = dict(event)
+    timestamps = df["timestamp"].to_numpy(dtype="int64", copy=False)
+    diagnostics = {}
+    for kind in ("entry", "exit"):
+        timestamp = normalize_chart_timestamp_ms(event.get(f"{kind}_time"))
+        try:
+            price = float(event.get(f"{kind}_price"))
+        except (TypeError, ValueError):
+            continue
+        if timestamp is None or not np.isfinite(price) or not len(timestamps):
+            continue
+        insertion = int(np.searchsorted(timestamps, timestamp, side="left"))
+        candidates = [index for index in (insertion - 1, insertion) if 0 <= index < len(timestamps)]
+        if not candidates:
+            continue
+        candle_index = min(candidates, key=lambda index: abs(int(timestamps[index]) - timestamp))
+        candle = df.iloc[candle_index]
+        candle_time = int(timestamps[candle_index])
+        candle_low = float(candle["low"])
+        candle_high = float(candle["high"])
+        aligned[f"{kind}_time"] = candle_time
+        diagnostics[kind] = {
+            "requested_ms": timestamp,
+            "candle_ms": candle_time,
+            "price": price,
+            "low": candle_low,
+            "high": candle_high,
+            "inside_candle": bool(candle_low <= price <= candle_high),
+        }
+    aligned["_chart_alignment"] = diagnostics
+    return aligned
+
+
 def build_source_trade_mark_specs(event):
     """Normalize source trade timestamps for synchronized pane guides."""
     if not isinstance(event, dict):
@@ -10077,6 +10151,8 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     # legacy Inputs remain authoritative until the next migration step.
     chart_ui_state = chart_ui_state if isinstance(chart_ui_state, dict) else make_chart_ui_state()
     source_trade_event = get_active_chart_source_event(task_id, chart_event_context)
+    if source_trade_event:
+        source_trade_event = align_source_trade_event_to_candles(source_trade_event, df)
     source_trade_marks = build_source_trade_mark_specs(source_trade_event)
     # UTC conversion remains local because the figure renderer uses it for
     # source marks, signals, and tooltips.
@@ -10428,7 +10504,8 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             event_exit_price = float(selected_event.get("exit_price"))
             interaction_trace(
                 f"chart source trade task={task_id} entry_ms={event_entry_ms} entry_price={event_entry_price:.8g} "
-                f"exit_ms={event_exit_ms} exit_price={event_exit_price:.8g} category={selected_event.get('category')}"
+                f"exit_ms={event_exit_ms} exit_price={event_exit_price:.8g} category={selected_event.get('category')} "
+                f"alignment={selected_event.get('_chart_alignment')}"
             )
             if len(df) and event_entry_ms is not None and event_exit_ms is not None and all(np.isfinite(value) for value in (event_entry_ms, event_exit_ms, event_entry_price, event_exit_price)):
                 timestamps = df['timestamp'].to_numpy()
