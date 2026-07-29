@@ -996,6 +996,56 @@ def attach_chart_trace_schema(fig, source):
     return schema
 
 
+def build_chart_diagnostic_fingerprint(fig, df, task_id, source, source_trade_event=None):
+    """Return tiny deterministic samples used only to verify browser integrity."""
+    if df is None or df.empty:
+        return {}
+    indices = sorted(set((0, len(df) // 2, len(df) - 1)))
+
+    def scalar(value):
+        if value is None or pd.isna(value):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    trace_samples = []
+    for trace_index, trace in enumerate(fig.data):
+        values = getattr(trace, "close", None) if getattr(trace, "type", "") == "candlestick" else getattr(trace, "y", None)
+        try:
+            if values is None or len(values) != len(df):
+                continue
+            sampled = [scalar(values[index]) for index in indices]
+        except (TypeError, IndexError):
+            continue
+        trace_samples.append({
+            "index": trace_index,
+            "name": str(getattr(trace, "name", "") or ""),
+            "field": "close" if getattr(trace, "type", "") == "candlestick" else "y",
+            "values": sampled,
+        })
+    event = {}
+    if isinstance(source_trade_event, dict):
+        for kind in ("entry", "exit"):
+            timestamp = normalize_chart_timestamp_ms(source_trade_event.get(f"{kind}_time"))
+            try:
+                price = float(source_trade_event.get(f"{kind}_price"))
+            except (TypeError, ValueError):
+                price = None
+            event[kind] = {"timestamp": int(timestamp) if timestamp is not None else None, "price": price}
+    return {
+        "version": 1,
+        "task_id": str(task_id),
+        "source": str(source or "main_table"),
+        "points": len(df),
+        "indices": indices,
+        "timestamps": [int(df["timestamp"].iloc[index]) for index in indices],
+        "traces": trace_samples,
+        "event": event,
+    }
+
+
 def chart_schemas_match(current_schema, requested_schema):
     """Conservative gate: only identical, enabled schemas may use patching."""
     if not isinstance(current_schema, dict) or not isinstance(requested_schema, dict):
@@ -3428,6 +3478,7 @@ def start_chart_dash_response_timer():
     if "task-chart.figure" in output:
         g.chart_dash_output = output
         g.chart_dash_started_at = time.perf_counter()
+        g.chart_trace_id = request.headers.get("X-GPT-Chart-Trace", "server")
 
 
 @app.server.after_request
@@ -3436,9 +3487,14 @@ def trace_chart_dash_response(response):
     started_at = getattr(g, "chart_dash_started_at", None)
     if started_at is not None:
         elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        callback_ms = getattr(g, "chart_callback_ms", None)
+        serialization_ms = max(0, elapsed_ms - callback_ms) if callback_ms is not None else None
         size = response.calculate_content_length()
         interaction_trace(
-            f"chart Dash response total_ms={elapsed_ms} bytes={size if size is not None else 'streamed'}"
+            f"chart response id={getattr(g, 'chart_trace_id', 'server')} total_ms={elapsed_ms} "
+            f"callback_ms={callback_ms if callback_ms is not None else 'unknown'} "
+            f"serialize_ms={serialization_ms if serialization_ms is not None else 'unknown'} "
+            f"bytes={size if size is not None else 'streamed'}"
         )
     return response
 
@@ -3472,7 +3528,7 @@ def register_browser_callback(*args, **kwargs):
 def render_ui_trace(_):
     """Show recent server-side chart interactions for non-technical debugging."""
     events = list(UI_INTERACTION_TRACE_EVENTS)
-    return "\n".join(events[-40:]) if events else "No chart events yet. Open a chart or click a toolbar button."
+    return "\n".join(events[-120:]) if events else "No chart events yet. Open a chart or click a toolbar button."
 
 
 # ----- Flask route for task actions (stop/pause/save) – unchanged -----
@@ -3607,7 +3663,7 @@ window.__gptUiBrowserTrace = [];
 window.__gptRenderBrowserTrace = function() {
     const panel = document.getElementById('ui-client-trace-output');
     if (!panel) return;
-    const lines = window.__gptEarlyBrowserTrace.concat(window.__gptUiBrowserTrace).slice(-40);
+    const lines = window.__gptEarlyBrowserTrace.concat(window.__gptUiBrowserTrace).slice(-100);
     panel.textContent = lines.join('\\n');
 };
 window.__gptEarlyTrace = function(message) {
@@ -3781,7 +3837,7 @@ function traceUi(message, details) {
     const text = new Date().toLocaleTimeString() + ' | ' + message + (details ? ' | ' + JSON.stringify(details) : '');
     const trace = window.__gptUiBrowserTrace || (window.__gptUiBrowserTrace = []);
     trace.push(text);
-    if (trace.length > 30) trace.splice(0, trace.length - 30);
+    if (trace.length > 100) trace.splice(0, trace.length - 100);
     if (window.__gptRenderBrowserTrace) window.__gptRenderBrowserTrace();
     if (window.localStorage && window.localStorage.getItem('gptTraceUi') === '1') {
         console.debug('[GPT UI TRACE]', message, details || '');
@@ -3789,7 +3845,33 @@ function traceUi(message, details) {
 }
 traceUi('page script initialized', {loaded: window.__gptIndexScriptLoaded});
 function markChartRenderRequested(kind) {
-    window.__gptChartRenderRequest = {kind: kind, startedAt: performance.now(), responseReceived: false};
+    const now = performance.now();
+    const current = window.__gptChartRenderRequest;
+    if (current && !current.responseReceived && now - current.startedAt < 350 && current.kind === kind) return current;
+    window.__gptChartTraceSequence = Number(window.__gptChartTraceSequence || 0) + 1;
+    const id = Date.now().toString(36) + '-' + window.__gptChartTraceSequence.toString(36);
+    window.__gptChartRenderRequest = {
+        id: id, kind: kind, startedAt: now, responseReceived: false,
+        longTaskCount: 0, longTaskMs: 0, longTaskMaxMs: 0
+    };
+    traceUi('chart diagnostic started', {id: id, kind: kind});
+    return window.__gptChartRenderRequest;
+}
+if (typeof PerformanceObserver === 'function' && !window.__gptChartLongTaskObserver) {
+    try {
+        window.__gptChartLongTaskObserver = new PerformanceObserver(function(list) {
+            const active = window.__gptChartRenderRequest;
+            if (!active) return;
+            list.getEntries().forEach(function(entry) {
+                active.longTaskCount += 1;
+                active.longTaskMs += entry.duration;
+                active.longTaskMaxMs = Math.max(active.longTaskMaxMs, entry.duration);
+            });
+        });
+        window.__gptChartLongTaskObserver.observe({entryTypes: ['longtask']});
+    } catch (_) {
+        // Long-task observation is optional and must never affect rendering.
+    }
 }
 function installDashChartNetworkTrace() {
     if (window.__gptDashChartFetchTraceInstalled || typeof window.fetch !== 'function') return;
@@ -3806,8 +3888,21 @@ function installDashChartNetworkTrace() {
         }
         const isChartFigure = url.indexOf('/_dash-update-component') >= 0 && output.indexOf('task-chart.figure') >= 0;
         const startedAt = isChartFigure ? performance.now() : 0;
-        if (isChartFigure) traceUi('chart Dash request sent', {kind: (window.__gptChartRenderRequest || {}).kind || 'external'});
-        return originalFetch(input, init).then(function(response) {
+        let requestInit = init;
+        if (isChartFigure) {
+            const active = window.__gptChartRenderRequest || markChartRenderRequested('external');
+            active.fetchStartedAt = startedAt;
+            try {
+                requestInit = Object.assign({}, init || {});
+                const headers = new Headers((init && init.headers) || {});
+                headers.set('X-GPT-Chart-Trace', active.id);
+                requestInit.headers = headers;
+            } catch (_) {
+                requestInit = init;
+            }
+            traceUi('chart Dash request sent', {id: active.id, kind: active.kind || 'external', click_to_request_ms: Math.round(startedAt - active.startedAt)});
+        }
+        return originalFetch(input, requestInit).then(function(response) {
             if (isChartFigure) {
                 const activeRequest = window.__gptChartRenderRequest;
                 if (activeRequest) {
@@ -3815,7 +3910,9 @@ function installDashChartNetworkTrace() {
                     activeRequest.responseReceivedAt = performance.now();
                 }
                 traceUi('chart Dash response received', {
+                    id: activeRequest ? activeRequest.id : 'external',
                     elapsed_ms: Math.round(performance.now() - startedAt),
+                    click_to_response_ms: activeRequest ? Math.round(performance.now() - activeRequest.startedAt) : null,
                     bytes: response.headers.get('content-length') || 'chunked'
                 });
             }
@@ -3824,6 +3921,53 @@ function installDashChartNetworkTrace() {
     };
 }
 installDashChartNetworkTrace();
+function validateChartDiagnosticFingerprint(plot) {
+    const meta = (plot && plot.layout && plot.layout.meta) || {};
+    const expected = meta.diagnostic_fingerprint;
+    if (!expected || !plot) return {status: 'unavailable', issues: ['missing fingerprint']};
+    const issues = [];
+    const fullData = plot._fullData || plot.data || [];
+    function numericEqual(left, right) {
+        if (left == null && right == null) return true;
+        const a = Number(left), b = Number(right);
+        if (!Number.isFinite(a) || !Number.isFinite(b)) return String(left) === String(right);
+        return Math.abs(a - b) <= Math.max(1e-10, Math.abs(b) * 1e-8);
+    }
+    (expected.traces || []).forEach(function(sample) {
+        const trace = fullData[sample.index];
+        const series = trace && trace[sample.field];
+        if (!trace || !series) {
+            issues.push('missing trace ' + sample.index + ':' + sample.name);
+            return;
+        }
+        (expected.indices || []).forEach(function(pointIndex, offset) {
+            if (!numericEqual(series[pointIndex], sample.values[offset])) {
+                issues.push('value mismatch ' + sample.index + ':' + sample.name + '@' + pointIndex);
+            }
+        });
+    });
+    function asMillis(value) {
+        if (value instanceof Date) return value.getTime();
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) return numeric;
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    ['entry', 'exit'].forEach(function(kind) {
+        const event = (expected.event || {})[kind];
+        if (!event || event.timestamp == null || event.price == null) return;
+        const wantedName = kind === 'entry' ? 'Dynamic strategy entry' : 'Dynamic strategy exit';
+        const marker = fullData.find(function(trace) { return trace && trace.name === wantedName; });
+        if (!marker || !marker.x || !marker.y) {
+            issues.push('missing ' + kind + ' marker');
+            return;
+        }
+        if (!numericEqual(asMillis(marker.x[0]), event.timestamp)) issues.push(kind + ' timestamp mismatch');
+        if (!numericEqual(marker.y[0], event.price)) issues.push(kind + ' price mismatch');
+    });
+    if (String(meta.task_id || '') !== String(expected.task_id || '')) issues.push('task id mismatch');
+    return {status: issues.length ? 'FAIL' : 'PASS', issues: issues.slice(0, 8)};
+}
 function installChartBrowserRenderTrace() {
     function attach() {
         const root = document.getElementById('task-chart');
@@ -3853,10 +3997,22 @@ function installChartBrowserRenderTrace() {
                 }
             }
             window.requestAnimationFrame(function() {
+                const integrity = validateChartDiagnosticFingerprint(plot);
+                traceUi('chart integrity', {
+                    id: request ? request.id : (plot.layout && plot.layout.meta && plot.layout.meta.diagnostic_id) || 'external',
+                    status: integrity.status,
+                    issues: integrity.issues
+                });
                 traceUi('chart browser applied', {
+                    id: request ? request.id : 'external',
                     kind: request ? request.kind : 'external',
                     elapsed_ms: elapsedMs,
-                    traces: (plot.data || []).length
+                    response_to_plot_ms: request && request.responseReceivedAt ? Math.round(performance.now() - request.responseReceivedAt) : null,
+                    traces: (plot.data || []).length,
+                    shapes: ((plot.layout || {}).shapes || []).length,
+                    long_tasks: request ? request.longTaskCount : 0,
+                    long_task_ms: request ? Math.round(request.longTaskMs) : 0,
+                    long_task_max_ms: request ? Math.round(request.longTaskMaxMs) : 0
                 });
                 if (!window.__gptToolbarRenderPending && window.__gptQueuedChartNavigation) {
                     const queued = window.__gptQueuedChartNavigation;
@@ -4582,6 +4738,7 @@ document.addEventListener('click', function(e) {
     if (button.id === 'prev-chart-btn' || button.id === 'next-chart-btn') {
         // Also cover source-event navigation, which deliberately uses the
         // server callback instead of the direct adjacent-task Store path.
+        markChartRenderRequested(button.id);
         resetMeasureForChartNavigation();
     }
     if (openTableChartImmediately(button)) {
@@ -10226,7 +10383,26 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     candle_info_enabled = render_values["candle_info_enabled"]
     measure_mode = render_values["measure_mode"]
     task = tm.get_task(task_id)
-    interaction_trace(f"chart render start task={task_id} request={getattr(chart_request, 'get', lambda *_: None)('source') if isinstance(chart_request, dict) else None}")
+    diagnostic_id = request.headers.get("X-GPT-Chart-Trace", "server")
+    diagnostic_started = diagnostic_last = time.perf_counter()
+
+    def trace_chart_phase(name, **details):
+        """Publish copyable phase timings without changing chart data or flow."""
+        nonlocal diagnostic_last
+        now = time.perf_counter()
+        step_ms = round((now - diagnostic_last) * 1000)
+        total_ms = round((now - diagnostic_started) * 1000)
+        suffix = " ".join(f"{key}={value}" for key, value in details.items())
+        interaction_trace(
+            f"chart phase id={diagnostic_id} task={task_id} name={name} "
+            f"step_ms={step_ms} total_ms={total_ms}{(' ' + suffix) if suffix else ''}"
+        )
+        diagnostic_last = now
+
+    interaction_trace(
+        f"chart render start id={diagnostic_id} task={task_id} "
+        f"request={getattr(chart_request, 'get', lambda *_: None)('source') if isinstance(chart_request, dict) else None}"
+    )
     timer = PerfTimer(f"Chart render {task_id}").start()
     chart_window = load_chart_task_window(task)
     if not chart_window:
@@ -10239,6 +10415,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         f"source_rows={chart_window.get('source_rows')} window_rows={len(chart_window['df'])}"
     )
     timer.check("Load task window")
+    trace_chart_phase("load_window", cache="hit" if chart_window.get("cache_hit") else "miss", rows=len(chart_window["df"]))
     sym = chart_window["symbol"]
     fp = chart_window["file_path"]
     start_ms = chart_window["start_ms"]
@@ -10258,6 +10435,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if source_trade_event:
         source_trade_event = align_source_trade_event_to_candles(source_trade_event, df)
     source_trade_marks = build_source_trade_mark_specs(source_trade_event)
+    trace_chart_phase("resolve_context", source=chart_source, source_trade=bool(source_trade_event))
     # UTC conversion remains local because the figure renderer uses it for
     # source marks, signals, and tooltips.
     def ms_to_chart_x(ms):
@@ -10451,8 +10629,15 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     indicator_started = time.perf_counter()
     if volume_visible and has_volume:
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+    trace_chart_phase("indicator_volume", enabled=bool(volume_visible and has_volume))
+    rsi_cached = 'rsi' in df.columns
     if rsi_visible and 'rsi' not in df.columns:
         df['rsi'] = compute_rsi(df['close'])
+    trace_chart_phase("indicator_rsi", enabled=bool(rsi_visible), cached=rsi_cached)
+    stochastic_cached = all(column in df.columns for column in (
+        'stoch_k_14_1_3', 'stoch_d_14_1_3', 'stoch_k_40_1_4', 'stoch_d_40_1_4',
+        'stoch_k_60_1_10', 'stoch_d_60_1_10', 'stoch_k_300_1_10', 'stoch_d_300_1_10',
+    ))
     if stochastic_visible:
         stochastic_columns = {
             ('stoch_k_14_1_3', 'stoch_d_14_1_3'): (14, 1, 3),
@@ -10463,10 +10648,16 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         for (k_col, d_col), params in stochastic_columns.items():
             if k_col not in df.columns or d_col not in df.columns:
                 df[k_col], df[d_col] = compute_stochastic(df['high'], df['low'], df['close'], *params)
+    trace_chart_phase("indicator_stochastic", enabled=bool(stochastic_visible), cached=stochastic_cached)
+    adx_cached = {'adx_14_1', 'plus_di_14', 'minus_di_14'}.issubset(df.columns)
     if adx_visible and not {'adx_14_1', 'plus_di_14', 'minus_di_14'}.issubset(df.columns):
         df['adx_14_1'], df['plus_di_14'], df['minus_di_14'] = compute_adx(df['high'], df['low'], df['close'], 14, 1)
+    trace_chart_phase("indicator_adx", enabled=bool(adx_visible), cached=adx_cached)
+    macd_cached = {'macd_line', 'macd_signal', 'macd_hist'}.issubset(df.columns)
     if macd_visible and not {'macd_line', 'macd_signal', 'macd_hist'}.issubset(df.columns):
         df['macd_line'], df['macd_signal'], df['macd_hist'] = compute_chart_macd(df['close'], 12, 26, 9)
+    trace_chart_phase("indicator_macd", enabled=bool(macd_visible), cached=macd_cached)
+    disparity_cached = {'disparity_50', 'disparity_25', 'disparity_9'}.issubset(df.columns)
     if disparity_visible:
         if 'disparity_50' not in df.columns:
             df['disparity_50'] = compute_disparity_index(df['close'], 50)
@@ -10474,6 +10665,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             df['disparity_25'] = compute_disparity_index(df['close'], 25)
         if 'disparity_9' not in df.columns:
             df['disparity_9'] = compute_disparity_index(df['close'], 9)
+    trace_chart_phase("indicator_disparity", enabled=bool(disparity_visible), cached=disparity_cached)
     # Build a UI/render model after lazy calculations. This preserves the
     # existing formulas while separating source/data decisions from rendering.
     pane_visibility = {
@@ -10490,6 +10682,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     indicator_specs = chart_model["indicator_specs"]
     indicator_ms = round((time.perf_counter() - indicator_started) * 1000)
     timer.check(f"Render model source={chart_model['source']} panes={len(indicator_specs)}")
+    trace_chart_phase("render_model", panes=len(indicator_specs), indicator_ms=indicator_ms)
 
     # Same-schema task navigation can stop here: indicator arrays have been
     # calculated with the original formulas, but no Plotly Figure, subplots,
@@ -10509,11 +10702,12 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             elapsed = time.perf_counter() - timer.start_time
             payload_ms = round((time.perf_counter() - payload_started) * 1000)
             interaction_trace(
-                f"chart fast payload complete task={task_id} elapsed={elapsed:.3f}s "
+                f"chart fast payload complete id={diagnostic_id} task={task_id} elapsed={elapsed:.3f}s "
                 f"indicator_ms={indicator_ms} build_ms={payload_ms} "
                 f"points={len(df)} traces={len(payload['traces'])} "
                 f"bytes={len(payload_json.encode('utf-8'))}"
             )
+            g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
             timer.end()
             return no_update, current_render_schema, payload_json
 
@@ -10528,7 +10722,9 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             rows=total_rows, cols=1, shared_xaxes=True,
             vertical_spacing=0.035, row_heights=row_heights
         )
+    trace_chart_phase("make_subplots", rows=total_rows)
     add_main_candles(fig)
+    trace_chart_phase("main_traces", traces=len(fig.data))
 
     current_row = 2
     for indicator_type, indicator_data in indicator_specs:
@@ -10545,6 +10741,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         elif indicator_type == "volume":
             add_volume_trace(fig, row=current_row)
         current_row += 1
+    trace_chart_phase("indicator_traces", traces=len(fig.data))
 
     if volume_visible and not has_volume:
         fig.add_annotation(
@@ -10718,6 +10915,10 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     # parquet/figure rebuild for every drag or point measurement.
 
     timer.check("Figure traces and overlays")
+    trace_chart_phase(
+        "overlays", traces=len(fig.data), shapes=len(fig.layout.shapes or ()),
+        annotations=len(fig.layout.annotations or ()),
+    )
     # Layout (light theme)
     fig.update_layout(
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
@@ -10798,7 +10999,21 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     # The full renderer remains authoritative. This metadata only establishes a
     # stable, conservative contract for a later opt-in incremental navigation path.
     requested_render_schema = attach_chart_trace_schema(fig, chart_model["source"])
+    diagnostic_fingerprint = build_chart_diagnostic_fingerprint(
+        fig, df, task_id, chart_model["source"], source_trade_event
+    )
+    fig.layout.meta = {
+        **(fig.layout.meta if isinstance(fig.layout.meta, dict) else {}),
+        "diagnostic_fingerprint": diagnostic_fingerprint,
+        "diagnostic_id": diagnostic_id,
+    }
+    interaction_trace(
+        f"chart fingerprint id={diagnostic_id} task={task_id} source={chart_model['source']} "
+        f"points={diagnostic_fingerprint.get('points')} sampled_traces={len(diagnostic_fingerprint.get('traces') or [])} "
+        f"event={diagnostic_fingerprint.get('event') or 'none'}"
+    )
     timer.check(f"Layout and view state traces={len(fig.data)}")
+    trace_chart_phase("layout_schema", traces=len(fig.data), axes=total_rows)
     elapsed = time.perf_counter() - timer.start_time
     if elapsed > CHART_RENDER_PERF_BUDGET_SECONDS:
         perf_log(f"[TRACE] ⚠️ Chart render exceeded {CHART_RENDER_PERF_BUDGET_SECONDS:.1f}s: {elapsed:.4f}s")
@@ -10807,9 +11022,10 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         and chart_schemas_match(current_render_schema, requested_render_schema)
     )
     interaction_trace(
-        f"chart render complete task={task_id} elapsed={elapsed:.3f}s "
+        f"chart render complete id={diagnostic_id} task={task_id} elapsed={elapsed:.3f}s "
         f"traces={len(fig.data)} mode={'incremental' if use_incremental_patch else 'full'}"
     )
+    g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
     timer.end()
     if use_incremental_patch:
         return build_incremental_chart_patch(fig), requested_render_schema, no_update
