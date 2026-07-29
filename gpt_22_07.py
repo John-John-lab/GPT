@@ -866,7 +866,10 @@ CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
 # It bypasses Plotly Figure construction and sends raw trace arrays to the
 # already mounted graph. Any schema/browser mismatch requests the authoritative
 # full renderer immediately.
-CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "1") == "1"
+# Correctness is the default. The compact restyle path remains available for
+# controlled profiling, but full Plotly figures are authoritative until pane,
+# Measure, crosshair, and source-mark state all pass browser regression tests.
+CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "0") == "1"
 CHART_FAST_CANDLE_SCHEMA_VERSION = 3
 CHART_FAST_NAV_SUPPORTED_NAMES = frozenset({
     "ohlc", "measure_click_points", "rsi_14",
@@ -3808,6 +3811,12 @@ function installChartBrowserRenderTrace() {
             // A figure may emit more than one afterplot event while Plotly
             // settles its layout. Report the first paint for this request.
             if (request) {
+                // A server figure contains only protected application shapes.
+                // Record them before any user rectangle is appended so Clear
+                // and Backspace can never remove Signal Level or pane guides.
+                if (plot.layout) {
+                    plot.__dashBaseShapeCount = (plot.layout.shapes || []).length;
+                }
                 window.__gptChartRenderRequest = null;
                 window.__gptPendingChartTaskId = '';
                 if (String(request.kind || '').indexOf('toolbar-') === 0) {
@@ -3983,7 +3992,7 @@ function installChartCrosshairFallback() {
     line.style.cssText = 'position:fixed;z-index:10050;display:none;width:0;border-left:1px dashed #666;pointer-events:none;';
     document.body.appendChild(line);
     function clearLabels(root) {
-        if (root) root.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(node) { node.remove(); });
+        document.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(node) { node.remove(); });
     }
     function asMillis(value) {
         if (value instanceof Date) return value.getTime();
@@ -4025,7 +4034,7 @@ function installChartCrosshairFallback() {
         if (index === null) return;
         clearLabels(root);
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
-        const rootRect = root.getBoundingClientRect(), valuesByAxis = {};
+        const valuesByAxis = {};
         plot.data.forEach(function(trace, curveNumber) {
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             const name = trace && trace.name ? String(trace.name) : '';
@@ -4042,8 +4051,11 @@ function installChartCrosshairFallback() {
             if (!axis || !Number.isFinite(axis._offset)) return;
             const label = document.createElement('div');
             label.dataset.taskChartOscillatorSyncLabel = 'true'; label.textContent = valuesByAxis[axisId].join('\\n');
-            label.style.cssText = 'position:absolute;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
-            label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px'; label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px'; root.appendChild(label);
+            // Fixed overlays stay above Plotly's SVG/WebGL stacking contexts.
+            // Absolute children of the graph could be hidden by the plot over
+            // the data area and appear only beside the y axis.
+            label.style.cssText = 'position:fixed;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
+            label.style.left = Math.max(0, axisLeft + 8) + 'px'; label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px'; document.body.appendChild(label);
         });
     }, true);
 }
@@ -4590,7 +4602,12 @@ document.addEventListener('keydown', function(e) {
     const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
     const shapes = plot && plot.layout ? (plot.layout.shapes || []) : [];
     const base = Math.max(0, Number(plot && plot.__dashBaseShapeCount || 0));
-    if (!plot || !window.Plotly || shapes.length <= base) return;
+    if (!plot || !window.Plotly) return;
+    // Plotly's generic shape editor otherwise receives the same key and can
+    // erase protected server shapes when there is no measurement to remove.
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (shapes.length <= base) return;
     let removeIndex = shapes.length - 1;
     if (e.key === 'Delete' && plot.__dashSelectedMeasureShapeKey) {
         const selectedOffset = shapes.slice(base).findIndex(function(shape) {
@@ -4599,7 +4616,6 @@ document.addEventListener('keydown', function(e) {
         if (selectedOffset < 0) return;
         removeIndex = base + selectedOffset;
     }
-    e.preventDefault();
     const remainingShapes = shapes.slice(0, removeIndex).concat(shapes.slice(removeIndex + 1));
     window.Plotly.relayout(plot, {shapes: remainingShapes});
     window.__taskChartMeasureShapes = uniqueMeasureShapes(remainingShapes.slice(base)).map(function(item) { return Object.assign({}, item); });
@@ -5377,7 +5393,10 @@ def build_root_layout():
                     dcc.Graph(
                         id="task-chart",
                         style={"flex": "1", "minHeight": "0"},
-                        config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect", "eraseshape"]}
+                        # Shape erasing from Plotly's generic modebar cannot
+                        # distinguish a measurement from protected Signal Level.
+                        # Use Clear/Backspace, which preserve base figure shapes.
+                        config={"scrollZoom": True, "displaylogo": False, "modeBarButtonsToAdd": ["drawrect"]}
                     ),
                     html.Div(id="measure-hint", style={"color": "#333", "fontSize": "12px", "textAlign": "center", "marginTop": "5px"}),
                     html.Div(id="measure-result", style={"color": "black", "marginTop": "10px", "textAlign": "center", "fontSize": "14px"})
@@ -9084,7 +9103,7 @@ function(figure, oscillatorSyncInfo, candleInfo) {
     plot.__dashOscillatorSyncInfo = Boolean(oscillatorSyncInfo);
     plot.__dashCandleInfoEnabled = Boolean(candleInfo);
     function clearOscillatorSyncLabels() {
-        root.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(label) {
+        document.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(label) {
             label.remove();
         });
     }
@@ -9170,7 +9189,6 @@ function(figure, oscillatorSyncInfo, candleInfo) {
         const svg = plot.querySelector('.main-svg');
         if (!svg) return;
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
-        const rootRect = root.getBoundingClientRect();
         const svgRect = svg.getBoundingClientRect();
         const valuesByAxis = {};
         plot.data.forEach(function(trace, curveNumber) {
@@ -9196,9 +9214,9 @@ function(figure, oscillatorSyncInfo, candleInfo) {
             const label = document.createElement('div');
             label.dataset.taskChartOscillatorSyncLabel = 'true';
             label.textContent = valuesByAxis[axisId].join('\\n');
-            label.style.position = 'absolute';
-            label.style.left = Math.max(0, svgRect.left - rootRect.left + 8) + 'px';
-            label.style.top = Math.max(0, svgRect.top - rootRect.top + axis._offset + 4) + 'px';
+            label.style.position = 'fixed';
+            label.style.left = Math.max(0, svgRect.left + 8) + 'px';
+            label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px';
             label.style.zIndex = '10052';
             label.style.pointerEvents = 'none';
             label.style.whiteSpace = 'pre-line';
@@ -9209,7 +9227,7 @@ function(figure, oscillatorSyncInfo, candleInfo) {
             label.style.font = '11px sans-serif';
             label.style.lineHeight = '1.3';
             label.style.padding = '2px 5px';
-            root.appendChild(label);
+            document.body.appendChild(label);
         });
     }
     function syncedHoverAt(event, rect) {
@@ -10418,8 +10436,11 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
                 end_idx = int(np.searchsorted(timestamps, max(event_entry_ms, event_exit_ms), side='right')) - 1
                 start_idx = max(0, min(start_idx, len(df) - 1))
                 end_idx = max(start_idx, min(end_idx, len(df) - 1))
-                left_idx = max(0, start_idx - 20)
-                right_idx = min(len(df) - 1, end_idx + 20)
+                # Keep enough candle context around source trades to verify the
+                # strategy path visually. Twenty bars made short trades appear
+                # excessively zoomed and could place text outside the viewport.
+                left_idx = max(0, start_idx - 60)
+                right_idx = min(len(df) - 1, end_idx + 60)
                 event_focus_xrange = [df['x'].iloc[left_idx], df['x'].iloc[right_idx]]
                 event_low = min(float(df['low'].iloc[left_idx:right_idx + 1].min()), event_entry_price, event_exit_price)
                 event_high = max(float(df['high'].iloc[left_idx:right_idx + 1].max()), event_entry_price, event_exit_price)
