@@ -3998,7 +3998,25 @@ function applyChartToggleImmediately(button) {
         }
     }
     if (button.id === 'toggle-oscillator-info-box-btn') button.textContent = active ? 'Osc Info: On' : 'Osc Info: Off';
-    if (button.id === 'toggle-oscillator-sync-info-btn') button.textContent = active ? 'Osc All: On' : 'Osc All: Off';
+    if (button.id === 'toggle-oscillator-sync-info-btn') {
+        button.textContent = active ? 'Osc All: On' : 'Osc All: Off';
+        if (!active) {
+            document.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(node) { node.remove(); });
+        } else {
+            // Populate a stable initial readout immediately; later native hover
+            // events update the same right-side boxes with the exact point.
+            window.setTimeout(function() {
+                const root = document.getElementById('task-chart');
+                const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+                if (!plot) return;
+                const rect = plot.getBoundingClientRect();
+                plot.dispatchEvent(new MouseEvent('mousemove', {
+                    bubbles: true, clientX: rect.left + rect.width * 0.7,
+                    clientY: rect.top + rect.height * 0.5
+                }));
+            }, 30);
+        }
+    }
     if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
     if (button.id === 'toggle-measure-oscillator-range-btn') {
         button.textContent = active ? 'Osc Range: On' : 'Osc Range: Off';
@@ -4044,7 +4062,11 @@ function installChartCrosshairFallback() {
         if (!plot || !plot._fullLayout || !plot.data) { line.style.display = 'none'; return; }
         const rect = plot.getBoundingClientRect();
         if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
-            line.style.display = 'none'; clearLabels(root); return;
+            line.style.display = 'none';
+            // Keep the last synchronized values visible while Osc All is On.
+            // They are a static readout, not a tooltip tied to mouse presence.
+            if (!chartToggleState['toggle-oscillator-sync-info-btn']) clearLabels(root);
+            return;
         }
         line.style.left = event.clientX + 'px'; line.style.top = rect.top + 'px'; line.style.height = rect.height + 'px'; line.style.display = 'block';
         if (!chartToggleState['toggle-oscillator-sync-info-btn']) { clearLabels(root); return; }
@@ -4058,7 +4080,14 @@ function installChartCrosshairFallback() {
         const axisLeft = svgRect.left + Number(xaxis._offset || 0);
         const axisWidth = Math.max(1, Number(xaxis._length || rect.width));
         const axisRatio = Math.max(0, Math.min(1, (event.clientX - axisLeft) / axisWidth));
-        const index = nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
+        const nativeHover = (plot._hoverdata || []).find(function(point) {
+            const trace = point && plot.data && plot.data[point.curveNumber];
+            return trace && trace.x && trace.x.length === firstTrace.x.length;
+        });
+        const nativePointIndex = nativeHover && Number.isInteger(Number(nativeHover.pointNumber)) ? Number(nativeHover.pointNumber) : null;
+        // Prefer Plotly's own native-hover point. This is the exact point used
+        // by the immediate hover box; geometric lookup is only a fallback.
+        const index = nativePointIndex !== null ? nativePointIndex : nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
         if (index === null) return;
         clearLabels(root);
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
@@ -4083,12 +4112,12 @@ function installChartCrosshairFallback() {
             // Absolute children of the graph could be hidden by the plot over
             // the data area and appear only beside the y axis.
             label.style.cssText = 'position:fixed;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
-            // Follow the dashed cursor instead of sitting on the y axis. Clamp
-            // approximately to the viewport so multi-value ADX/MACD boxes stay visible.
-            label.style.left = Math.max(4, Math.min(window.innerWidth - 210, event.clientX + 12)) + 'px';
+            // Static readouts stay at the right side of the plot and never
+            // follow or cover the dashed cursor in the analytical area.
+            label.style.left = Math.max(4, Math.min(window.innerWidth - 210, svgRect.right - 205)) + 'px';
             label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px'; document.body.appendChild(label);
         });
-    }, true);
+    }, false);
 }
 installChartCrosshairFallback();
 // Chrome/Plotly compatibility fallback: older Plotly bundles can paint a
@@ -9182,7 +9211,7 @@ function(figure, oscillatorSyncInfo, candleInfo) {
     }
     function hideLine() {
         line.style.display = 'none';
-        clearOscillatorSyncLabels();
+        if (!plot.__dashOscillatorSyncInfo) clearOscillatorSyncLabels();
         if (window.Plotly && window.Plotly.Fx) {
             try { window.Plotly.Fx.unhover(plot); } catch (e) {}
         }
@@ -9248,7 +9277,7 @@ function(figure, oscillatorSyncInfo, candleInfo) {
             label.dataset.taskChartOscillatorSyncLabel = 'true';
             label.textContent = valuesByAxis[axisId].join('\\n');
             label.style.position = 'fixed';
-            label.style.left = Math.max(0, svgRect.left + 8) + 'px';
+            label.style.left = Math.max(4, Math.min(window.innerWidth - 210, svgRect.right - 205)) + 'px';
             label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px';
             label.style.zIndex = '10052';
             label.style.pointerEvents = 'none';
@@ -9281,7 +9310,12 @@ function(figure, oscillatorSyncInfo, candleInfo) {
                 break;
             }
         }
-        const pointIndex = findNearestPointIndex(xValues, targetMs);
+        const nativeHover = (plot._hoverdata || []).find(function(point) {
+            const trace = point && plot.data && plot.data[point.curveNumber];
+            return trace && trace.x && trace.x.length === xValues.length;
+        });
+        const nativePointIndex = nativeHover && Number.isInteger(Number(nativeHover.pointNumber)) ? Number(nativeHover.pointNumber) : null;
+        const pointIndex = nativePointIndex !== null ? nativePointIndex : findNearestPointIndex(xValues, targetMs);
         if (pointIndex === null) return;
         const hoverPoints = [];
         plot.data.forEach(function(trace, curveNumber) {
