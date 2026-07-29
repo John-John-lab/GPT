@@ -1296,6 +1296,7 @@ OSCILLATOR_SETTINGS_IDS = [
     "osc-exit-sell-stoch-60-level-input", "osc-exit-sell-stoch-60-condition-input", "osc-exit-sell-stoch-300-level-input", "osc-exit-sell-stoch-300-condition-input", "osc-exit-buy-stoch-14-level-input", "osc-exit-buy-stoch-14-condition-input",
     "osc-exit-buy-stoch-40-level-input", "osc-exit-buy-stoch-40-condition-input", "osc-exit-buy-stoch-60-level-input", "osc-exit-buy-stoch-60-condition-input", "osc-exit-buy-stoch-300-level-input", "osc-exit-buy-stoch-300-condition-input",
     "osc-reversal-notional-input", "osc-reversal-cost-input", "osc-reversal-open-return-input",
+    "osc-task-limit-input",
     "osc-research-entry-windows-input", "osc-research-exit-windows-input", "osc-research-sl-grid-input", "osc-research-stop-presets-input",
     "osc-research-max-combos-input", "osc-research-top-input",
 ]
@@ -3939,6 +3940,37 @@ function deactivateMeasureForChartAction() {
         window.Plotly.relayout(plot, {dragmode: 'pan'});
     }
 }
+function resetMeasureForChartNavigation() {
+    chartToggleState['toggle-measure-btn'] = false;
+    window.__taskChartMeasureShapes = [];
+    window.__taskChartMeasureTaskId = '';
+    if (window.dash_clientside && typeof window.dash_clientside.set_props === 'function') {
+        window.dash_clientside.set_props('measure-mode-store', {data: false});
+        window.dash_clientside.set_props('measure-result-store', {data: null});
+        window.dash_clientside.set_props('measure-points-store', {data: {first: null, second: null}});
+    }
+    const button = document.getElementById('toggle-measure-btn');
+    if (button) {
+        button.textContent = '📐 Measure';
+        button.setAttribute('aria-pressed', 'false');
+        button.style.background = 'transparent';
+        button.style.borderWidth = '1px';
+        button.style.fontWeight = 'normal';
+    }
+    const root = document.getElementById('task-chart');
+    const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
+    if (plot && window.Plotly && plot.layout) {
+        const base = Math.max(0, Number(plot.__dashBaseShapeCount || 0));
+        const protectedShapes = (plot.layout.shapes || []).slice(0, base);
+        plot.__dashSelectedMeasureShapeKey = '';
+        window.Plotly.relayout(plot, {shapes: protectedShapes, dragmode: 'pan'});
+    }
+    document.querySelectorAll('[id^="task-chart-measure-label-"], [id^="task-chart-measure-pointer-"], [id^="task-chart-measure-osc-range-"]').forEach(function(node) { node.remove(); });
+    const result = document.getElementById('measure-result');
+    const hint = document.getElementById('measure-hint');
+    if (result) result.textContent = '';
+    if (hint) hint.textContent = '';
+}
 function applyChartToggleImmediately(button) {
     if (window.__chartToolbarUsesServerCallbacks) return false;
     const config = chartToggleStores[button.id];
@@ -4089,25 +4121,37 @@ function installChartCrosshairFallback() {
         // by the immediate hover box; geometric lookup is only a fallback.
         const index = nativePointIndex !== null ? nativePointIndex : nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
         if (index === null) return;
-        clearLabels(root);
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
         const valuesByAxis = {};
         plot.data.forEach(function(trace, curveNumber) {
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             const name = trace && trace.name ? String(trace.name) : '';
             if (!trace || axisId === 'y' || !trace.y || index >= trace.y.length || trace.visible === false || name.startsWith('_')) return;
-            const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][index];
-            const value = Number(calcPoint && Number.isFinite(Number(calcPoint.y)) ? calcPoint.y : trace.y[index]);
-            if (!Number.isFinite(value)) return;
+            // Read the same source array used by Plotly's native point hover.
+            // calcdata may be decimated/reordered by WebGL and was the reason
+            // the static box could disagree with the immediate hover label.
+            const value = Number(trace.y[index]);
             const magnitude = Math.abs(value);
-            const formatted = magnitude !== 0 && magnitude < 0.01 ? value.toPrecision(5) : value.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4);
+            const formatted = Number.isFinite(value)
+                ? (magnitude !== 0 && magnitude < 0.01 ? value.toPrecision(5) : value.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4))
+                : 'n/a';
             (valuesByAxis[axisId] || (valuesByAxis[axisId] = [])).push((name || 'Value') + ': ' + formatted);
+        });
+        const activeAxes = new Set(Object.keys(valuesByAxis));
+        document.querySelectorAll('[data-task-chart-oscillator-sync-label="true"]').forEach(function(node) {
+            if (!activeAxes.has(node.dataset.taskChartOscillatorAxis || '')) node.remove();
         });
         Object.keys(valuesByAxis).forEach(function(axisId) {
             const axis = plot._fullLayout['yaxis' + axisId.slice(1)];
             if (!axis || !Number.isFinite(axis._offset)) return;
-            const label = document.createElement('div');
-            label.dataset.taskChartOscillatorSyncLabel = 'true'; label.textContent = valuesByAxis[axisId].join('\\n');
+            let label = document.querySelector('[data-task-chart-oscillator-sync-label="true"][data-task-chart-oscillator-axis="' + axisId + '"]');
+            if (!label) {
+                label = document.createElement('div');
+                label.dataset.taskChartOscillatorSyncLabel = 'true';
+                label.dataset.taskChartOscillatorAxis = axisId;
+                document.body.appendChild(label);
+            }
+            label.textContent = valuesByAxis[axisId].join('\\n');
             // Fixed overlays stay above Plotly's SVG/WebGL stacking contexts.
             // Absolute children of the graph could be hidden by the plot over
             // the data area and appear only beside the y axis.
@@ -4115,7 +4159,7 @@ function installChartCrosshairFallback() {
             // Static readouts stay at the right side of the plot and never
             // follow or cover the dashed cursor in the analytical area.
             label.style.left = Math.max(4, Math.min(window.innerWidth - 210, svgRect.right - 205)) + 'px';
-            label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px'; document.body.appendChild(label);
+            label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px';
         });
     }, false);
 }
@@ -4454,6 +4498,7 @@ function openTableChartImmediately(button) {
         window.setTimeout(function() {
             if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
         }, 30000);
+        resetMeasureForChartNavigation();
         markChartRenderRequested('main-table-chart');
         window.dash_clientside.set_props('chart-task-id', {data: taskId});
         window.dash_clientside.set_props('chart-click-store', {data: {[taskId + '_chart']: Date.now() / 1000}});
@@ -4475,6 +4520,7 @@ function submitAdjacentChartNavigation(taskId, direction, buttonId) {
     window.setTimeout(function() {
         if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
     }, 30000);
+    resetMeasureForChartNavigation();
     markChartRenderRequested(buttonId);
     // Navigation needs only the selected task. Unlike a table Chart action,
     // the modal is already open, so updating chart-click-store merely schedules
@@ -4521,6 +4567,11 @@ document.addEventListener('click', function(e) {
     
     if (!button) return;
     traceUi('button click', {id: button.id, action: button.getAttribute('data-action')});
+    if (button.id === 'prev-chart-btn' || button.id === 'next-chart-btn') {
+        // Also cover source-event navigation, which deliberately uses the
+        // server callback instead of the direct adjacent-task Store path.
+        resetMeasureForChartNavigation();
+    }
     if (openTableChartImmediately(button)) {
         e.preventDefault();
         e.stopPropagation();
@@ -6141,6 +6192,11 @@ def build_tasks_tab_layout():
                     html.Label("Notional USD:", style={"width": "100px", "display": "inline-block"}), dcc.Input(id="osc-reversal-notional-input", type="number", value=1000, min=0, step=100, style={"width": "110px"}),
                     html.Label("Costs %:", style={"width": "70px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-cost-input", type="number", value=0.10, min=0, step=0.01, style={"width": "90px"}),
                     html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
+                ], style={"marginBottom": "10px"}),
+                html.Div([
+                    html.Label("First tasks to check:", style={"width": "140px", "display": "inline-block"}),
+                    dcc.Input(id="osc-task-limit-input", type="number", value=200, min=1, step=1, style={"width": "110px"}),
+                    html.Span("Leave blank to check every task. This does not filter the main table.", style={"marginLeft": "10px", "color": "#666", "fontSize": "12px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("Settings name:", style={"width": "100px", "display": "inline-block"}),
@@ -9035,8 +9091,9 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
 
     const meta = figure.layout.meta || {};
     const hasEventFocus = Array.isArray(meta.event_focus_xrange) && meta.event_focus_xrange.length === 2;
-    const targetRange = hasEventFocus ? meta.event_focus_xrange : (focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange));
-    if ((extendX || focusEntry || hasEventFocus) && targetRange && targetRange.length === 2) {
+    const useEventFocus = Boolean(focusEntry && hasEventFocus);
+    const targetRange = useEventFocus ? meta.event_focus_xrange : (focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange));
+    if ((extendX || focusEntry || useEventFocus) && targetRange && targetRange.length === 2) {
         Object.keys(figure.layout).forEach(function(key) {
             if (/^xaxis[0-9]*$/.test(key)) {
                 layoutUpdate[key + '.range'] = targetRange;
@@ -10652,10 +10709,12 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         title=f"{sym} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
         xaxis_rangeslider_visible=False,
         template="plotly_white",
-        hovermode="x",
+        # Source trade markers should expose their details only when the user
+        # points at the marker, not anywhere along the same timestamp.
+        hovermode="closest" if source_trade_event else "x",
         # Keep hover labels tied to nearby data points; the browser-side
         # crosshair overlay provides the always-visible vertical guide.
-        hoverdistance=24,
+        hoverdistance=8 if source_trade_event else 24,
         spikedistance=-1,
         clickmode="event+select",
         # Measure is a State, not an Input: clicking Measure stays clientside
@@ -10712,7 +10771,9 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         fig.update_layout(hoversubplots="axis")
     except ValueError:
         pass
-    if event_focus_xrange and event_focus_yrange:
+    # Dynamic-strategy charts now open at the normal task range. The existing
+    # Focus Entry control is the explicit opt-in for the tighter trade window.
+    if focus_entry and event_focus_xrange and event_focus_yrange:
         fig.update_xaxes(range=event_focus_xrange, autorange=False)
         fig.update_yaxes(range=event_focus_yrange, autorange=False, row=1, col=1)
     elif focus_entry and entry_focus_xrange and entry_focus_yrange:
@@ -12478,10 +12539,11 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
+    State("osc-task-limit-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, notional_usd, round_trip_cost_pct, open_return_pct, task_limit, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update, no_update
@@ -12523,6 +12585,10 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
         stop_rules = parse_dynamic_stop_rules(stop_rules_text)
         sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
         tasks = get_display_tasks_snapshot()
+        available_tasks = len(tasks)
+        normalized_task_limit = max(1, int(task_limit)) if task_limit not in (None, "") else None
+        if normalized_task_limit is not None:
+            tasks = tasks[:normalized_task_limit]
         started = time.time()
         table, event_groups = build_oscillator_reversal_summary_table(
             tasks,
@@ -12543,6 +12609,7 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
         elapsed = time.time() - started
         status = (
             f"✅ Oscillator reversal checkup run #{n_clicks} complete in {elapsed:.2f}s. "
+            f"tasks={len(tasks)}/{available_tasks}; "
             f"entry filters={format_oscillator_specs(oscillator_specs)}; close filters={format_oscillator_specs(oscillator_exit_specs) if oscillator_exit_specs else 'disabled'}; windows entry={entry_condition_window}, close={oscillator_exit_window}; "
             f"SL={float(stop_loss_pct or 0):g}%, max adverse DD={'off' if not max_dd_pct else f'{float(max_dd_pct):g}%'}, "
             f"TP={', '.join(fmt_dynamic_level_label(level) for level in tp_levels)}, "
@@ -12604,10 +12671,11 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
+    State("osc-task-limit-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, _version):
+def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, task_limit, _version):
     """Research optimizer for oscillator settings, windows, SLs, and stop rules."""
     if not n_clicks:
         return no_update, no_update
@@ -12648,6 +12716,8 @@ def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition
         sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=(1, 1.5, 2, 2.5, 3))
         stop_presets = parse_research_stop_rule_presets(stop_presets_text)
         tasks = get_display_tasks_snapshot()
+        if task_limit not in (None, ""):
+            tasks = tasks[:max(1, int(task_limit))]
         started = time.time()
         table = build_oscillator_research_optimizer_table(
             tasks,
