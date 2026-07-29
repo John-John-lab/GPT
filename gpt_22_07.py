@@ -1296,7 +1296,7 @@ OSCILLATOR_SETTINGS_IDS = [
     "osc-exit-sell-stoch-60-level-input", "osc-exit-sell-stoch-60-condition-input", "osc-exit-sell-stoch-300-level-input", "osc-exit-sell-stoch-300-condition-input", "osc-exit-buy-stoch-14-level-input", "osc-exit-buy-stoch-14-condition-input",
     "osc-exit-buy-stoch-40-level-input", "osc-exit-buy-stoch-40-condition-input", "osc-exit-buy-stoch-60-level-input", "osc-exit-buy-stoch-60-condition-input", "osc-exit-buy-stoch-300-level-input", "osc-exit-buy-stoch-300-condition-input",
     "osc-reversal-notional-input", "osc-reversal-cost-input", "osc-reversal-open-return-input",
-    "osc-task-limit-input",
+    "osc-task-limit-enabled-input", "osc-task-limit-input",
     "osc-research-entry-windows-input", "osc-research-exit-windows-input", "osc-research-sl-grid-input", "osc-research-stop-presets-input",
     "osc-research-max-combos-input", "osc-research-top-input",
 ]
@@ -4124,13 +4124,25 @@ function installChartCrosshairFallback() {
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
         const valuesByAxis = {};
         plot.data.forEach(function(trace, curveNumber) {
+            const fullTrace = plot._fullData && plot._fullData[curveNumber];
+            const valueSeries = (fullTrace && fullTrace.y) || (trace && trace.y);
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             const name = trace && trace.name ? String(trace.name) : '';
-            if (!trace || axisId === 'y' || !trace.y || index >= trace.y.length || trace.visible === false || name.startsWith('_')) return;
-            // Read the same source array used by Plotly's native point hover.
-            // calcdata may be decimated/reordered by WebGL and was the reason
-            // the static box could disagree with the immediate hover label.
-            const value = Number(trace.y[index]);
+            if (!trace || axisId === 'y' || !valueSeries || trace.visible === false || name.startsWith('_')) return;
+            // Dash may transport arrays as {dtype,bdata}; those objects are
+            // intentionally not indexable. Prefer the native hover value for
+            // this curve, then Plotly's expanded calcdata, and only then an
+            // ordinary/typed trace array.
+            const hovered = (plot._hoverdata || []).find(function(point) {
+                return point && Number(point.curveNumber) === curveNumber && Number(point.pointNumber) === index;
+            });
+            const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][index];
+            const rawValue = hovered && hovered.y != null
+                ? hovered.y
+                : (calcPoint && calcPoint.y != null
+                    ? calcPoint.y
+                    : (valueSeries[index] != null ? valueSeries[index] : null));
+            const value = Number(rawValue);
             const magnitude = Math.abs(value);
             const formatted = Number.isFinite(value)
                 ? (magnitude !== 0 && magnitude < 0.01 ? value.toPrecision(5) : value.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4))
@@ -4155,11 +4167,11 @@ function installChartCrosshairFallback() {
             // Fixed overlays stay above Plotly's SVG/WebGL stacking contexts.
             // Absolute children of the graph could be hidden by the plot over
             // the data area and appear only beside the y axis.
-            label.style.cssText = 'position:fixed;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
+            label.style.cssText = 'position:absolute;z-index:10052;pointer-events:none;white-space:pre-line;background:rgba(255,255,255,.92);border:1px solid #90a4ae;border-radius:3px;color:#263238;font:11px sans-serif;line-height:1.3;padding:2px 5px;';
             // Static readouts stay at the right side of the plot and never
             // follow or cover the dashed cursor in the analytical area.
-            label.style.left = Math.max(4, Math.min(window.innerWidth - 210, svgRect.right - 205)) + 'px';
-            label.style.top = Math.max(0, svgRect.top + axis._offset + 4) + 'px';
+            label.style.left = (window.scrollX + Math.max(4, Math.min(window.innerWidth - 210, svgRect.right - 205))) + 'px';
+            label.style.top = (window.scrollY + Math.max(0, svgRect.top + axis._offset + 4)) + 'px';
         });
     }, false);
 }
@@ -6194,9 +6206,15 @@ def build_tasks_tab_layout():
                     html.Label("Open/no-exit %:", style={"width": "120px", "display": "inline-block", "marginLeft": "20px"}), dcc.Input(id="osc-reversal-open-return-input", type="number", value=0, step=0.1, style={"width": "90px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
+                    dcc.Checklist(
+                        id="osc-task-limit-enabled-input",
+                        options=[{"label": "Limit task count", "value": "enabled"}],
+                        value=["enabled"],
+                        style={"display": "inline-block", "marginRight": "12px"},
+                    ),
                     html.Label("First tasks to check:", style={"width": "140px", "display": "inline-block"}),
                     dcc.Input(id="osc-task-limit-input", type="number", value=200, min=1, step=1, style={"width": "110px"}),
-                    html.Span("Leave blank to check every task. This does not filter the main table.", style={"marginLeft": "10px", "color": "#666", "fontSize": "12px"}),
+                    html.Span("Toggle off to check all tasks. This never filters the main table.", style={"marginLeft": "10px", "color": "#666", "fontSize": "12px"}),
                 ], style={"marginBottom": "10px"}),
                 html.Div([
                     html.Label("Settings name:", style={"width": "100px", "display": "inline-block"}),
@@ -9080,16 +9098,17 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     // values. Issue a second Plotly layout pass only when a live interaction
     // preference actually differs from the rendered layout.
     const layoutUpdate = {};
+    const meta = figure.layout.meta || {};
     const showHover = (!effectiveMeasureMode || effectiveMeasureHover);
     const desiredDragMode = effectiveMeasureMode ? 'drawrect' : 'pan';
     const currentLayout = plot.layout || {};
     if (currentLayout.dragmode !== desiredDragMode) layoutUpdate.dragmode = desiredDragMode;
-    const desiredHoverMode = showHover ? 'x' : false;
+    const sourceTradeChart = meta.chart_open_source === 'dynamic_oscillator_summary';
+    const desiredHoverMode = showHover ? (sourceTradeChart ? 'closest' : 'x') : false;
     if (currentLayout.hovermode !== desiredHoverMode) layoutUpdate.hovermode = desiredHoverMode;
     const desiredHoverSubplots = showHover ? 'axis' : false;
     if (currentLayout.hoversubplots !== desiredHoverSubplots) layoutUpdate.hoversubplots = desiredHoverSubplots;
 
-    const meta = figure.layout.meta || {};
     const hasEventFocus = Array.isArray(meta.event_focus_xrange) && meta.event_focus_xrange.length === 2;
     const useEventFocus = Boolean(focusEntry && hasEventFocus);
     const targetRange = useEventFocus ? meta.event_focus_xrange : (focusEntry ? meta.entry_focus_xrange : (extendX ? meta.extended_xrange : meta.default_xrange));
@@ -10115,11 +10134,9 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
                                f"<br>Why entered:<br>{entry_reason_html}"
                                f"<br>Time: %{{x|%Y-%m-%d %H:%M}}<extra></extra>"),
             ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=[entry_dt, entry_dt], y=[y_min, y_max], mode="lines",
-                line=dict(color="#00c853", width=1, dash="dot"),
-                name="Entry time", showlegend=False, hoverinfo="skip",
-            ), row=1, col=1)
+            # A layout guide is cheaper than another full Plotly trace and
+            # cannot participate in hover selection for the nearby marker.
+            fig.add_vline(x=entry_dt, row=1, col=1, line_color="#00c853", line_width=1, line_dash="dot")
     if exit_time is not None and exit_price is not None:
         try:
             exit_ms = normalize_chart_timestamp_ms(exit_time)
@@ -10140,11 +10157,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
                 name="Dynamic strategy exit", showlegend=False, hoverlabel=dict(align="left"),
                 hovertemplate=exit_hover + "<extra></extra>",
             ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=[exit_dt, exit_dt], y=[y_min, y_max], mode="lines",
-                line=dict(color="#d50000", width=1, dash="dot"),
-                name="Exit time", showlegend=False, hoverinfo="skip",
-            ), row=1, col=1)
+            fig.add_vline(x=exit_dt, row=1, col=1, line_color="#d50000", line_width=1, line_dash="dot")
 
 
 # ----- Chart figure callback (light theme) -----
@@ -10247,9 +10260,10 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     source_trade_marks = build_source_trade_mark_specs(source_trade_event)
     # UTC conversion remains local because the figure renderer uses it for
     # source marks, signals, and tooltips.
-    def ms_to_utc_datetime(ms):
-        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
-    signal_dt = ms_to_utc_datetime(task.signal_time)
+    def ms_to_chart_x(ms):
+        """Use exactly the same x representation as the candle traces."""
+        return int(ms) if CHART_COMPACT_TIME_AXIS_ENABLED else datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    signal_dt = ms_to_chart_x(task.signal_time)
     # RSI calculation
     def compute_rsi(series, period=14):
         delta = series.diff()
@@ -10628,7 +10642,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if events_visible and hasattr(task, 'events') and task.events:
         for ev in task.events:
             ts = ev['timestamp']
-            event_dt = ms_to_utc_datetime(ts)
+            event_dt = ms_to_chart_x(ts)
             event_type = ev['type']
             color = 'magenta' if 'pin' in event_type else \
                 'cyan' if 'touch' in event_type else \
@@ -10653,13 +10667,13 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         name='Signal Time Marker', showlegend=False, hoverinfo='skip'
     ), row=1, col=1)
     # Source-aware main-pane entry/exit markers retain detailed reasons and P&L.
-    add_source_trade_overlay(fig, source_trade_event, ms_to_utc_datetime, y_min, y_max)
+    add_source_trade_overlay(fig, source_trade_event, ms_to_chart_x, y_min, y_max)
     # Source-entry/exit guides are repeated in each visible oscillator pane.
     # This gives strategy-summary charts one aligned time reference without
     # changing oscillator values, calculations, or main-pane trade tooltips.
     if source_trade_marks and total_rows > 1:
         for mark in source_trade_marks:
-            mark_time = ms_to_utc_datetime(mark["timestamp"])
+            mark_time = ms_to_chart_x(mark["timestamp"])
             for row in range(2, total_rows + 1):
                 fig.add_vline(
                     x=mark_time, row=row, col=1,
@@ -10673,7 +10687,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             for sig in task.strategy_signals:
                 if sig['type'] == 'impulse':
                     continue
-                sig_time = ms_to_utc_datetime(sig['entry_time_ms'])
+                sig_time = ms_to_chart_x(sig['entry_time_ms'])
                 if sig['direction'] == 'buy':
                     marker = dict(symbol='triangle-up', size=12, color='lime')
                 else:
@@ -10689,7 +10703,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             for sig in task.strategy_signals:
                 if sig['type'] != 'impulse':
                     continue
-                sig_time = ms_to_utc_datetime(sig['entry_time_ms'])
+                sig_time = ms_to_chart_x(sig['entry_time_ms'])
                 marker = dict(symbol='diamond', size=14, color='purple')
                 fig.add_trace(go.Scatter(
                     x=[sig_time], y=[sig['entry_price']],
@@ -12539,11 +12553,12 @@ def run_level_reversal_checkup(n_clicks, entry_offset_pct, stop_loss_pct, max_dd
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
+    State("osc-task-limit-enabled-input", "value"),
     State("osc-task-limit-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, notional_usd, round_trip_cost_pct, open_return_pct, task_limit, _version):
+def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, stop_loss_pct, max_dd_pct, tp_text, stop_rules_text, sl_grid_text, entry_condition_window, oscillator_exit_window, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, notional_usd, round_trip_cost_pct, open_return_pct, task_limit_enabled, task_limit, _version):
     """On-demand callback for oscillator-confirmed level-reversal diagnostics."""
     if not n_clicks:
         return no_update, no_update, no_update
@@ -12586,7 +12601,7 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
         sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=())
         tasks = get_display_tasks_snapshot()
         available_tasks = len(tasks)
-        normalized_task_limit = max(1, int(task_limit)) if task_limit not in (None, "") else None
+        normalized_task_limit = max(1, int(task_limit or 1)) if "enabled" in (task_limit_enabled or []) else None
         if normalized_task_limit is not None:
             tasks = tasks[:normalized_task_limit]
         started = time.time()
@@ -12671,11 +12686,12 @@ def run_oscillator_reversal_checkup(n_clicks, stoch14_level, stoch14_condition, 
     State("osc-reversal-notional-input", "value"),
     State("osc-reversal-cost-input", "value"),
     State("osc-reversal-open-return-input", "value"),
+    State("osc-task-limit-enabled-input", "value"),
     State("osc-task-limit-input", "value"),
     State("golden-store-version", "data"),
     prevent_initial_call=True,
 )
-def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, task_limit, _version):
+def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition, stoch40_level, stoch40_condition, stoch60_level, stoch60_condition, stoch300_level, stoch300_condition, rsi_level, rsi_condition, down_stoch14_level, down_stoch14_condition, down_stoch40_level, down_stoch40_condition, down_stoch60_level, down_stoch60_condition, down_stoch300_level, down_stoch300_condition, down_rsi_level, down_rsi_condition, exit_enabled, exit_sell_stoch14_level, exit_sell_stoch14_condition, exit_sell_stoch40_level, exit_sell_stoch40_condition, exit_sell_stoch60_level, exit_sell_stoch60_condition, exit_sell_stoch300_level, exit_sell_stoch300_condition, exit_buy_stoch14_level, exit_buy_stoch14_condition, exit_buy_stoch40_level, exit_buy_stoch40_condition, exit_buy_stoch60_level, exit_buy_stoch60_condition, exit_buy_stoch300_level, exit_buy_stoch300_condition, entry_windows_text, exit_windows_text, sl_grid_text, stop_presets_text, max_combos, top_n, notional_usd, round_trip_cost_pct, open_return_pct, task_limit_enabled, task_limit, _version):
     """Research optimizer for oscillator settings, windows, SLs, and stop rules."""
     if not n_clicks:
         return no_update, no_update
@@ -12716,8 +12732,8 @@ def run_oscillator_research_optimizer(n_clicks, stoch14_level, stoch14_condition
         sl_grid = parse_dynamic_percent_levels(sl_grid_text, default_levels=(1, 1.5, 2, 2.5, 3))
         stop_presets = parse_research_stop_rule_presets(stop_presets_text)
         tasks = get_display_tasks_snapshot()
-        if task_limit not in (None, ""):
-            tasks = tasks[:max(1, int(task_limit))]
+        if "enabled" in (task_limit_enabled or []):
+            tasks = tasks[:max(1, int(task_limit or 1))]
         started = time.time()
         table = build_oscillator_research_optimizer_table(
             tasks,
