@@ -4691,22 +4691,29 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         // customdata is derived locally from close values rather than repeated
         // in the Dash response. Candle hover still receives the identical data.
         const candleCustomData = candleUpdate.close.map(function(value) { return [value]; });
-        const candleRestyle = {
-            open: [candleUpdate.open], high: [candleUpdate.high],
-            low: [candleUpdate.low], close: [candleUpdate.close], customdata: [candleCustomData]
-        };
-        if (!sameSharedX) candleRestyle.x = [sharedDates];
-        await window.Plotly.restyle(plot, candleRestyle, [0]);
-        candleAppliedAt = performance.now();
-        const valueIndices = [];
-        const xUpdates = [];
-        const yUpdates = [];
-        const markerColorUpdates = [];
-        const textUpdates = [];
-        const hoverTemplateUpdates = [];
+        // Update every trace and the layout in one Plotly calculation. The old
+        // fast path first restyled the candle and then updated oscillators,
+        // forcing Plotly to traverse all shared axes twice (about 0.9-1.9s in
+        // the supplied browser traces). `undefined` deliberately retains an
+        // attribute on trace types where it does not apply.
+        const allIndices = actualKeys.map(function(_, index) { return index; });
+        const openUpdates = [candleUpdate.open];
+        const highUpdates = [candleUpdate.high];
+        const lowUpdates = [candleUpdate.low];
+        const closeUpdates = [candleUpdate.close];
+        const customDataUpdates = [candleCustomData];
+        const xUpdates = [sameSharedX ? undefined : sharedDates];
+        const yUpdates = [undefined];
+        const markerColorUpdates = [((plot.data[0] || {}).marker || {}).color];
+        const textUpdates = [(plot.data[0] || {}).text];
+        const hoverTemplateUpdates = [(plot.data[0] || {}).hovertemplate];
         updates.slice(1).forEach(function(update, offset) {
             const index = offset + 1;
-            valueIndices.push(index);
+            openUpdates.push(undefined);
+            highUpdates.push(undefined);
+            lowUpdates.push(undefined);
+            closeUpdates.push(undefined);
+            customDataUpdates.push(undefined);
             // Most adjacent results share the exact candle window. Undefined
             // tells Plotly to retain an unchanged shared x array, while event
             // and signal traces still receive their task-specific positions.
@@ -4763,16 +4770,14 @@ async function applyFastCandleNavigationPayload(rawPayload) {
                 layoutUpdate[key + '.range'] = null;
             }
         });
-        // Plotly.update applies oscillator arrays and task-dependent layout in
-        // one calculation pass instead of a restyle followed by a relayout.
-        if (valueIndices.length) {
-            await window.Plotly.update(plot, {
-                x: xUpdates, y: yUpdates, 'marker.color': markerColorUpdates,
-                text: textUpdates, hovertemplate: hoverTemplateUpdates
-            }, layoutUpdate, valueIndices);
-        } else {
-            await window.Plotly.relayout(plot, layoutUpdate);
-        }
+        candleAppliedAt = performance.now();
+        await window.Plotly.update(plot, {
+            x: xUpdates, y: yUpdates,
+            open: openUpdates, high: highUpdates, low: lowUpdates,
+            close: closeUpdates, customdata: customDataUpdates,
+            'marker.color': markerColorUpdates,
+            text: textUpdates, hovertemplate: hoverTemplateUpdates
+        }, layoutUpdate, allIndices);
         valuesAppliedAt = performance.now();
         colorsAppliedAt = performance.now();
         window.__gptPendingChartTaskId = '';
@@ -4787,6 +4792,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             colors_ms: Math.round(colorsAppliedAt - valuesAppliedAt),
             final_ms: Math.round(performance.now() - colorsAppliedAt),
             shared_x_reused: sameSharedX,
+            update_strategy: 'single-pass',
             points: payload.shared_x.length,
             traces: actualKeys.length
         });
