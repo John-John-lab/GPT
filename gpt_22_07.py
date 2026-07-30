@@ -997,7 +997,8 @@ def attach_chart_trace_schema(fig, source):
     return schema
 
 
-def build_chart_diagnostic_fingerprint(fig, df, task_id, source, source_trade_event=None):
+def build_chart_diagnostic_fingerprint(fig, df, task_id, source, source_trade_event=None,
+                                       signal_price=None):
     """Return tiny deterministic samples used only to verify browser integrity."""
     if df is None or df.empty:
         return {}
@@ -1044,6 +1045,7 @@ def build_chart_diagnostic_fingerprint(fig, df, task_id, source, source_trade_ev
         "timestamps": [int(df["timestamp"].iloc[index]) for index in indices],
         "traces": trace_samples,
         "event": event,
+        "signal_price": scalar(signal_price),
     }
 
 
@@ -1264,6 +1266,7 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         "event": ({kind: {"timestamp": value["x"], "price": value["y"]}
                    for kind, value in source_event_payload.items()}
                   if source_event_payload else {}),
+        "signal_price": signal_price,
     }
     return {
         "version": CHART_FAST_CANDLE_SCHEMA_VERSION,
@@ -1286,6 +1289,7 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
             "chart_open_source": str(source),
             "timeframe": task.timeframe,
             "task_id": str(task_id),
+            "signal_price": signal_price,
             "measurement": {},
             "render_schema": current_schema,
             "diagnostic_fingerprint": diagnostic_fingerprint,
@@ -3920,6 +3924,10 @@ const chartToggleActions = {
 const chartQueuedActions = {};
 let chartActionFlushTimer = null;
 window.__gptToolbarRenderPending = false;
+const chartRenderActionPaths = new Set([
+    'panes.rsi', 'panes.stochastic', 'panes.volume', 'panes.adx', 'panes.macd', 'panes.disparity',
+    'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry'
+]);
 function flushQueuedChartActions() {
     if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
     chartActionFlushTimer = null;
@@ -3936,11 +3944,7 @@ function flushQueuedChartActions() {
     const actions = Object.keys(chartQueuedActions).map(function(key) { return chartQueuedActions[key]; });
     Object.keys(chartQueuedActions).forEach(function(key) { delete chartQueuedActions[key]; });
     if (!actions.length) return false;
-    const renderPaths = new Set([
-        'panes.rsi', 'panes.stochastic', 'panes.volume', 'panes.adx', 'panes.macd', 'panes.disparity',
-        'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry'
-    ]);
-    const needsRender = actions.some(function(action) { return renderPaths.has(action.section + '.' + action.key); });
+    const needsRender = actions.some(function(action) { return chartRenderActionPaths.has(action.section + '.' + action.key); });
     window.__gptToolbarRenderPending = needsRender;
     window.__gptToolbarRenderPendingSince = needsRender ? performance.now() : 0;
     markChartRenderRequested(actions.length === 1 ? 'toolbar-' + actions[0].key : 'toolbar-batch');
@@ -3951,7 +3955,18 @@ function flushQueuedChartActions() {
 function queueChartToggleAction(buttonId, active) {
     const path = chartToggleActions[buttonId];
     if (!path || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
-    chartQueuedActions[path[0] + '.' + path[1]] = {type: 'set', section: path[0], key: path[1], value: Boolean(active)};
+    const actionPath = path[0] + '.' + path[1];
+    // Browser-only measurement/information controls already have a dedicated
+    // legacy Store. Writing it directly avoids a 28-byte figure callback that
+    // can overlap and delay the next large navigation request.
+    if (!chartRenderActionPaths.has(actionPath)) {
+        const storeConfig = chartToggleStores[buttonId];
+        if (!storeConfig || !storeConfig[0]) return false;
+        window.dash_clientside.set_props(storeConfig[0], {data: Boolean(active)});
+        traceUi('local toolbar applied', {id: buttonId, active: Boolean(active), server_request: false});
+        return true;
+    }
+    chartQueuedActions[actionPath] = {type: 'set', section: path[0], key: path[1], value: Boolean(active)};
     if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
     chartActionFlushTimer = window.setTimeout(flushQueuedChartActions,
     // A half-second quiet period is comfortable for deliberate multi-pane
@@ -4052,6 +4067,45 @@ function installDashChartNetworkTrace() {
     };
 }
 installDashChartNetworkTrace();
+function chartSignalShapeIndex(shapes) {
+    return (shapes || []).findIndex(function(shape) {
+        const line = (shape || {}).line || {};
+        const color = String(line.color || '').replace(/\\s+/g, '').toLowerCase();
+        return String(shape.name || '') === 'chart_signal_level' ||
+            (String(shape.yref || '') === 'y' && ['yellow', '#ffff00', 'rgb(255,255,0)'].indexOf(color) >= 0);
+    });
+}
+function ensureChartSignalLevel(plot) {
+    const meta = (plot && plot.layout && plot.layout.meta) || {};
+    const price = Number(meta.signal_price);
+    if (!plot || !window.Plotly || !Number.isFinite(price) || plot.__gptSignalRepairPending) return false;
+    const shapes = (plot.layout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
+    let index = chartSignalShapeIndex(shapes);
+    if (index >= 0 && Number(shapes[index].y0) === price && Number(shapes[index].y1) === price) return false;
+    if (index >= 0) {
+        shapes[index] = Object.assign({}, shapes[index], {name: 'chart_signal_level', y0: price, y1: price});
+    } else {
+        shapes.push({
+            type: 'line', name: 'chart_signal_level', xref: 'paper', yref: 'y',
+            x0: 0, x1: 1, y0: price, y1: price,
+            line: {color: 'yellow', width: 1, dash: 'dash'}
+        });
+    }
+    const annotations = (plot.layout.annotations || []).map(function(item) { return Object.assign({}, item); });
+    const annotation = annotations.find(function(item) { return String((item || {}).text || '').indexOf('Signal Level') >= 0; });
+    if (annotation) annotation.y = price;
+    else annotations.push({
+        text: 'Signal Level', xref: 'paper', yref: 'y', x: 1, y: price,
+        xanchor: 'right', yanchor: 'bottom', showarrow: false, font: {color: 'yellow'}
+    });
+    plot.__gptSignalRepairPending = true;
+    traceUi('chart signal level repaired', {taskId: meta.task_id || '', price: price});
+    Promise.resolve(window.Plotly.relayout(plot, {shapes: shapes, annotations: annotations})).finally(function() {
+        plot.__gptSignalRepairPending = false;
+        plot.__dashBaseShapeCount = shapes.length;
+    });
+    return true;
+}
 function validateChartDiagnosticFingerprint(plot) {
     const meta = (plot && plot.layout && plot.layout.meta) || {};
     const expected = meta.diagnostic_fingerprint;
@@ -4101,6 +4155,15 @@ function validateChartDiagnosticFingerprint(plot) {
         if (!numericEqual(asMillis(marker.x[0]), event.timestamp)) issues.push(kind + ' timestamp mismatch');
         if (!numericEqual(marker.y[0], event.price)) issues.push(kind + ' price mismatch');
     });
+    if (expected.signal_price != null) {
+        const shapes = (plot.layout && plot.layout.shapes) || [];
+        const signalIndex = chartSignalShapeIndex(shapes);
+        if (signalIndex < 0) issues.push('missing signal level');
+        else if (!numericEqual(shapes[signalIndex].y0, expected.signal_price) ||
+                 !numericEqual(shapes[signalIndex].y1, expected.signal_price)) {
+            issues.push('signal level mismatch');
+        }
+    }
     if (String(meta.task_id || '') !== String(expected.task_id || '')) issues.push('task id mismatch');
     return {status: issues.length ? 'FAIL' : 'PASS', issues: issues.slice(0, 8)};
 }
@@ -4115,6 +4178,10 @@ function installChartBrowserRenderTrace() {
             // Validate and release navigation only after both have completed,
             // otherwise the candle-only intermediate state looks corrupt.
             if (window.__gptFastPayloadApplying) return;
+            // A signal level is protected application state, not a user shape.
+            // Repair it before diagnostics if a Plotly transition or generic
+            // shape edit dropped it; the repair emits one follow-up afterplot.
+            if (ensureChartSignalLevel(plot)) return;
             const request = window.__gptChartRenderRequest;
             // Local relayouts (for example Measure mode) can emit afterplot
             // before Dash has returned the replacement figure. Do not consume
@@ -4757,18 +4824,27 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         const currentLayout = plot.layout || {};
         const shapes = (currentLayout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
         const annotations = (currentLayout.annotations || []).map(function(annotation) { return Object.assign({}, annotation); });
-        const signalShape = shapes.find(function(shape) {
-            const line = (shape || {}).line || {};
-            return String(shape.yref || '') === 'y' && String(line.color || '').toLowerCase() === 'yellow';
-        });
-        if (signalShape) {
-            signalShape.y0 = payload.signal_price;
-            signalShape.y1 = payload.signal_price;
+        let signalShapeIndex = chartSignalShapeIndex(shapes);
+        if (signalShapeIndex < 0) {
+            shapes.push({
+                type: 'line', name: 'chart_signal_level', xref: 'paper', yref: 'y',
+                x0: 0, x1: 1, y0: payload.signal_price, y1: payload.signal_price,
+                line: {color: 'yellow', width: 1, dash: 'dash'}
+            });
+            signalShapeIndex = shapes.length - 1;
+        } else {
+            shapes[signalShapeIndex] = Object.assign({}, shapes[signalShapeIndex], {
+                name: 'chart_signal_level', y0: payload.signal_price, y1: payload.signal_price
+            });
         }
         const signalAnnotation = annotations.find(function(annotation) {
             return String((annotation || {}).text || '').indexOf('Signal Level') >= 0;
         });
         if (signalAnnotation) signalAnnotation.y = payload.signal_price;
+        else annotations.push({
+            text: 'Signal Level', xref: 'paper', yref: 'y', x: 1, y: payload.signal_price,
+            xanchor: 'right', yanchor: 'bottom', showarrow: false, font: {color: 'yellow'}
+        });
         if (payload.source_event) {
             [['entry', '#00c853'], ['exit', '#d50000']].forEach(function(item) {
                 const kind = item[0], color = item[1];
@@ -11181,6 +11257,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     # Signal level
     signal_price = task.signal_price
     fig.add_hline(y=signal_price, line_dash="dash", line_color="yellow",
+                  name="chart_signal_level",
                   annotation_text="Signal Level", annotation_position="top right",
                   row=1, col=1)
     # Event markers (only if toggled on)
@@ -11286,6 +11363,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             "chart_open_source": (chart_event_context or {}).get("source", "main_table") if isinstance(chart_event_context, dict) else "main_table",
             "timeframe": task.timeframe,
             "task_id": str(task_id),
+            "signal_price": float(signal_price),
             "measurement": chart_model["ui_state"].get("measurement", {}),
         },
         # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
@@ -11339,7 +11417,8 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     # stable, conservative contract for a later opt-in incremental navigation path.
     requested_render_schema = attach_chart_trace_schema(fig, chart_model["source"])
     diagnostic_fingerprint = build_chart_diagnostic_fingerprint(
-        fig, df, task_id, chart_model["source"], source_trade_event
+        fig, df, task_id, chart_model["source"], source_trade_event,
+        signal_price=signal_price,
     )
     fig.layout.meta = {
         **(fig.layout.meta if isinstance(fig.layout.meta, dict) else {}),
