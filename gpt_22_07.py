@@ -1089,7 +1089,11 @@ def chart_fast_candle_navigation_eligible(current_schema, source, render_values,
     count is task-dependent. Registered candle and oscillator panes are safe
     when every semantic trace name has a compact payload mapping.
     """
-    if not CHART_FAST_CANDLE_NAV_ENABLED or triggered_id != "chart-task-id":
+    # Direct summary navigation updates context and task in the same browser
+    # turn. Dash may report either Store as the trigger. The caller only sets
+    # navigation_context after verifying the token belongs to this exact task.
+    navigation_triggers = {"chart-task-id", "chart-event-context-store"}
+    if not CHART_FAST_CANDLE_NAV_ENABLED or triggered_id not in navigation_triggers:
         return False
     normalized_source = str(source or "main_table")
     if normalized_source not in {"main_table", "dynamic_oscillator_summary"} or not isinstance(current_schema, dict):
@@ -4931,7 +4935,9 @@ function dispatchAdjacentChartNavigation(taskId, direction, buttonId, mode) {
             String(cachedContext.events[nextIndex].task_id || '') : '';
         if (cachedTarget === String(taskId)) {
             const now = Date.now();
-            const nextContext = Object.assign({}, cachedContext, {index: nextIndex, navigation_token: now});
+            const nextContext = Object.assign({}, cachedContext, {
+                index: nextIndex, navigation_token: now, navigation_task_id: String(taskId)
+            });
             window.__gptChartEventContext = nextContext;
             // Once the source context has been validated by the named callback,
             // subsequent adjacent clicks can update all dependent Stores in the
@@ -4999,7 +5005,9 @@ window.dash_clientside.chart_navigation = {
             return Array(4).fill(window.dash_clientside.no_update);
         }
         const now = Date.now();
-        const nextContext = Object.assign({}, eventContext, {index: nextIndex, navigation_token: now});
+        const nextContext = Object.assign({}, eventContext, {
+            index: nextIndex, navigation_token: now, navigation_task_id: targetId
+        });
         window.__gptChartEventContext = nextContext;
         const nextViewState = {task_id: targetId, axes: {}, reset_for_navigation_ts: now / 1000};
         traceUi('local source chart navigation', {direction: direction, taskId: targetId, path: 'direct-command'});
@@ -5023,7 +5031,8 @@ window.dash_clientside.chart_navigation = {
             }
             nextContext = Object.assign({}, eventContext, {
                 index: nextIndex,
-                navigation_token: Date.now()
+                navigation_token: Date.now(),
+                navigation_task_id: targetId
             });
         }
         let nextViewState = window.dash_clientside.no_update;
@@ -11011,7 +11020,13 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     explicit_source_navigation = bool(
         isinstance(chart_event_context, dict)
         and chart_event_context.get("navigation_token")
+        and str(chart_event_context.get("navigation_task_id") or "") == str(task_id)
     )
+    if isinstance(chart_event_context, dict) and chart_event_context.get("navigation_token"):
+        interaction_trace(
+            f"chart navigation eligibility id={diagnostic_id} task={task_id} "
+            f"trigger={ctx.triggered_id} exact_task={explicit_source_navigation}"
+        )
     if chart_source == "dynamic_oscillator_summary" and not explicit_source_navigation:
         interaction_trace(
             f"chart fast bypass id={diagnostic_id} task={task_id} "
