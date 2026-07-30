@@ -5329,7 +5329,9 @@ CHART_SOURCE_PROFILES = {
     "dynamic_oscillator_summary": {
         "navigation": "event_group",
         "focus": "event_interval",
-        "default_panes": ("rsi", "stochastic"),
+        # Opening a strategy result must not silently enable analytical panes.
+        # Pane visibility remains an explicit toolbar/user preference.
+        "default_panes": (),
         "default_overlays": ("event_marks", "trade_details"),
         "show_trade_details": True,
     },
@@ -9038,7 +9040,7 @@ def clear_chart_context_on_close(_):
     prevent_initial_call=True,
 )
 def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids, event_groups):
-    """Open the chart on a selected diagnostic event number and enable oscillator panes."""
+    """Open the selected diagnostic event without changing pane visibility."""
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict):
         return no_update, no_update, no_update, no_update, no_update
@@ -9062,7 +9064,10 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     if not task_id:
         return no_update, no_update, no_update, no_update, no_update
     context = make_chart_context("dynamic_oscillator_summary", category=category, events=events, index=event_index, overlay=True)
-    return task_id, {f"{task_id}_chart": time.time()}, context, True, True
+    # RSI/Stochastic used to be forced on here. That made a newly opened chart
+    # contradict untouched toolbar buttons and also expanded every subsequent
+    # compact payload. Preserve the user's current pane choices instead.
+    return task_id, {f"{task_id}_chart": time.time()}, context, no_update, no_update
 
 @app.callback(
     Output("chart-event-context-store", "data", allow_duplicate=True),
