@@ -4724,39 +4724,31 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         // customdata is derived locally from close values rather than repeated
         // in the Dash response. Candle hover still receives the identical data.
         const candleCustomData = candleUpdate.close.map(function(value) { return [value]; });
-        // Update every trace and the layout in one Plotly calculation. The old
-        // fast path first restyled the candle and then updated oscillators,
-        // forcing Plotly to traverse all shared axes twice (about 0.9-1.9s in
-        // the supplied browser traces). `undefined` deliberately retains an
-        // attribute on trace types where it does not apply.
-        const allIndices = actualKeys.map(function(_, index) { return index; });
-        const openUpdates = [candleUpdate.open];
-        const highUpdates = [candleUpdate.high];
-        const lowUpdates = [candleUpdate.low];
-        const closeUpdates = [candleUpdate.close];
-        const customDataUpdates = [candleCustomData];
-        const xUpdates = [sameSharedX ? undefined : sharedDates];
-        const yUpdates = [undefined];
-        const markerColorUpdates = [((plot.data[0] || {}).marker || {}).color];
-        const textUpdates = [(plot.data[0] || {}).text];
-        const hoverTemplateUpdates = [(plot.data[0] || {}).hovertemplate];
-        updates.slice(1).forEach(function(update, offset) {
-            const index = offset + 1;
-            openUpdates.push(undefined);
-            highUpdates.push(undefined);
-            lowUpdates.push(undefined);
-            closeUpdates.push(undefined);
-            customDataUpdates.push(undefined);
-            // Most adjacent results share the exact candle window. Undefined
-            // tells Plotly to retain an unchanged shared x array, while event
-            // and signal traces still receive their task-specific positions.
-            const taskSpecificX = update.x_kind !== 'shared';
-            xUpdates.push(taskSpecificX || !sameSharedX ? traceX(update) : undefined);
-            yUpdates.push(update.y);
-            const currentMarker = ((plot.data[index] || {}).marker || {}).color;
-            markerColorUpdates.push(update.marker_color !== undefined ? update.marker_color : currentMarker);
-            textUpdates.push(Array.isArray(update.text) ? update.text : (plot.data[index] || {}).text);
-            hoverTemplateUpdates.push(update.hovertemplate || (plot.data[index] || {}).hovertemplate);
+        // Build type-correct replacement traces. Passing OHLC attributes with
+        // undefined slots through Plotly.update also applies those attributes
+        // to ScatterGL traces in some Plotly versions and can fail inside axis
+        // setup (`_inputDomain`). Plotly.react still performs one diff/render
+        // pass, but each trace receives only attributes valid for its type.
+        const nextData = plot.data.map(function(trace, index) {
+            const update = updates[index];
+            const nextTrace = Object.assign({}, trace);
+            if (index === 0) {
+                nextTrace.open = candleUpdate.open;
+                nextTrace.high = candleUpdate.high;
+                nextTrace.low = candleUpdate.low;
+                nextTrace.close = candleUpdate.close;
+                nextTrace.customdata = candleCustomData;
+                if (!sameSharedX) nextTrace.x = sharedDates;
+                return nextTrace;
+            }
+            if (update.x_kind !== 'shared' || !sameSharedX) nextTrace.x = traceX(update);
+            nextTrace.y = update.y;
+            if (update.marker_color !== undefined) {
+                nextTrace.marker = Object.assign({}, nextTrace.marker || {}, {color: update.marker_color});
+            }
+            if (Array.isArray(update.text)) nextTrace.text = update.text;
+            if (update.hovertemplate) nextTrace.hovertemplate = update.hovertemplate;
+            return nextTrace;
         });
         const currentLayout = plot.layout || {};
         const shapes = (currentLayout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
@@ -4789,28 +4781,23 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             });
         }
         const meta = Object.assign({}, currentLayout.meta || {}, payload.meta || {});
-        const layoutUpdate = {
+        const nextLayout = Object.assign({}, currentLayout, {
             title: {text: payload.title}, meta: meta, shapes: shapes, annotations: annotations,
-            uirevision: 'task-chart-preserve-view-' + payload.task_id,
-            'yaxis.autorange': true, 'yaxis.range': null
-        };
+            uirevision: 'task-chart-preserve-view-' + payload.task_id
+        });
+        nextLayout.yaxis = Object.assign({}, currentLayout.yaxis || {}, {autorange: true});
+        delete nextLayout.yaxis.range;
         // Reset every shared time axis, not only xaxis. Otherwise a range left
         // on xaxis2/xaxis3 by the previous multi-pane chart can make the new
         // task appear unexpectedly zoomed or shifted.
         Object.keys(currentLayout).forEach(function(key) {
             if (/^xaxis[0-9]*$/.test(key)) {
-                layoutUpdate[key + '.autorange'] = true;
-                layoutUpdate[key + '.range'] = null;
+                nextLayout[key] = Object.assign({}, currentLayout[key] || {}, {autorange: true});
+                delete nextLayout[key].range;
             }
         });
         candleAppliedAt = performance.now();
-        await window.Plotly.update(plot, {
-            x: xUpdates, y: yUpdates,
-            open: openUpdates, high: highUpdates, low: lowUpdates,
-            close: closeUpdates, customdata: customDataUpdates,
-            'marker.color': markerColorUpdates,
-            text: textUpdates, hovertemplate: hoverTemplateUpdates
-        }, layoutUpdate, allIndices);
+        await window.Plotly.react(plot, nextData, nextLayout, plot._context || {});
         valuesAppliedAt = performance.now();
         colorsAppliedAt = performance.now();
         window.__gptPendingChartTaskId = '';
@@ -4825,7 +4812,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             colors_ms: Math.round(colorsAppliedAt - valuesAppliedAt),
             final_ms: Math.round(performance.now() - colorsAppliedAt),
             shared_x_reused: sameSharedX,
-            update_strategy: 'single-pass',
+            update_strategy: 'single-react',
             points: payload.shared_x.length,
             traces: actualKeys.length
         });
@@ -4936,6 +4923,30 @@ function dispatchAdjacentChartNavigation(taskId, direction, buttonId, mode) {
     }, 30000);
     resetMeasureForChartNavigation();
     markChartRenderRequested(buttonId);
+    const cachedContext = window.__gptChartEventContext;
+    if (cachedContext && Array.isArray(cachedContext.events)) {
+        const currentIndex = Math.max(0, Number(cachedContext.index || 0));
+        const nextIndex = currentIndex + (direction === 'previous' ? -1 : 1);
+        const cachedTarget = nextIndex >= 0 && nextIndex < cachedContext.events.length ?
+            String(cachedContext.events[nextIndex].task_id || '') : '';
+        if (cachedTarget === String(taskId)) {
+            const now = Date.now();
+            const nextContext = Object.assign({}, cachedContext, {index: nextIndex, navigation_token: now});
+            window.__gptChartEventContext = nextContext;
+            // Once the source context has been validated by the named callback,
+            // subsequent adjacent clicks can update all dependent Stores in the
+            // capture handler itself. This removes the remaining command-Store
+            // callback scheduling delay while keeping exact event/task matching.
+            window.dash_clientside.set_props('chart-event-context-store', {data: nextContext});
+            window.dash_clientside.set_props('chart-view-state-store', {data: {
+                task_id: String(taskId), axes: {}, reset_for_navigation_ts: now / 1000
+            }});
+            window.dash_clientside.set_props('chart-click-store', {data: {[String(taskId) + '_chart']: now / 1000}});
+            window.dash_clientside.set_props('chart-task-id', {data: String(taskId)});
+            traceUi('local source chart navigation', {direction: direction, taskId: String(taskId), path: 'direct-cached-context'});
+            return true;
+        }
+    }
     // Summary navigation must advance the event index and task together. A
     // tiny command Store wakes one atomic clientside callback immediately,
     // avoiding the slower React n_click round trip without weakening the
@@ -4989,6 +5000,7 @@ window.dash_clientside.chart_navigation = {
         }
         const now = Date.now();
         const nextContext = Object.assign({}, eventContext, {index: nextIndex, navigation_token: now});
+        window.__gptChartEventContext = nextContext;
         const nextViewState = {task_id: targetId, axes: {}, reset_for_navigation_ts: now / 1000};
         traceUi('local source chart navigation', {direction: direction, taskId: targetId, path: 'direct-command'});
         return [targetId, {[targetId + '_chart']: now / 1000}, nextContext, nextViewState];
