@@ -1081,7 +1081,8 @@ def build_incremental_chart_patch(fig):
     return patch
 
 
-def chart_fast_candle_navigation_eligible(current_schema, source, render_values, triggered_id):
+def chart_fast_candle_navigation_eligible(current_schema, source, render_values, triggered_id,
+                                          navigation_context=False):
     """Return whether navigation can safely update the mounted chart traces.
 
     Source/strategy/event overlays retain the full renderer because their trace
@@ -1094,6 +1095,11 @@ def chart_fast_candle_navigation_eligible(current_schema, source, render_values,
     if normalized_source not in {"main_table", "dynamic_oscillator_summary"} or not isinstance(current_schema, dict):
         return False
     if current_schema.get("source") != normalized_source:
+        return False
+    # Opening a summary row must build the authoritative figure so its initial
+    # entry/exit traces, guides, ranges and source metadata are established.
+    # Only an explicit Previous/Next context may mutate that mounted schema.
+    if normalized_source == "dynamic_oscillator_summary" and not navigation_context:
         return False
     trace_keys = tuple(current_schema.get("trace_keys") or ())
     if not trace_keys:
@@ -4746,8 +4752,17 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         const layoutUpdate = {
             title: {text: payload.title}, meta: meta, shapes: shapes, annotations: annotations,
             uirevision: 'task-chart-preserve-view-' + payload.task_id,
-            'xaxis.autorange': true, 'yaxis.autorange': true
+            'yaxis.autorange': true, 'yaxis.range': null
         };
+        // Reset every shared time axis, not only xaxis. Otherwise a range left
+        // on xaxis2/xaxis3 by the previous multi-pane chart can make the new
+        // task appear unexpectedly zoomed or shifted.
+        Object.keys(currentLayout).forEach(function(key) {
+            if (/^xaxis[0-9]*$/.test(key)) {
+                layoutUpdate[key + '.autorange'] = true;
+                layoutUpdate[key + '.range'] = null;
+            }
+        });
         // Plotly.update applies oscillator arrays and task-dependent layout in
         // one calculation pass instead of a restyle followed by a relayout.
         if (valueIndices.length) {
@@ -4908,12 +4923,15 @@ window.dash_clientside.chart_navigation = {
                 traceUi('chart navigation rejected', {reason: 'event context mismatch', targetId: targetId, nextIndex: nextIndex});
                 return Array(5).fill(window.dash_clientside.no_update);
             }
-            nextContext = Object.assign({}, eventContext, {index: nextIndex});
+            nextContext = Object.assign({}, eventContext, {
+                index: nextIndex,
+                navigation_token: Date.now()
+            });
         }
         let nextViewState = window.dash_clientside.no_update;
-        if (viewState && viewState.axes) {
-            nextViewState = Object.assign({}, viewState, {task_id: targetId, carried_to_task_ts: Date.now() / 1000});
-        }
+        // Zoom/pan belongs to the task that created it. Carrying those ranges
+        // into another coin caused apparently zoomed-out or displaced charts.
+        nextViewState = {task_id: targetId, axes: {}, reset_for_navigation_ts: Date.now() / 1000};
         traceUi('local source chart navigation', {direction: triggered === 'prev-chart-btn' ? 'previous' : 'next', taskId: targetId});
         return [
             targetId,
@@ -9056,6 +9074,7 @@ def clear_chart_context_on_close(_):
     Output("chart-event-context-store", "data", allow_duplicate=True),
     Output("rsi-visible-store", "data", allow_duplicate=True),
     Output("stochastic-visible-store", "data", allow_duplicate=True),
+    Output("chart-view-state-store", "data", allow_duplicate=True),
     Input({"type": "osc-event-chart", "category": ALL}, "n_clicks"),
     State({"type": "osc-event-index", "category": ALL}, "value"),
     State({"type": "osc-event-index", "category": ALL}, "id"),
@@ -9066,11 +9085,11 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     """Open the selected diagnostic event without changing pane visibility."""
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict):
-        return no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update
     category = triggered.get("category")
     events = (event_groups or {}).get(category) or []
     if not events:
-        return no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update
 
     requested_number = 1
     for value, id_obj in zip(requested_indices or [], requested_index_ids or []):
@@ -9085,12 +9104,13 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
 
     task_id = str(events[event_index].get("task_id") or "")
     if not task_id:
-        return no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update
     context = make_chart_context("dynamic_oscillator_summary", category=category, events=events, index=event_index, overlay=True)
     # RSI/Stochastic used to be forced on here. That made a newly opened chart
     # contradict untouched toolbar buttons and also expanded every subsequent
     # compact payload. Preserve the user's current pane choices instead.
-    return task_id, {f"{task_id}_chart": time.time()}, context, no_update, no_update
+    reset_view = {"task_id": task_id, "axes": {}, "reset_for_source_open_ts": time.time()}
+    return task_id, {f"{task_id}_chart": time.time()}, context, no_update, no_update, reset_view
 
 @app.callback(
     Output("chart-event-context-store", "data", allow_duplicate=True),
@@ -10874,8 +10894,18 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     # Same-schema task navigation can stop here: indicator arrays have been
     # calculated with the original formulas, but no Plotly Figure, subplots,
     # traces, annotations, or layout have been constructed or serialized.
+    explicit_source_navigation = bool(
+        isinstance(chart_event_context, dict)
+        and chart_event_context.get("navigation_token")
+    )
+    if chart_source == "dynamic_oscillator_summary" and not explicit_source_navigation:
+        interaction_trace(
+            f"chart fast bypass id={diagnostic_id} task={task_id} "
+            "reason=authoritative_source_open"
+        )
     if chart_fast_candle_navigation_eligible(
-        current_render_schema, chart_source, render_values, ctx.triggered_id
+        current_render_schema, chart_source, render_values, ctx.triggered_id,
+        navigation_context=explicit_source_navigation,
     ):
         payload_started = time.perf_counter()
         try:
