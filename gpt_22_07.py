@@ -16,7 +16,7 @@ Now with signal‑based downloading, candle analysis, and per‑task interactive
 # Keep imports centralized. Repository-local strategy/impulse/database imports are
 # intentionally explicit so the main app can be reorganized without changing math.
 
-import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functools, sys, bisect, math, copy
+import os, json, time, threading, queue, uuid, shutil, glob, hashlib, re, functools, sys, bisect, math
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 import dash
@@ -822,8 +822,6 @@ CHART_FILE_END_CACHE_MAX = 48
 chart_file_end_cache = OrderedDict()
 CHART_TASK_INDICATOR_CACHE_MAX = 2
 chart_task_indicator_cache = OrderedDict()
-CHART_FIGURE_CACHE_MAX = 2
-chart_figure_cache = OrderedDict()
 # Phase 1 rendering optimization: migrate one low-risk oscillator line first.
 # The toggle offers an immediate rollback path on an unusual browser/GPU while
 # leaving candle, bar, marker, measurement, and strategy rendering unchanged.
@@ -4799,6 +4797,13 @@ document.addEventListener('click', function(e) {
     if (!button) return;
     traceUi('button click', {id: button.id, action: button.getAttribute('data-action')});
     if (button.id === 'prev-chart-btn' || button.id === 'next-chart-btn') {
+        const targetTaskId = String(button.getAttribute('data-target-task-id') || '');
+        if (!targetTaskId) {
+            traceUi('chart navigation ignored', {reason: 'no adjacent task', direction: button.id === 'prev-chart-btn' ? 'previous' : 'next'});
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+        }
         const pendingAge = performance.now() - Number(window.__gptChartNavigationPendingSince || 0);
         if (window.__gptChartNavigationPending && pendingAge < 30000) {
             traceUi('chart navigation ignored', {reason: 'render pending', direction: button.id === 'prev-chart-btn' ? 'previous' : 'next'});
@@ -10468,66 +10473,6 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if source_trade_event:
         source_trade_event = align_source_trade_event_to_candles(source_trade_event, df)
     trace_chart_phase("resolve_context", source=chart_source, source_trade=bool(source_trade_event))
-    # Cache the last two authoritative figures, not merely their indicator
-    # columns. Back/Forward review commonly alternates between two results; in
-    # that case Plotly graph-object construction costs ~1.7s even when every
-    # calculation is already cached. The complete render contract is part of
-    # the key, and the parquet version prevents stale candles after an update.
-    try:
-        source_stat = os.stat(fp)
-        source_version = (source_stat.st_mtime_ns, source_stat.st_size)
-    except OSError:
-        source_version = None
-    figure_cache_contract = {
-        "task_id": str(task_id),
-        "source_version": source_version,
-        "source": chart_source,
-        "event": source_trade_event,
-        "visible": {
-            "rsi": bool(rsi_visible), "stochastic": bool(stochastic_visible),
-            "volume": bool(volume_visible), "adx": bool(adx_visible),
-            "macd": bool(macd_visible), "disparity": bool(disparity_visible),
-            "strategy": bool(strategy_visible), "impulse": bool(impulse_visible),
-            "events": bool(events_visible), "focus_entry": bool(focus_entry),
-            "candle_info": bool(candle_info_enabled),
-        },
-        # Volatile timestamps in the Store must not defeat Back/Forward cache
-        # hits; only axis ranges influence the rendered figure.
-        "view_axes": ((chart_view_state or {}).get("axes")
-                      if isinstance(chart_view_state, dict)
-                      and str(chart_view_state.get("task_id")) == str(task_id)
-                      else None),
-        "compact_time": CHART_COMPACT_TIME_AXIS_ENABLED,
-        "webgl": [CHART_WEBGL_RSI_ENABLED, CHART_WEBGL_STOCHASTIC_ENABLED,
-                  CHART_WEBGL_ADX_ENABLED, CHART_WEBGL_MACD_ENABLED,
-                  CHART_WEBGL_DISPARITY_ENABLED],
-    }
-    figure_cache_key = hashlib.sha256(
-        json.dumps(figure_cache_contract, sort_keys=True, default=str,
-                   separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    # Source-summary events fully describe their task-specific trade overlays.
-    # Other sources may depend on mutable strategy/task annotations that are
-    # not yet versioned, so keep their authoritative full render unchanged.
-    figure_cache_eligible = chart_source == "dynamic_oscillator_summary"
-    cached_figure = chart_figure_cache.get(figure_cache_key) if figure_cache_eligible else None
-    if cached_figure is not None:
-        chart_figure_cache.move_to_end(figure_cache_key)
-        fig = copy.deepcopy(cached_figure)
-        meta = fig.layout.meta if isinstance(fig.layout.meta, dict) else {}
-        fig.layout.meta = {**meta, "diagnostic_id": diagnostic_id,
-                           "figure_cache_hit": True}
-        requested_render_schema = fig.layout.meta.get("render_schema")
-        trace_chart_phase("figure_cache_hit", traces=len(fig.data),
-                          bytes_hint="full")
-        interaction_trace(
-            f"chart render complete id={diagnostic_id} task={task_id} "
-            f"elapsed={time.perf_counter() - diagnostic_started:.3f}s "
-            f"traces={len(fig.data)} mode=figure_cache"
-        )
-        g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
-        timer.end()
-        return fig, requested_render_schema, no_update
     # UTC conversion remains local because the figure renderer uses it for
     # source marks, signals, and tooltips.
     def ms_to_chart_x(ms):
@@ -11112,17 +11057,6 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
         timer.end()
         return build_incremental_chart_patch(fig), requested_render_schema, no_update
-    if figure_cache_eligible:
-        cached_copy_started = time.perf_counter()
-        chart_figure_cache[figure_cache_key] = copy.deepcopy(fig)
-        chart_figure_cache.move_to_end(figure_cache_key)
-        while len(chart_figure_cache) > CHART_FIGURE_CACHE_MAX:
-            chart_figure_cache.popitem(last=False)
-        interaction_trace(
-            f"chart figure cache store id={diagnostic_id} task={task_id} "
-            f"copy_ms={round((time.perf_counter() - cached_copy_started) * 1000)} "
-            f"entries={len(chart_figure_cache)}"
-        )
     g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
     timer.end()
     return fig, requested_render_schema, no_update
