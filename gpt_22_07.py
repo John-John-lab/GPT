@@ -866,17 +866,18 @@ CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
 # It bypasses Plotly Figure construction and sends raw trace arrays to the
 # already mounted graph. Any schema/browser mismatch requests the authoritative
 # full renderer immediately.
-# Correctness is the default. The compact restyle path remains available for
-# controlled profiling, but full Plotly figures are authoritative until pane,
-# Measure, crosshair, and source-mark state all pass browser regression tests.
-CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "0") == "1"
-CHART_FAST_CANDLE_SCHEMA_VERSION = 3
+# Integrity-guarded compact navigation is now the default after repeated field
+# fingerprints passed. Any schema/value/event mismatch automatically requests
+# the authoritative full figure; set GPT_CHART_FAST_CANDLE_NAV=0 to roll back.
+CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "1") == "1"
+CHART_FAST_CANDLE_SCHEMA_VERSION = 4
 CHART_FAST_NAV_SUPPORTED_NAMES = frozenset({
     "ohlc", "measure_click_points", "rsi_14",
     "stoch_14_1_3_d", "stoch_40_1_4_d", "stoch_60_1_10_d", "stoch_300_1_10_d",
     "adx_14_1", "di_14", "macd_hist", "macd_12_26", "signal_9",
     "dix_1_ema_50", "dix_2_ema_25", "dix_3_ema_9", "volume",
     "signal_time", "signal_time_marker",
+    "dynamic_strategy_entry", "dynamic_strategy_exit",
 })
 # Optional neighbour warming is disabled by default. Runtime traces show cold
 # reads take only tens of milliseconds, while a delayed background read can
@@ -1089,15 +1090,20 @@ def chart_fast_candle_navigation_eligible(current_schema, source, render_values,
     """
     if not CHART_FAST_CANDLE_NAV_ENABLED or triggered_id != "chart-task-id":
         return False
-    if str(source or "main_table") != "main_table" or not isinstance(current_schema, dict):
+    normalized_source = str(source or "main_table")
+    if normalized_source not in {"main_table", "dynamic_oscillator_summary"} or not isinstance(current_schema, dict):
         return False
-    if current_schema.get("source") != "main_table":
+    if current_schema.get("source") != normalized_source:
         return False
     trace_keys = tuple(current_schema.get("trace_keys") or ())
     if not trace_keys:
         return False
     trace_names = {key.rsplit(":", 1)[0].split(":", 1)[-1] for key in trace_keys}
     if not trace_names.issubset(CHART_FAST_NAV_SUPPORTED_NAMES):
+        return False
+    if normalized_source == "dynamic_oscillator_summary" and not {
+        "dynamic_strategy_entry", "dynamic_strategy_exit"
+    }.issubset(trace_names):
         return False
     return not any(bool(render_values.get(key)) for key in (
         "strategy_visible", "impulse_visible", "events_visible", "focus_entry",
@@ -1109,7 +1115,9 @@ def _chart_json_series(series):
     return [None if pd.isna(value) else float(value) for value in series]
 
 
-def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_schema):
+def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_schema,
+                                         source="main_table", source_trade_event=None,
+                                         diagnostic_id="server"):
     """Build compact task-dependent trace arrays without a Plotly Figure."""
     y_min = float(df["low"].min())
     y_max = float(df["high"].max())
@@ -1147,6 +1155,40 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         "signal_time": [y_min, y_max],
         "signal_time_marker": [signal_price],
     }
+    source_event_payload = None
+    if source == "dynamic_oscillator_summary" and isinstance(source_trade_event, dict):
+        details = build_source_trade_details(source_trade_event)
+        try:
+            entry_ms = int(normalize_chart_timestamp_ms(source_trade_event.get("entry_time")))
+            exit_ms = int(normalize_chart_timestamp_ms(source_trade_event.get("exit_time")))
+            entry_price = float(source_trade_event.get("entry_price"))
+            exit_price = float(source_trade_event.get("exit_price"))
+        except (TypeError, ValueError):
+            raise ValueError("dynamic source event is incomplete")
+        entry_reason_html = str(details["entry_reason"]).replace("; ", "<br>")
+        exit_text = "TP" if details["is_tp_checkpoint"] else f"EXIT {details['return_text']}"
+        exit_color = ("#ff9800" if details["is_tp_checkpoint"] else
+                      ("#00c853" if details["return_text"].startswith("+") else "#d50000"))
+        exit_hover = (
+            f"{details['label']}<br>TP checkpoint: %{{y:.6g}}<br>%{{x|%Y-%m-%d %H:%M}}"
+            if details["is_tp_checkpoint"] else
+            f"<b>{details['label']}</b><br>Exit reason: {details['exit_reason_label']}"
+            f"<br>Why exited:<br>{str(details['exit_conditions']).replace('; ', '<br>')}"
+            f"<br>Return: {details['return_text']}<br>Exit: %{{y:.6g}}"
+            f"<br>Time: %{{x|%Y-%m-%d %H:%M}}"
+        )
+        source_event_payload = {
+            "entry": {"x": entry_ms, "y": entry_price,
+                      "text": f"ENTRY {details['direction']}".strip(),
+                      "hovertemplate": (
+                          f"<b>{details['label']}</b><br>Entry {details['direction'] or 'trade'}: %{{y:.6g}}"
+                          f"<br>Why entered:<br>{entry_reason_html}"
+                          f"<br>Time: %{{x|%Y-%m-%d %H:%M}}<extra></extra>"
+                      ), "marker_color": "#00c853"},
+            "exit": {"x": exit_ms, "y": exit_price, "text": exit_text,
+                     "hovertemplate": exit_hover + "<extra></extra>",
+                     "marker_color": exit_color},
+        }
     di_values = []
     if "plus_di_14" in df and "minus_di_14" in df:
         di_values = [_chart_json_series(df["plus_di_14"]), _chart_json_series(df["minus_di_14"])]
@@ -1161,6 +1203,18 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
                 "high": _chart_json_series(df["high"]),
                 "low": _chart_json_series(df["low"]),
                 "close": close_values,
+            })
+            continue
+        if name in {"dynamic_strategy_entry", "dynamic_strategy_exit"}:
+            if not source_event_payload:
+                raise ValueError("dynamic source event payload unavailable")
+            kind = "entry" if name.endswith("entry") else "exit"
+            event_value = source_event_payload[kind]
+            trace_updates.append({
+                "key": key, "x_kind": f"event_{kind}", "y": [event_value["y"]],
+                "text": [event_value["text"]],
+                "hovertemplate": event_value["hovertemplate"],
+                "marker_color": event_value["marker_color"],
             })
             continue
         if name == "di_14":
@@ -1181,6 +1235,26 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
                 for close_value, open_value in zip(close_values, _chart_json_series(df["open"]))
             ]
         trace_updates.append(update)
+    indices = sorted(set((0, len(df) // 2, len(df) - 1)))
+    fingerprint_traces = []
+    for index, update in enumerate(trace_updates):
+        values = update.get("close") if "close" in update else update.get("y")
+        if not isinstance(values, list) or len(values) != len(df):
+            continue
+        fingerprint_traces.append({
+            "index": index, "name": update["key"],
+            "field": "close" if "close" in update else "y",
+            "values": [values[position] for position in indices],
+        })
+    diagnostic_fingerprint = {
+        "version": 1, "task_id": str(task_id), "source": str(source),
+        "points": len(df), "indices": indices,
+        "timestamps": [int(df["timestamp"].iloc[position]) for position in indices],
+        "traces": fingerprint_traces,
+        "event": ({kind: {"timestamp": value["x"], "price": value["y"]}
+                   for kind, value in source_event_payload.items()}
+                  if source_event_payload else {}),
+    }
     return {
         "version": CHART_FAST_CANDLE_SCHEMA_VERSION,
         "revision": time.time_ns(),
@@ -1190,6 +1264,7 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         # avoids repeating 1,861 timestamps for every visible trace.
         "shared_x": x_values,
         "signal_x": signal_ms,
+        "source_event": source_event_payload,
         "traces": trace_updates,
         "signal_price": signal_price,
         "title": f"{symbol} – {task.timeframe}  (Signal at {pd.to_datetime(task.signal_time, unit='ms')})",
@@ -1198,11 +1273,13 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
             "extended_xrange": extended_xrange,
             "entry_focus_xrange": None,
             "event_focus_xrange": None,
-            "chart_open_source": "main_table",
+            "chart_open_source": str(source),
             "timeframe": task.timeframe,
             "task_id": str(task_id),
             "measurement": {},
             "render_schema": current_schema,
+            "diagnostic_fingerprint": diagnostic_fingerprint,
+            "diagnostic_id": diagnostic_id,
         },
     }
 
@@ -3991,6 +4068,10 @@ function installChartBrowserRenderTrace() {
         if (!plot || !window.Plotly || plot.__gptBrowserRenderTraceInstalled || typeof plot.on !== 'function') return;
         plot.__gptBrowserRenderTraceInstalled = true;
         plot.on('plotly_afterplot', function() {
+            // Compact navigation performs two intentional Plotly operations.
+            // Validate and release navigation only after both have completed,
+            // otherwise the candle-only intermediate state looks corrupt.
+            if (window.__gptFastPayloadApplying) return;
             const request = window.__gptChartRenderRequest;
             // Local relayouts (for example Measure mode) can emit afterplot
             // before Dash has returned the replacement figure. Do not consume
@@ -4543,7 +4624,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
     let payload = rawPayload;
     try {
         if (typeof payload === 'string') payload = JSON.parse(payload);
-        if (!payload || payload.version !== 3 || !payload.task_id || !Array.isArray(payload.shared_x)) return false;
+        if (!payload || payload.version !== 4 || !payload.task_id || !Array.isArray(payload.shared_x)) return false;
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
         if (!plot || !window.Plotly || !Array.isArray(plot.data)) {
@@ -4564,6 +4645,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             return false;
         }
         const startedAt = performance.now();
+        window.__gptFastPayloadApplying = true;
         let candleAppliedAt = startedAt;
         let valuesAppliedAt = startedAt;
         let colorsAppliedAt = startedAt;
@@ -4575,6 +4657,8 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         function traceX(update) {
             if (update.x_kind === 'signal_line') return [signalDate, signalDate];
             if (update.x_kind === 'signal_marker') return [signalDate];
+            if (update.x_kind === 'event_entry') return [new Date(Number(payload.source_event.entry.x)).toISOString()];
+            if (update.x_kind === 'event_exit') return [new Date(Number(payload.source_event.exit.x)).toISOString()];
             return sharedDates;
         }
         const candleUpdate = updates[0];
@@ -4594,13 +4678,17 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         const xUpdates = [];
         const yUpdates = [];
         const markerColorUpdates = [];
+        const textUpdates = [];
+        const hoverTemplateUpdates = [];
         updates.slice(1).forEach(function(update, offset) {
             const index = offset + 1;
             valueIndices.push(index);
             xUpdates.push(traceX(update));
             yUpdates.push(update.y);
             const currentMarker = ((plot.data[index] || {}).marker || {}).color;
-            markerColorUpdates.push(Array.isArray(update.marker_color) ? update.marker_color : currentMarker);
+            markerColorUpdates.push(update.marker_color !== undefined ? update.marker_color : currentMarker);
+            textUpdates.push(Array.isArray(update.text) ? update.text : (plot.data[index] || {}).text);
+            hoverTemplateUpdates.push(update.hovertemplate || (plot.data[index] || {}).hovertemplate);
         });
         const currentLayout = plot.layout || {};
         const shapes = (currentLayout.shapes || []).map(function(shape) { return Object.assign({}, shape); });
@@ -4617,6 +4705,21 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             return String((annotation || {}).text || '').indexOf('Signal Level') >= 0;
         });
         if (signalAnnotation) signalAnnotation.y = payload.signal_price;
+        if (payload.source_event) {
+            [['entry', '#00c853'], ['exit', '#d50000']].forEach(function(item) {
+                const kind = item[0], color = item[1];
+                const eventValue = payload.source_event[kind];
+                const guide = shapes.find(function(shape) {
+                    const line = (shape || {}).line || {};
+                    return String(shape.yref || '') === 'paper' && String(line.color || '').toLowerCase() === color;
+                });
+                if (guide && eventValue) {
+                    const eventDate = new Date(Number(eventValue.x)).toISOString();
+                    guide.x0 = eventDate;
+                    guide.x1 = eventDate;
+                }
+            });
+        }
         const meta = Object.assign({}, currentLayout.meta || {}, payload.meta || {});
         const layoutUpdate = {
             title: {text: payload.title}, meta: meta, shapes: shapes, annotations: annotations,
@@ -4627,7 +4730,8 @@ async function applyFastCandleNavigationPayload(rawPayload) {
         // one calculation pass instead of a restyle followed by a relayout.
         if (valueIndices.length) {
             await window.Plotly.update(plot, {
-                x: xUpdates, y: yUpdates, 'marker.color': markerColorUpdates
+                x: xUpdates, y: yUpdates, 'marker.color': markerColorUpdates,
+                text: textUpdates, hovertemplate: hoverTemplateUpdates
             }, layoutUpdate, valueIndices);
         } else {
             await window.Plotly.relayout(plot, layoutUpdate);
@@ -4648,8 +4752,26 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             points: payload.shared_x.length,
             traces: actualKeys.length
         });
+        window.__gptFastPayloadApplying = false;
+        const integrity = validateChartDiagnosticFingerprint(plot);
+        traceUi('chart integrity', {
+            id: (payload.meta && payload.meta.diagnostic_id) || 'fast',
+            status: integrity.status, issues: integrity.issues
+        });
+        window.__gptChartRenderRequest = null;
+        window.__gptChartNavigationPending = false;
+        window.__gptChartNavigationPendingSince = 0;
+        ['prev-chart-btn', 'next-chart-btn'].forEach(function(id) {
+            const button = document.getElementById(id);
+            if (button) button.disabled = false;
+        });
+        if (integrity.status === 'FAIL') {
+            requestFullChartFallback(payload.task_id, 'post-apply integrity failure: ' + integrity.issues.join('; '));
+            return false;
+        }
         return true;
     } catch (error) {
+        window.__gptFastPayloadApplying = false;
         requestFullChartFallback(payload && payload.task_id, error && error.message ? error.message : error);
         return false;
     }
@@ -10730,7 +10852,9 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         payload_started = time.perf_counter()
         try:
             payload = build_fast_candle_navigation_payload(
-                task, task_id, chart_window["symbol"], df, current_render_schema
+                task, task_id, chart_window["symbol"], df, current_render_schema,
+                source=chart_source, source_trade_event=source_trade_event,
+                diagnostic_id=diagnostic_id,
             )
             payload_json = json.dumps(payload, separators=(",", ":"), allow_nan=False)
         except (KeyError, TypeError, ValueError) as exc:
