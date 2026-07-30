@@ -4131,7 +4131,7 @@ function installChartBrowserRenderTrace() {
                 if (!window.__gptToolbarRenderPending && window.__gptQueuedChartNavigation) {
                     const queued = window.__gptQueuedChartNavigation;
                     window.__gptQueuedChartNavigation = null;
-                    submitAdjacentChartNavigation(queued.taskId, queued.direction, queued.buttonId);
+                    dispatchAdjacentChartNavigation(queued.taskId, queued.direction, queued.buttonId, queued.mode);
                 }
             });
         });
@@ -4884,8 +4884,35 @@ function submitAdjacentChartNavigation(taskId, direction, buttonId) {
     traceUi('local chart navigation', {direction: direction, taskId: taskId, storeWrites: 1});
     return true;
 }
+function dispatchAdjacentChartNavigation(taskId, direction, buttonId, mode) {
+    if (mode !== 'event') return submitAdjacentChartNavigation(taskId, direction, buttonId);
+    if (!taskId || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
+    if (window.__gptPendingChartTaskId === taskId) {
+        traceUi('duplicate chart navigation ignored', {direction: direction, taskId: taskId});
+        return true;
+    }
+    window.__gptPendingChartTaskId = taskId;
+    window.setTimeout(function() {
+        if (window.__gptPendingChartTaskId === taskId) window.__gptPendingChartTaskId = '';
+    }, 30000);
+    resetMeasureForChartNavigation();
+    markChartRenderRequested(buttonId);
+    // Summary navigation must advance the event index and task together. A
+    // tiny command Store wakes one atomic clientside callback immediately,
+    // avoiding the slower React n_click round trip without weakening the
+    // event/task consistency check in chart_navigation.navigate_command.
+    window.dash_clientside.set_props('chart-navigation-command-store', {data: {
+        task_id: String(taskId),
+        direction: direction,
+        ts: Date.now()
+    }});
+    traceUi('chart navigation command dispatched', {direction: direction, taskId: taskId});
+    return true;
+}
 function openAdjacentChartImmediately(button) {
-    if (!button || button.getAttribute('data-direct-navigation') !== 'true') return false;
+    if (!button) return false;
+    const mode = String(button.getAttribute('data-direct-navigation') || 'false');
+    if (mode !== 'true' && mode !== 'event') return false;
     const taskId = String(button.getAttribute('data-target-task-id') || '');
     if (!taskId || !window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return false;
     const direction = button.id === 'prev-chart-btn' ? 'previous' : 'next';
@@ -4894,19 +4921,39 @@ function openAdjacentChartImmediately(button) {
     // chart omitted those panes. Flush the batch and retain only the latest
     // requested destination; afterplot resumes navigation with the new schema.
     if (chartActionFlushTimer || Object.keys(chartQueuedActions).length || window.__gptToolbarRenderPending) {
-        window.__gptQueuedChartNavigation = {taskId: taskId, direction: direction, buttonId: button.id};
+        window.__gptQueuedChartNavigation = {taskId: taskId, direction: direction, buttonId: button.id, mode: mode};
         const waitingForRender = flushQueuedChartActions();
         traceUi('chart navigation queued for toolbar', {direction: direction, taskId: taskId});
         if (!waitingForRender && !window.__gptToolbarRenderPending) {
             window.__gptQueuedChartNavigation = null;
-            return submitAdjacentChartNavigation(taskId, direction, button.id);
+            return dispatchAdjacentChartNavigation(taskId, direction, button.id, mode);
         }
         return true;
     }
-    return submitAdjacentChartNavigation(taskId, direction, button.id);
+    return dispatchAdjacentChartNavigation(taskId, direction, button.id, mode);
 }
 window.dash_clientside = window.dash_clientside || {};
 window.dash_clientside.chart_navigation = {
+    navigate_command: function(command, currentTaskId, eventContext) {
+        if (!command || !command.task_id || !currentTaskId || !eventContext || !Array.isArray(eventContext.events)) {
+            return Array(4).fill(window.dash_clientside.no_update);
+        }
+        const direction = command.direction === 'previous' ? 'previous' : 'next';
+        const currentIndex = Math.max(0, Number(eventContext.index || 0));
+        const nextIndex = currentIndex + (direction === 'previous' ? -1 : 1);
+        const targetId = String(command.task_id || '');
+        if (nextIndex < 0 || nextIndex >= eventContext.events.length ||
+                String(eventContext.events[nextIndex].task_id || '') !== targetId) {
+            traceUi('chart navigation rejected', {reason: 'direct event context mismatch', targetId: targetId, nextIndex: nextIndex});
+            window.__gptPendingChartTaskId = '';
+            return Array(4).fill(window.dash_clientside.no_update);
+        }
+        const now = Date.now();
+        const nextContext = Object.assign({}, eventContext, {index: nextIndex, navigation_token: now});
+        const nextViewState = {task_id: targetId, axes: {}, reset_for_navigation_ts: now / 1000};
+        traceUi('local source chart navigation', {direction: direction, taskId: targetId, path: 'direct-command'});
+        return [targetId, {[targetId + '_chart']: now / 1000}, nextContext, nextViewState];
+    },
     navigate: function(prevClicks, nextClicks, currentTaskId, eventContext, viewState, previousTarget, nextTarget) {
         const callbackContext = window.dash_clientside.callback_context || {};
         const triggered = callbackContext.triggered_id;
@@ -5537,6 +5584,9 @@ def build_root_layout():
     dcc.Store(id="chart-task-id", data=None),     # store task_id for chart modal
     dcc.Store(id="chart-highlight-dummy", data=None),  # clientside row highlight sync
     dcc.Store(id="chart-event-context-store", data=make_chart_context()),
+    # Browser-dispatched summary navigation command. This keeps task, source
+    # event index, and view reset atomic without waiting for a button n_click.
+    dcc.Store(id="chart-navigation-command-store", data=None),
     # Canonical request used by future source-aware chart controls/renderers.
     dcc.Store(id="chart-request-store", data=make_chart_request(None)),
     dcc.Store(id="chart-ui-state-store", data=make_chart_ui_state()),
@@ -8753,9 +8803,10 @@ def update_chart_nav_buttons(task_id, version, event_context):
         previous = str(events[idx - 1].get("task_id") or "") if idx > 0 else ""
         following = str(events[idx + 1].get("task_id") or "") if idx < total - 1 else ""
         # Summary-event navigation must move task id and event index together.
-        # The named clientside callback below does that atomically; these stay
-        # false only to prevent the simpler main-table capture handler running.
-        return idx <= 0, idx >= total - 1, previous, following, "false", "false"
+        # The named clientside callback below does that atomically. "event"
+        # selects the direct-command path. The legacy n_click
+        # callback remains available when browser set_props is unavailable.
+        return idx <= 0, idx >= total - 1, previous, following, "event", "event"
     if not task_id:
         return True, True, "", "", "false", "false"
     _, chartable = get_chartable_tasks_for_navigation()
@@ -8768,6 +8819,18 @@ def update_chart_nav_buttons(task_id, version, event_context):
     # Main-table navigation needs only a new task id. Expose the already
     # resolved adjacent ids so the browser can skip the server n_click hop.
     return idx <= 0, idx >= len(chart_ids) - 1, previous, following, "true", "true"
+
+app.clientside_callback(
+    ClientsideFunction(namespace="chart_navigation", function_name="navigate_command"),
+    Output("chart-task-id", "data", allow_duplicate=True),
+    Output("chart-click-store", "data", allow_duplicate=True),
+    Output("chart-event-context-store", "data", allow_duplicate=True),
+    Output("chart-view-state-store", "data", allow_duplicate=True),
+    Input("chart-navigation-command-store", "data"),
+    State("chart-task-id", "data"),
+    State("chart-event-context-store", "data"),
+    prevent_initial_call=True,
+)
 
 app.clientside_callback(
     ClientsideFunction(namespace="chart_navigation", function_name="navigate"),
