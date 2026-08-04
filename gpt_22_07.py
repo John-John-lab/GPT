@@ -4067,6 +4067,7 @@ const chartToggleStores = {
     'toggle-slr-btn': ['slr-visible-store', false],
     'toggle-mfi-btn': ['mfi-visible-store', false],
     'toggle-vwap-btn': ['vwap-visible-store', false],
+    'toggle-chart-vline-btn': ['chart-vline-mode-store', false],
     'toggle-strategy-btn': ['strategy-visible-store', false],
     'toggle-chart-info-box-btn': ['chart-info-box-store', false],
     'toggle-oscillator-info-box-btn': ['oscillator-info-box-store', true],
@@ -4095,6 +4096,7 @@ const chartToggleActions = {
     'toggle-slr-btn': ['panes', 'slr'],
     'toggle-mfi-btn': ['panes', 'mfi'],
     'toggle-vwap-btn': ['panes', 'vwap'],
+    'toggle-chart-vline-btn': ['information', 'vertical_lines'],
     'toggle-strategy-btn': ['overlays', 'strategy'],
     'toggle-impulses-btn': ['overlays', 'impulses'],
     'toggle-events-btn': ['overlays', 'events'],
@@ -4116,6 +4118,131 @@ const chartRenderActionPaths = new Set([
     'panes.cmf', 'panes.cho', 'panes.atr', 'panes.cvd', 'panes.slr', 'panes.mfi', 'panes.vwap',
     'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry'
 ]);
+const chartPaneOrderRegistry = [
+    'rsi', 'stochastic', 'volume', 'adx', 'macd', 'disparity', 'cci',
+    'cmf', 'cho', 'atr', 'cvd', 'slr', 'mfi', 'vwap'
+];
+const chartPaneTitleKeys = {
+    'rsi (14)': 'rsi', 'stochastic': 'stochastic', 'volume': 'volume',
+    'adx / di': 'adx', 'macd (price units)': 'macd', 'cmoa dix': 'disparity',
+    'cci (20)': 'cci', 'cmf (20)': 'cmf', 'chaikin osc': 'cho', 'atr': 'atr',
+    'cvd': 'cvd', 'slr %': 'slr', 'mfi (14)': 'mfi', 'vwap': 'vwap'
+};
+function getTaskPlot() {
+    const holder = document.getElementById('task-chart');
+    return holder ? (holder.querySelector('.js-plotly-plot') || holder) : null;
+}
+function publishIndicatorOrder(order) {
+    if (!window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return;
+    const clean = [];
+    (order || []).forEach(function(key) {
+        if (chartPaneOrderRegistry.indexOf(key) >= 0 && clean.indexOf(key) < 0) clean.push(key);
+    });
+    chartPaneOrderRegistry.forEach(function(key) { if (clean.indexOf(key) < 0) clean.push(key); });
+    window.__chartIndicatorOrder = clean;
+    window.dash_clientside.set_props('chart-indicator-order-store', {data: clean});
+    traceUi('indicator order changed', {order: clean});
+}
+function visibleIndicatorPanes(gd) {
+    const layout = gd && gd._fullLayout;
+    if (!layout) return [];
+    const panes = [];
+    Object.keys(layout).forEach(function(axisName) {
+        if (!/^yaxis\\d*$/.test(axisName) || axisName === 'yaxis') return;
+        const axis = layout[axisName];
+        const title = String((axis.title && axis.title.text) || '').toLowerCase();
+        const key = chartPaneTitleKeys[title];
+        if (key && Array.isArray(axis.domain)) panes.push({key: key, domain: axis.domain, axisName: axisName});
+    });
+    panes.sort(function(a, b) { return b.domain[1] - a.domain[1]; });
+    return panes;
+}
+function installIndicatorOrderButtons() {
+    const gd = getTaskPlot();
+    if (!gd || !gd._fullLayout) return;
+    const parent = gd.parentElement;
+    if (!parent) return;
+    parent.style.position = parent.style.position || 'relative';
+    parent.querySelectorAll('.chart-pane-order-buttons').forEach(function(node) { node.remove(); });
+    const panes = visibleIndicatorPanes(gd);
+    if (!panes.length) return;
+    panes.forEach(function(pane, index) {
+        const box = document.createElement('div');
+        box.className = 'chart-pane-order-buttons';
+        box.style.cssText = 'position:absolute;right:12px;z-index:20;display:flex;gap:2px;background:rgba(255,255,255,0.72);border-radius:4px;padding:1px;';
+        box.style.top = Math.max(28, Math.round((1 - pane.domain[1]) * gd.clientHeight) + 26) + 'px';
+        [['↑', -1], ['↓', 1]].forEach(function(spec) {
+            const btn = document.createElement('button');
+            btn.textContent = spec[0];
+            btn.title = 'Move ' + pane.key + (spec[1] < 0 ? ' up' : ' down');
+            btn.disabled = (spec[1] < 0 && index === 0) || (spec[1] > 0 && index === panes.length - 1);
+            btn.style.cssText = 'font-size:10px;line-height:12px;min-width:18px;padding:0 3px;border:1px solid #78909c;background:#f5f7f8;cursor:pointer;';
+            btn.addEventListener('click', function(event) {
+                event.preventDefault();
+                event.stopPropagation();
+                const order = panes.map(function(item) { return item.key; });
+                const targetIndex = index + spec[1];
+                const tmp = order[index];
+                order[index] = order[targetIndex];
+                order[targetIndex] = tmp;
+                publishIndicatorOrder(order);
+            });
+            box.appendChild(btn);
+        });
+        parent.appendChild(box);
+    });
+}
+function chartSessionVLineShapes(gd) {
+    const shapes = ((gd && gd.layout && gd.layout.shapes) || []).slice();
+    return shapes.filter(function(shape) { return shape && shape.name === 'session_vline'; });
+}
+function clearChartSessionVLines() {
+    const gd = getTaskPlot();
+    if (!gd || !window.Plotly) return;
+    const shapes = ((gd.layout && gd.layout.shapes) || []).filter(function(shape) { return !(shape && shape.name === 'session_vline'); });
+    window.Plotly.relayout(gd, {shapes: shapes});
+    traceUi('vertical session lines cleared');
+}
+function chartVLineModeEnabled() {
+    const button = document.getElementById('toggle-chart-vline-btn');
+    return !!(button && String(button.textContent || '').indexOf('On') >= 0);
+}
+function installChartVerticalLineDblClick() {
+    const gd = getTaskPlot();
+    if (!gd || gd.__chartVLineDblClickInstalled) return;
+    gd.__chartVLineDblClickInstalled = true;
+    gd.addEventListener('dblclick', function(event) {
+        if (!chartVLineModeEnabled() || !window.Plotly || !gd._fullLayout || !gd._fullLayout.xaxis) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const xa = gd._fullLayout.xaxis;
+        const rect = gd.getBoundingClientRect();
+        const pixel = event.clientX - rect.left - (xa._offset || 0);
+        if (pixel < 0 || pixel > (xa._length || gd.clientWidth)) return;
+        const xValue = xa.p2d ? xa.p2d(pixel) : null;
+        if (xValue === null || typeof xValue === 'undefined') return;
+        const shapes = ((gd.layout && gd.layout.shapes) || []).slice();
+        const existingIndex = shapes.findIndex(function(shape) {
+            if (!shape || shape.name !== 'session_vline' || !xa.d2p) return false;
+            return Math.abs(xa.d2p(shape.x0) - pixel) <= 6;
+        });
+        if (existingIndex >= 0) {
+            shapes.splice(existingIndex, 1);
+        } else {
+            shapes.push({
+                type: 'line', name: 'session_vline', xref: 'x', yref: 'paper',
+                x0: xValue, x1: xValue, y0: 0, y1: 1,
+                line: {color: '#455a64', width: 1, dash: 'dot'}, layer: 'above'
+            });
+        }
+        window.Plotly.relayout(gd, {shapes: shapes});
+        traceUi('vertical session line toggled', {count: shapes.filter(function(shape) { return shape && shape.name === 'session_vline'; }).length});
+    }, true);
+}
+function installChartPaneHelpers() {
+    installIndicatorOrderButtons();
+    installChartVerticalLineDblClick();
+}
 function flushQueuedChartActions() {
     if (chartActionFlushTimer) window.clearTimeout(chartActionFlushTimer);
     chartActionFlushTimer = null;
@@ -4151,6 +4278,7 @@ function queueChartToggleAction(buttonId, active) {
         const storeConfig = chartToggleStores[buttonId];
         if (!storeConfig || !storeConfig[0]) return false;
         window.dash_clientside.set_props(storeConfig[0], {data: Boolean(active)});
+        if (buttonId === 'toggle-chart-vline-btn' && !Boolean(active)) clearChartSessionVLines();
         traceUi('local toolbar applied', {id: buttonId, active: Boolean(active), server_request: false});
         return true;
     }
@@ -4420,6 +4548,7 @@ function installChartBrowserRenderTrace() {
                     long_task_ms: request ? Math.round(request.longTaskMs) : 0,
                     long_task_max_ms: request ? Math.round(request.longTaskMaxMs) : 0
                 });
+                installChartPaneHelpers();
                 if (!window.__gptToolbarRenderPending && window.__gptQueuedChartNavigation) {
                     const queued = window.__gptQueuedChartNavigation;
                     window.__gptQueuedChartNavigation = null;
@@ -5089,6 +5218,7 @@ async function applyFastCandleNavigationPayload(rawPayload) {
             traces: actualKeys.length
         });
         window.__gptFastPayloadApplying = false;
+        installChartPaneHelpers();
         const integrity = validateChartDiagnosticFingerprint(plot);
         traceUi('chart integrity', {
             id: (payload.meta && payload.meta.diagnostic_id) || 'fast',
@@ -5814,7 +5944,7 @@ def make_chart_ui_state(
     strategy=False, impulses=False, events=False,
     measure=False, measure_anchor=False, measure_hover=True,
     measure_oscillator_range=False, candle_info=False, oscillator_info=True,
-    oscillator_sync=False, extend_x=False, focus_entry=False,
+    oscillator_sync=False, vertical_lines=False, extend_x=False, focus_entry=False,
 ):
     return {
         "panes": {
@@ -5836,6 +5966,7 @@ def make_chart_ui_state(
         "information": {
             "candle": bool(candle_info), "oscillator": bool(oscillator_info),
             "oscillator_sync": bool(oscillator_sync),
+            "vertical_lines": bool(vertical_lines),
         },
         "viewport": {"extend_x": bool(extend_x), "focus_entry": bool(focus_entry)},
     }
@@ -5878,10 +6009,14 @@ CHART_OVERLAY_REGISTRY = {
 }
 
 
-def build_chart_indicator_specs(visibility, has_volume):
-    """Return visible pane specs in stable registry order for the figure renderer."""
+def build_chart_indicator_specs(visibility, has_volume, indicator_order=None):
+    """Return visible pane specs in stable/session-selected order for the renderer."""
     specs = []
-    for key, definition in CHART_INDICATOR_REGISTRY.items():
+    registered_keys = list(CHART_INDICATOR_REGISTRY.keys())
+    order = [key for key in (indicator_order or []) if key in CHART_INDICATOR_REGISTRY]
+    ordered_keys = order + [key for key in registered_keys if key not in order]
+    for key in ordered_keys:
+        definition = CHART_INDICATOR_REGISTRY[key]
         if not visibility.get(key, False):
             continue
         if definition["requires_volume"] and not has_volume:
@@ -5957,6 +6092,8 @@ def build_root_layout():
     dcc.Store(id="slr-visible-store", data=False),
     dcc.Store(id="mfi-visible-store", data=False),
     dcc.Store(id="vwap-visible-store", data=False),
+    dcc.Store(id="chart-vline-mode-store", data=False),
+    dcc.Store(id="chart-indicator-order-store", storage_type="session", data=[]),
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
@@ -6191,6 +6328,7 @@ def build_root_layout():
                             html.Button("SLR: Off", id="toggle-slr-btn", title="Toggle 50-bar linear regression slope percent", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
                             html.Button("MFI: Off", id="toggle-mfi-btn", title="Toggle Money Flow Index (14)", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
                             html.Button("VWAP: Off", id="toggle-vwap-btn", title="Toggle session/window VWAP", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "82px", "whiteSpace": "nowrap"}),
+                            html.Button("VLine: Off", id="toggle-chart-vline-btn", title="Double-click any chart pane to add/remove dashed vertical session lines", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "86px", "whiteSpace": "nowrap"}),
                             html.Button("Strategy: Off", id="toggle-strategy-btn", style={
                                 "background": "transparent",
                                 "color": "black",
@@ -9373,6 +9511,7 @@ _CHART_UI_STATE_PATHS = {
     "chart-info-box-store": ("information", "candle"),
     "oscillator-info-box-store": ("information", "oscillator"),
     "oscillator-sync-info-store": ("information", "oscillator_sync"),
+    "chart-vline-mode-store": ("information", "vertical_lines"),
     "chart-extend-x-store": ("viewport", "extend_x"),
     "chart-focus-entry-store": ("viewport", "focus_entry"),
 }
@@ -9613,6 +9752,7 @@ _CHART_TOGGLE_BUTTONS = {
     "toggle-slr-btn": "slr-visible-store",
     "toggle-mfi-btn": "mfi-visible-store",
     "toggle-vwap-btn": "vwap-visible-store",
+    "toggle-chart-vline-btn": "chart-vline-mode-store",
     "toggle-strategy-btn": "strategy-visible-store",
     "toggle-impulses-btn": "impulse-visible-store",
     "toggle-events-btn": "events-visible-store",
@@ -9838,6 +9978,7 @@ def _chart_toggle_button(label, enabled):
     Output("toggle-slr-btn", "children"), Output("toggle-slr-btn", "style"),
     Output("toggle-mfi-btn", "children"), Output("toggle-mfi-btn", "style"),
     Output("toggle-vwap-btn", "children"), Output("toggle-vwap-btn", "style"),
+    Output("toggle-chart-vline-btn", "children"), Output("toggle-chart-vline-btn", "style"),
     Output("toggle-strategy-btn", "children"), Output("toggle-strategy-btn", "style"),
     Output("toggle-impulses-btn", "children"), Output("toggle-impulses-btn", "style"),
     Output("toggle-events-btn", "children"), Output("toggle-events-btn", "style"),
@@ -9855,12 +9996,13 @@ def _chart_toggle_button(label, enabled):
     Input("slr-visible-store", "data"),
     Input("mfi-visible-store", "data"),
     Input("vwap-visible-store", "data"),
+    Input("chart-vline-mode-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
     prevent_initial_call=False,
 )
-def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, cci, cmf, cho, atr, cvd, slr, mfi, vwap, strategy, impulses, events):
+def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, cci, cmf, cho, atr, cvd, slr, mfi, vwap, vline, strategy, impulses, events):
     return (
         *_chart_toggle_button("RSI", rsi),
         *_chart_toggle_button("Stoch", stochastic),
@@ -9876,6 +10018,7 @@ def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, c
         *_chart_toggle_button("SLR", slr),
         *_chart_toggle_button("MFI", mfi),
         *_chart_toggle_button("VWAP", vwap),
+        *_chart_toggle_button("VLine", vline),
         *_chart_toggle_button("Strategy", strategy),
         *_chart_toggle_button("Impulses", impulses),
         *_chart_toggle_button("Events", events),
@@ -10807,7 +10950,7 @@ def load_chart_task_window(task):
     }
 
 
-def build_chart_render_model(task, chart_window, pane_visibility, event_context, ui_state=None):
+def build_chart_render_model(task, chart_window, pane_visibility, event_context, ui_state=None, indicator_order=None):
     """Make UI-only figure decisions from normalized data and source context."""
     has_volume = "volume" in chart_window["df"].columns
     source = (event_context or {}).get("source", "main_table")
@@ -10818,7 +10961,7 @@ def build_chart_render_model(task, chart_window, pane_visibility, event_context,
         "source_profile": CHART_SOURCE_PROFILES[source],
         "has_volume": has_volume,
         "ui_state": dict(ui_state or make_chart_ui_state()),
-        "indicator_specs": build_chart_indicator_specs(pane_visibility, has_volume),
+        "indicator_specs": build_chart_indicator_specs(pane_visibility, has_volume, indicator_order),
     }
 
 
@@ -11026,6 +11169,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     Input("chart-ui-action-store", "data"),
     Input("chart-event-context-store", "data"),
     Input("chart-force-full-render-store", "data"),
+    Input("chart-indicator-order-store", "data"),
     State("rsi-visible-store", "data"),
     State("stochastic-visible-store", "data"),
     State("volume-visible-store", "data"),
@@ -11052,7 +11196,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     State("chart-render-schema-store", "data"),
     prevent_initial_call=True,
 )
-def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
+def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, indicator_order, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
     if not task_id:
         return go.Figure(), None, ""
     if ctx.triggered_id == "chart-force-full-render-store":
@@ -11495,7 +11639,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     }
     timer.check("Lazy indicator preparation")
     chart_model = build_chart_render_model(
-        task, {**chart_window, "df": df}, pane_visibility, chart_event_context, chart_ui_state
+        task, {**chart_window, "df": df}, pane_visibility, chart_event_context, chart_ui_state, indicator_order
     )
     has_volume = chart_model["has_volume"]
     volume_enabled = bool(volume_visible and has_volume)
