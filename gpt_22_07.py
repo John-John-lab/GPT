@@ -9346,6 +9346,20 @@ def open_oscillator_event_chart(_clicks, requested_indices, requested_index_ids,
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict):
         return no_update, no_update, no_update, no_update, no_update, no_update
+    # Recalculating the strategy replaces the results table and inserts a new
+    # set of pattern-matching Chart buttons. Dash reports that insertion as an
+    # input change with n_clicks=0; it is not a user request to replace the
+    # chart that was already open. Only a positive click may select an event.
+    trigger_value = ctx.triggered[0].get("value") if ctx.triggered else None
+    if isinstance(trigger_value, (list, tuple)):
+        user_clicked = any(bool(value) for value in trigger_value)
+    else:
+        user_clicked = bool(trigger_value)
+    if not user_clicked:
+        interaction_trace(
+            f"ignored initial oscillator event chart input category={triggered.get('category')}"
+        )
+        return no_update, no_update, no_update, no_update, no_update, no_update
     category = triggered.get("category")
     events = (event_groups or {}).get(category) or []
     if not events:
