@@ -4453,14 +4453,20 @@ function installChartCrosshairFallback() {
         return Number.isFinite(parsed) ? parsed : null;
     }
     function nearestIndex(values, target) {
-        let best = 0, distance = Infinity;
-        (values || []).forEach(function(value, index) {
-            const stamp = asMillis(value);
-            if (stamp === null) return;
-            const nextDistance = Math.abs(stamp - target);
-            if (nextDistance < distance) { best = index; distance = nextDistance; }
-        });
-        return Number.isFinite(distance) ? best : null;
+        if (!values || !values.length || !Number.isFinite(target)) return null;
+        let low = 0, high = values.length - 1;
+        while (low < high) {
+            const middle = Math.floor((low + high) / 2);
+            const stamp = asMillis(values[middle]);
+            if (stamp === null || stamp < target) low = middle + 1;
+            else high = middle;
+        }
+        if (low <= 0) return 0;
+        const right = asMillis(values[low]);
+        const left = asMillis(values[low - 1]);
+        if (right === null) return low - 1;
+        if (left === null) return low;
+        return Math.abs(left - target) <= Math.abs(right - target) ? low - 1 : low;
     }
     document.addEventListener('mousemove', function(event) {
         const root = document.getElementById('task-chart');
@@ -4486,14 +4492,11 @@ function installChartCrosshairFallback() {
         const axisLeft = svgRect.left + Number(xaxis._offset || 0);
         const axisWidth = Math.max(1, Number(xaxis._length || rect.width));
         const axisRatio = Math.max(0, Math.min(1, (event.clientX - axisLeft) / axisWidth));
-        const nativeHover = (plot._hoverdata || []).find(function(point) {
-            const trace = point && plot.data && plot.data[point.curveNumber];
-            return trace && trace.x && trace.x.length === firstTrace.x.length;
-        });
-        const nativePointIndex = nativeHover && Number.isInteger(Number(nativeHover.pointNumber)) ? Number(nativeHover.pointNumber) : null;
-        // Prefer Plotly's own native-hover point. This is the exact point used
-        // by the immediate hover box; geometric lookup is only a fallback.
-        const index = nativePointIndex !== null ? nativePointIndex : nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
+        // Mousemove runs before Plotly refreshes `_hoverdata` when crossing
+        // from the candle pane into an oscillator pane. Reusing that stale
+        // point made Osc All show the preceding pane's timestamp. Resolve the
+        // timestamp solely from the shared x-axis geometry instead.
+        const index = nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
         if (index === null) return;
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
         const valuesByAxis = {};
@@ -4503,19 +4506,19 @@ function installChartCrosshairFallback() {
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             const name = trace && trace.name ? String(trace.name) : '';
             if (!trace || axisId === 'y' || !valueSeries || trace.visible === false || name.startsWith('_')) return;
-            // Dash may transport arrays as {dtype,bdata}; those objects are
-            // intentionally not indexable. Prefer the native hover value for
-            // this curve, then Plotly's expanded calcdata, and only then an
-            // ordinary/typed trace array.
+            // The current trace array is authoritative after Plotly.react.
+            // ScatterGL calcdata and _hoverdata may still describe the prior
+            // pointer event; use them only when Dash left a non-indexable
+            // encoded array instead of a normal/typed array.
             const hovered = (plot._hoverdata || []).find(function(point) {
                 return point && Number(point.curveNumber) === curveNumber && Number(point.pointNumber) === index;
             });
             const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][index];
-            const rawValue = hovered && hovered.y != null
-                ? hovered.y
+            const rawValue = valueSeries[index] != null
+                ? valueSeries[index]
                 : (calcPoint && calcPoint.y != null
                     ? calcPoint.y
-                    : (valueSeries[index] != null ? valueSeries[index] : null));
+                    : (hovered && hovered.y != null ? hovered.y : null));
             const value = Number(rawValue);
             const magnitude = Math.abs(value);
             const formatted = Number.isFinite(value)
@@ -9859,19 +9862,19 @@ function(figure, oscillatorSyncInfo, candleInfo) {
     }
     function findNearestPointIndex(xValues, targetMs) {
         if (!xValues || !xValues.length || targetMs === null) return null;
-        let bestIndex = 0;
-        let bestDistance = Infinity;
-        for (let i = 0; i < xValues.length; i += 1) {
-            const ms = toMillis(xValues[i]);
-            if (ms === null) continue;
-            const distance = Math.abs(ms - targetMs);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestIndex = i;
-            }
-            if (ms > targetMs && distance > bestDistance) break;
+        let low = 0, high = xValues.length - 1;
+        while (low < high) {
+            const middle = Math.floor((low + high) / 2);
+            const ms = toMillis(xValues[middle]);
+            if (ms === null || ms < targetMs) low = middle + 1;
+            else high = middle;
         }
-        return Number.isFinite(bestDistance) ? bestIndex : null;
+        if (low <= 0) return 0;
+        const right = toMillis(xValues[low]);
+        const left = toMillis(xValues[low - 1]);
+        if (right === null) return low - 1;
+        if (left === null) return low;
+        return Math.abs(left - targetMs) <= Math.abs(right - targetMs) ? low - 1 : low;
     }
     function formatOscillatorValue(value) {
         const numeric = Number(value);
@@ -9894,11 +9897,13 @@ function(figure, oscillatorSyncInfo, candleInfo) {
             if (!trace || axisId === 'y' || !trace.x || !trace.y || trace.x.length <= pointIndex || trace.visible === false || trace.visible === 'legendonly') return;
             if (traceName.startsWith('_') || traceName === 'Signal Time') return;
             if (trace.mode === 'markers' && trace.showlegend === false) return;
-            // Plotly hover reads its calculated point data, which can differ
-            // from the raw trace array after WebGL/restyle updates. Use that
-            // same authoritative value so Osc All boxes exactly match hover.
+            // Plotly.react has already replaced trace.y with the new task's
+            // authoritative values. ScatterGL calcdata may lag during hover,
+            // so consult it only if trace.y is not indexable.
             const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][pointIndex];
-            const renderedValue = calcPoint && Number.isFinite(Number(calcPoint.y)) ? calcPoint.y : trace.y[pointIndex];
+            const renderedValue = trace.y[pointIndex] != null
+                ? trace.y[pointIndex]
+                : (calcPoint && Number.isFinite(Number(calcPoint.y)) ? calcPoint.y : null);
             const value = formatOscillatorValue(renderedValue);
             if (value === null) return;
             if (!valuesByAxis[axisId]) valuesByAxis[axisId] = [];
@@ -9945,12 +9950,10 @@ function(figure, oscillatorSyncInfo, candleInfo) {
                 break;
             }
         }
-        const nativeHover = (plot._hoverdata || []).find(function(point) {
-            const trace = point && plot.data && plot.data[point.curveNumber];
-            return trace && trace.x && trace.x.length === xValues.length;
-        });
-        const nativePointIndex = nativeHover && Number.isInteger(Number(nativeHover.pointNumber)) ? Number(nativeHover.pointNumber) : null;
-        const pointIndex = nativePointIndex !== null ? nativePointIndex : findNearestPointIndex(xValues, targetMs);
+        // Do not use plot._hoverdata here: on pane transitions it still refers
+        // to the previous hover event. Geometry gives every pane the same
+        // authoritative candle index at this mouse x-coordinate.
+        const pointIndex = findNearestPointIndex(xValues, targetMs);
         if (pointIndex === null) return;
         const hoverPoints = [];
         plot.data.forEach(function(trace, curveNumber) {
