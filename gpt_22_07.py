@@ -5999,6 +5999,13 @@ CHART_INDICATOR_REGISTRY = {
     "vwap": {"requires_volume": True, "specs": (("vwap", None),)},
     "volume": {"requires_volume": True, "specs": (("volume", None),)},
 }
+# Indicator-pane maintenance checklist for future agents/AI:
+# 1) Add the pane key here with its volume requirement and trace spec.
+# 2) Add a matching Store/button/toggle entry and a lazy compute block.
+# 3) Add the trace-name to CHART_FAST_NAV_SUPPORTED_NAMES and compact payload
+#    only when the full-render trace name can be updated safely by the browser.
+# 4) Keep formulas chart-local unless a strategy explicitly consumes them.
+CHART_INDICATOR_ORDER_KEYS = tuple(CHART_INDICATOR_REGISTRY.keys())
 
 CHART_OVERLAY_REGISTRY = {
     "strategy": {"source_aware": False, "description": "Task strategy signals"},
@@ -6012,7 +6019,7 @@ CHART_OVERLAY_REGISTRY = {
 def build_chart_indicator_specs(visibility, has_volume, indicator_order=None):
     """Return visible pane specs in stable/session-selected order for the renderer."""
     specs = []
-    registered_keys = list(CHART_INDICATOR_REGISTRY.keys())
+    registered_keys = list(CHART_INDICATOR_ORDER_KEYS)
     order = [key for key in (indicator_order or []) if key in CHART_INDICATOR_REGISTRY]
     ordered_keys = order + [key for key in registered_keys if key not in order]
     for key in ordered_keys:
@@ -9470,6 +9477,13 @@ if CHART_UI_STATE_LEGACY_SYNC_ENABLED:
         Input("macd-visible-store", "data"),
         Input("disparity-visible-store", "data"),
         Input("cci-visible-store", "data"),
+        Input("cmf-visible-store", "data"),
+        Input("cho-visible-store", "data"),
+        Input("atr-visible-store", "data"),
+        Input("cvd-visible-store", "data"),
+        Input("slr-visible-store", "data"),
+        Input("mfi-visible-store", "data"),
+        Input("vwap-visible-store", "data"),
         Input("strategy-visible-store", "data"),
         Input("impulse-visible-store", "data"),
         Input("events-visible-store", "data"),
@@ -9480,6 +9494,7 @@ if CHART_UI_STATE_LEGACY_SYNC_ENABLED:
         Input("chart-info-box-store", "data"),
         Input("oscillator-info-box-store", "data"),
         Input("oscillator-sync-info-store", "data"),
+        Input("chart-vline-mode-store", "data"),
         Input("chart-extend-x-store", "data"),
         Input("chart-focus-entry-store", "data"),
         prevent_initial_call=False,
