@@ -1,5 +1,11 @@
 # Chart Development Roadmap
 
+> **AI and maintainer note:** Read the optimization decision record below
+> before proposing chart performance work. It records optimizations already
+> shipped, experiments that were rejected, and the small set of remaining
+> candidates. Do not reintroduce a rejected approach without new measurements
+> and an explicit reason.
+
 ## Purpose
 
 This document describes the next safe development steps for the chart in
@@ -10,6 +16,117 @@ trade annotations, measurement behavior, and responsive controls.
 
 The chart should be treated as a small application with explicit inputs and
 state, rather than as a collection of independently wired buttons.
+
+---
+
+## Chart Optimization Decision Record
+
+This section is the durable handoff for future maintainers and coding agents.
+The chart has already received substantial server, transport, and browser
+optimization. Read this section and inspect `git log -- gpt_22_07.py` before
+starting another performance refactor. Update this record whenever an
+experiment is accepted or rejected.
+
+### Measured baseline after the current optimization work
+
+Measurements supplied during development used 1,861 candles and up to 20
+traces. They show that same-schema navigation now spends roughly 0.30-0.64
+seconds building the compact server payload. Compressed responses are commonly
+about 235-255 KB, down from approximately 625-634 KB raw. The remaining visible
+delay is usually browser scheduling and Plotly application (roughly 0.8-3.4
+seconds), rather than indicator calculation (normally about 0.10-0.15 seconds).
+
+An authoritative chart opened from a source table intentionally still builds
+a complete figure. That path commonly takes about 2.8-3.4 seconds on the
+measured workload because it establishes the schema and trusted baseline that
+later navigation patches validate against.
+
+These figures are diagnostic baselines, not performance promises. Compare new
+work on the same machine, source, candle count, pane count, and warm/cold cache
+state.
+
+### Implemented and retained
+
+- Bounded task-window and indicator caching with source-file version
+  invalidation.
+- Lazy computation of visible indicators; strategy and indicator formulas are
+  unchanged.
+- Per-indicator WebGL switches with SVG fallbacks, so each renderer can be
+  rolled back independently.
+- A compact epoch-based time axis and removal of unnecessary dense helper
+  traces where the same visual result can be represented by layout objects.
+- A schema-tagged compact navigation payload with exact task/event checks,
+  source-context validation, gzip transport, and a full-render fallback.
+- One type-correct `Plotly.react` application for fast navigation, followed by
+  integrity validation of trace samples, signal levels, and source entry/exit
+  events.
+- Direct local navigation state updates and browser-only toolbar actions that
+  do not request a new figure.
+- Timestamp-based oscillator synchronization using binary search rather than
+  assuming that hover point indices are interchangeable across panes.
+
+### Tried and rejected: do not repeat without new evidence
+
+- **Dash `Patch` replacing complete trace objects:** the patch was frequently
+  larger and more CPU-intensive than the compact response. The old incremental
+  route remains disabled; replacing every trace is not incremental rendering.
+- **Separate candlestick restyle plus oscillator update:** reliable, but it
+  caused two expensive Plotly render passes and was slower than one react.
+- **One heterogeneous `Plotly.update` call with undefined OHLC slots:** caused
+  Plotly/ScatterGL `_inputDomain` failures. Use type-correct trace objects.
+- **Deep-copying cached Plotly figures:** copying cost roughly 1.2-2.3 seconds
+  and removed most of the expected benefit. Cache compact data/models instead.
+- **Broad or eager parquet prefetch:** reads normally cost only tens of
+  milliseconds and background work competed with foreground browser paint.
+  Any future prefetch must be bounded, idle-only, and measured end to end.
+- **Forcing oscillator defaults during every source open:** changed user UI
+  state and increased the payload. Source defaults may initialize a new
+  session, but must not overwrite explicit choices.
+- **Carrying zoom/range state between different tasks:** produced displaced or
+  apparently missing chart content. Task navigation resets data-dependent
+  ranges unless the user explicitly opts into persistence.
+- **Reading private/native hover data for the “Osc All” field:** pane hover data
+  can be stale or refer to a different trace. Resolve the shared timestamp from
+  axis geometry and look up each oscillator independently.
+- **Sending no-op toolbar callbacks:** even tiny 28-byte responses can queue
+  ahead of navigation. Pure presentation/measurement toggles remain local.
+
+### Remaining compact, maintainable opportunities
+
+1. **Dedicated compact navigation endpoint with cancellation.** Avoid Dash
+   callback scheduling for Next/Previous and cancel superseded requests with
+   `AbortController`. This is the strongest remaining candidate, but it must
+   retain source authorization, schema checks, and full-render fallback.
+2. **Small serialized-payload cache for revisits.** Key it by task, source-file
+   version, event identity, pane state, and render schema; bound it by count and
+   bytes. This can remove the remaining 0.15-0.35 second payload-build cost on
+   back/forward navigation.
+3. **Adjacent-task prefetch after idle.** Prefetch at most the previous and next
+   compact payload after `plotly_afterplot`; abort it immediately on user work.
+   Do not restore broad parquet or figure prefetch.
+4. **Explicit display-detail control.** A user-selected shorter visible window
+   or reduced detail can lower Plotly cost. Never silently downsample analysis
+   data or alter indicator/strategy calculations.
+
+The first two options are localized additions. They do not require another
+chart architecture rewrite. Beyond them, Plotly rendering of thousands of
+points across many panes is the dominant cost, so gains become smaller or
+require an explicit product tradeoff.
+
+### Guardrails for future optimization work
+
+- Preserve authoritative full rendering for a new source open.
+- Preserve schema mismatch, exception, and integrity-check fallbacks.
+- Do not change task analysis, strategy math, indicator formulas, trade-event
+  alignment, or signal levels as a performance shortcut.
+- Avoid private Plotly internals, unbounded caches, implicit downsampling,
+  binary protocols, and another broad refactor unless measured evidence shows
+  that the compact endpoint is insufficient.
+- Measure click-to-request, server build, serialization, response-to-plot, long
+  tasks, trace count, payload bytes, and integrity on the same workload.
+- Ship one optimization per commit behind an independent rollback switch.
+- Add the outcome and measurements to this record so future agents do not
+  repeat the same experiment.
 
 ---
 
@@ -335,4 +452,3 @@ A new chart feature is complete only when it:
 - is checked with JavaScript syntax validation;
 - is measured with Phase 6 tracing if it changes loading, indicators, traces,
   or figure rebuild frequency.
-
