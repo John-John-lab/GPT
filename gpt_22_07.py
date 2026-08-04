@@ -846,6 +846,13 @@ CHART_WEBGL_DISPARITY_ENABLED = os.environ.get("GPT_CHART_WEBGL_DISPARITY", "1")
 # CCI is one dense line and follows the same independently reversible WebGL
 # path as the other oscillators.
 CHART_WEBGL_CCI_ENABLED = os.environ.get("GPT_CHART_WEBGL_CCI", "1") == "1"
+CHART_WEBGL_CMF_ENABLED = os.environ.get("GPT_CHART_WEBGL_CMF", "1") == "1"
+CHART_WEBGL_CHO_ENABLED = os.environ.get("GPT_CHART_WEBGL_CHO", "1") == "1"
+CHART_WEBGL_ATR_ENABLED = os.environ.get("GPT_CHART_WEBGL_ATR", "1") == "1"
+CHART_WEBGL_CVD_ENABLED = os.environ.get("GPT_CHART_WEBGL_CVD", "1") == "1"
+CHART_WEBGL_SLR_ENABLED = os.environ.get("GPT_CHART_WEBGL_SLR", "1") == "1"
+CHART_WEBGL_MFI_ENABLED = os.environ.get("GPT_CHART_WEBGL_MFI", "1") == "1"
+CHART_WEBGL_VWAP_ENABLED = os.environ.get("GPT_CHART_WEBGL_VWAP", "1") == "1"
 # Encode dense trace timestamps as epoch milliseconds on an explicitly dated
 # Plotly axis. This avoids repeating long ISO timestamp strings in every pane.
 # Disable for an immediate compatibility rollback on an unusual Plotly bundle.
@@ -877,12 +884,13 @@ CHART_INCREMENTAL_SUPPORTED_SOURCES = frozenset({"main_table"})
 # fingerprints passed. Any schema/value/event mismatch automatically requests
 # the authoritative full figure; set GPT_CHART_FAST_CANDLE_NAV=0 to roll back.
 CHART_FAST_CANDLE_NAV_ENABLED = os.environ.get("GPT_CHART_FAST_CANDLE_NAV", "1") == "1"
-CHART_FAST_CANDLE_SCHEMA_VERSION = 4
+CHART_FAST_CANDLE_SCHEMA_VERSION = 5
 CHART_FAST_NAV_SUPPORTED_NAMES = frozenset({
     "ohlc", "measure_click_points", "rsi_14",
     "stoch_14_1_3_d", "stoch_40_1_4_d", "stoch_60_1_10_d", "stoch_300_1_10_d",
     "adx_14_1", "di_14", "macd_hist", "macd_12_26", "signal_9",
-    "dix_1_ema_50", "dix_2_ema_25", "dix_3_ema_9", "cci_20", "volume",
+    "dix_1_ema_50", "dix_2_ema_25", "dix_3_ema_9", "cci_20",
+    "cmf_20", "cho_3_10", "atr_3", "atr_30", "cvd", "slr_50", "mfi_14", "vwap", "close", "volume",
     "signal_time", "signal_time_marker",
     "dynamic_strategy_entry", "dynamic_strategy_exit",
 })
@@ -948,6 +956,34 @@ def make_chart_cci_trace(**kwargs):
     return make_chart_line_trace(CHART_WEBGL_CCI_ENABLED, **kwargs)
 
 
+def make_chart_cmf_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_CMF_ENABLED, **kwargs)
+
+
+def make_chart_cho_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_CHO_ENABLED, **kwargs)
+
+
+def make_chart_atr_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_ATR_ENABLED, **kwargs)
+
+
+def make_chart_cvd_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_CVD_ENABLED, **kwargs)
+
+
+def make_chart_slr_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_SLR_ENABLED, **kwargs)
+
+
+def make_chart_mfi_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_MFI_ENABLED, **kwargs)
+
+
+def make_chart_vwap_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_VWAP_ENABLED, **kwargs)
+
+
 def compute_chart_macd(close, fast_length=12, slow_length=26, signal_length=9):
     """Return standard MACD in the same price units as ``close``.
 
@@ -990,6 +1026,92 @@ def compute_chart_cci(high, low, close, period=20, constant=0.015):
         mean_deviation.iloc[period - 1:] = deviations
     mean_deviation = mean_deviation.replace(0, np.nan)
     return (typical_price - mean) / (float(constant) * mean_deviation)
+
+
+def compute_chart_true_range(high, low, close):
+    high = pd.Series(high, dtype="float64")
+    low = pd.Series(low, dtype="float64")
+    close = pd.Series(close, dtype="float64")
+    prev_close = close.shift(1)
+    return pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+
+
+def compute_chart_atr(high, low, close, period):
+    period = max(int(period), 1)
+    return compute_chart_true_range(high, low, close).rolling(window=period, min_periods=period).mean()
+
+
+def compute_chart_cmf(high, low, close, volume, period=20):
+    period = max(int(period), 1)
+    high = pd.Series(high, dtype="float64")
+    low = pd.Series(low, dtype="float64")
+    close = pd.Series(close, dtype="float64")
+    volume = pd.Series(volume, dtype="float64").fillna(0.0)
+    price_range = (high - low).replace(0, np.nan)
+    money_flow_volume = (((close - low) - (high - close)) / price_range).fillna(0.0) * volume
+    volume_sum = volume.rolling(window=period, min_periods=period).sum().replace(0, np.nan)
+    return money_flow_volume.rolling(window=period, min_periods=period).sum() / volume_sum
+
+
+def compute_chart_cho(high, low, close, volume, fast=3, slow=10):
+    high = pd.Series(high, dtype="float64")
+    low = pd.Series(low, dtype="float64")
+    close = pd.Series(close, dtype="float64")
+    volume = pd.Series(volume, dtype="float64").fillna(0.0)
+    price_range = (high - low).replace(0, np.nan)
+    adl_delta = (((close - low) - (high - close)) / price_range).fillna(0.0) * volume
+    adl = adl_delta.cumsum()
+    return adl.ewm(span=fast, adjust=False, min_periods=fast).mean() - adl.ewm(span=slow, adjust=False, min_periods=slow).mean()
+
+
+def compute_chart_cvd(df):
+    volume = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0.0)
+    taker_candidates = (
+        "taker_buy_base_asset_volume", "taker_buy_base_volume", "taker_buy_volume",
+        "buy_volume", "taker_buy_vol",
+    )
+    for column in taker_candidates:
+        if column in df.columns:
+            buy_volume = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+            return (buy_volume - (volume - buy_volume)).cumsum()
+    direction = np.sign(pd.to_numeric(df["close"], errors="coerce").diff()).fillna(0.0)
+    return (direction * volume).cumsum()
+
+
+def compute_chart_mfi(high, low, close, volume, period=14):
+    period = max(int(period), 1)
+    typical = (pd.Series(high, dtype="float64") + pd.Series(low, dtype="float64") + pd.Series(close, dtype="float64")) / 3.0
+    volume = pd.Series(volume, dtype="float64").fillna(0.0)
+    raw_flow = typical * volume
+    positive = raw_flow.where(typical.diff() > 0, 0.0)
+    negative = raw_flow.where(typical.diff() < 0, 0.0)
+    pos_sum = positive.rolling(window=period, min_periods=period).sum()
+    neg_sum = negative.rolling(window=period, min_periods=period).sum().replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + (pos_sum / neg_sum)))
+
+
+def compute_chart_vwap(high, low, close, volume):
+    typical = (pd.Series(high, dtype="float64") + pd.Series(low, dtype="float64") + pd.Series(close, dtype="float64")) / 3.0
+    volume = pd.Series(volume, dtype="float64").fillna(0.0)
+    cumulative_volume = volume.cumsum().replace(0, np.nan)
+    return (typical * volume).cumsum() / cumulative_volume
+
+
+def compute_chart_slr(close, period=50):
+    period = max(int(period), 2)
+    close = pd.Series(close, dtype="float64")
+    values = close.to_numpy(dtype="float64", copy=False)
+    slope = pd.Series(np.nan, index=close.index, dtype="float64")
+    if len(values) >= period:
+        x = np.arange(period, dtype="float64")
+        x_centered = x - x.mean()
+        denom = float(np.sum(x_centered ** 2))
+        windows = np.lib.stride_tricks.sliding_window_view(values, period)
+        y_centered = windows - windows.mean(axis=1)[:, None]
+        raw_slope = (y_centered @ x_centered) / denom
+        base = np.where(np.abs(windows[:, -1]) > 0, windows[:, -1], np.nan)
+        slope.iloc[period - 1:] = (raw_slope / base) * 100.0
+    return slope
 
 
 def _chart_trace_schema_key(trace, occurrence):
@@ -1203,6 +1325,15 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         "dix_2_ema_25": _chart_json_series(df["disparity_25"]) if "disparity_25" in df else None,
         "dix_3_ema_9": _chart_json_series(df["disparity_9"]) if "disparity_9" in df else None,
         "cci_20": _chart_json_series(df["cci_20"]) if "cci_20" in df else None,
+        "cmf_20": _chart_json_series(df["cmf_20"]) if "cmf_20" in df else None,
+        "cho_3_10": _chart_json_series(df["cho_3_10"]) if "cho_3_10" in df else None,
+        "atr_3": _chart_json_series(df["atr_3"]) if "atr_3" in df else None,
+        "atr_30": _chart_json_series(df["atr_30"]) if "atr_30" in df else None,
+        "cvd": _chart_json_series(df["cvd"]) if "cvd" in df else None,
+        "slr_50": _chart_json_series(df["slr_50"]) if "slr_50" in df else None,
+        "mfi_14": _chart_json_series(df["mfi_14"]) if "mfi_14" in df else None,
+        "vwap": _chart_json_series(df["vwap"]) if "vwap" in df else None,
+        "close": close_values,
         "volume": _chart_json_series(df["volume"]) if "volume" in df else None,
         "signal_time": [y_min, y_max],
         "signal_time_marker": [signal_price],
@@ -3929,6 +4060,13 @@ const chartToggleStores = {
     'toggle-macd-btn': ['macd-visible-store', false],
     'toggle-disparity-btn': ['disparity-visible-store', false],
     'toggle-cci-btn': ['cci-visible-store', false],
+    'toggle-cmf-btn': ['cmf-visible-store', false],
+    'toggle-cho-btn': ['cho-visible-store', false],
+    'toggle-atr-btn': ['atr-visible-store', false],
+    'toggle-cvd-btn': ['cvd-visible-store', false],
+    'toggle-slr-btn': ['slr-visible-store', false],
+    'toggle-mfi-btn': ['mfi-visible-store', false],
+    'toggle-vwap-btn': ['vwap-visible-store', false],
     'toggle-strategy-btn': ['strategy-visible-store', false],
     'toggle-chart-info-box-btn': ['chart-info-box-store', false],
     'toggle-oscillator-info-box-btn': ['oscillator-info-box-store', true],
@@ -3950,6 +4088,13 @@ const chartToggleActions = {
     'toggle-macd-btn': ['panes', 'macd'],
     'toggle-disparity-btn': ['panes', 'disparity'],
     'toggle-cci-btn': ['panes', 'cci'],
+    'toggle-cmf-btn': ['panes', 'cmf'],
+    'toggle-cho-btn': ['panes', 'cho'],
+    'toggle-atr-btn': ['panes', 'atr'],
+    'toggle-cvd-btn': ['panes', 'cvd'],
+    'toggle-slr-btn': ['panes', 'slr'],
+    'toggle-mfi-btn': ['panes', 'mfi'],
+    'toggle-vwap-btn': ['panes', 'vwap'],
     'toggle-strategy-btn': ['overlays', 'strategy'],
     'toggle-impulses-btn': ['overlays', 'impulses'],
     'toggle-events-btn': ['overlays', 'events'],
@@ -3968,6 +4113,7 @@ let chartActionFlushTimer = null;
 window.__gptToolbarRenderPending = false;
 const chartRenderActionPaths = new Set([
     'panes.rsi', 'panes.stochastic', 'panes.volume', 'panes.adx', 'panes.macd', 'panes.disparity', 'panes.cci',
+    'panes.cmf', 'panes.cho', 'panes.atr', 'panes.cvd', 'panes.slr', 'panes.mfi', 'panes.vwap',
     'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry'
 ]);
 function flushQueuedChartActions() {
@@ -5664,7 +5810,8 @@ def make_chart_request(task_id, context=None):
 # behavior and chart math are unchanged while later phases gain one stable API.
 def make_chart_ui_state(
     rsi=False, stochastic=False, volume=False, adx=False, macd=False,
-    disparity=False, cci=False, strategy=False, impulses=False, events=False,
+    disparity=False, cci=False, cmf=False, cho=False, atr=False, cvd=False, slr=False, mfi=False, vwap=False,
+    strategy=False, impulses=False, events=False,
     measure=False, measure_anchor=False, measure_hover=True,
     measure_oscillator_range=False, candle_info=False, oscillator_info=True,
     oscillator_sync=False, extend_x=False, focus_entry=False,
@@ -5674,6 +5821,8 @@ def make_chart_ui_state(
             "rsi": bool(rsi), "stochastic": bool(stochastic),
             "volume": bool(volume), "adx": bool(adx), "macd": bool(macd),
             "disparity": bool(disparity), "cci": bool(cci),
+            "cmf": bool(cmf), "cho": bool(cho), "atr": bool(atr),
+            "cvd": bool(cvd), "slr": bool(slr), "mfi": bool(mfi), "vwap": bool(vwap),
         },
         "overlays": {
             "strategy": bool(strategy), "impulses": bool(impulses),
@@ -5710,6 +5859,13 @@ CHART_INDICATOR_REGISTRY = {
     "macd": {"requires_volume": False, "specs": (("macd", None),)},
     "disparity": {"requires_volume": False, "specs": (("disparity", None),)},
     "cci": {"requires_volume": False, "specs": (("cci", None),)},
+    "cmf": {"requires_volume": True, "specs": (("cmf", None),)},
+    "cho": {"requires_volume": True, "specs": (("cho", None),)},
+    "atr": {"requires_volume": False, "specs": (("atr", None),)},
+    "cvd": {"requires_volume": True, "specs": (("cvd", None),)},
+    "slr": {"requires_volume": False, "specs": (("slr", None),)},
+    "mfi": {"requires_volume": True, "specs": (("mfi", None),)},
+    "vwap": {"requires_volume": True, "specs": (("vwap", None),)},
     "volume": {"requires_volume": True, "specs": (("volume", None),)},
 }
 
@@ -5794,6 +5950,13 @@ def build_root_layout():
     dcc.Store(id="macd-visible-store", data=False),  # default: MACD hidden
     dcc.Store(id="disparity-visible-store", data=False),  # default: CMOa Disparity Index hidden
     dcc.Store(id="cci-visible-store", data=False),  # default: CCI momentum hidden
+    dcc.Store(id="cmf-visible-store", data=False),
+    dcc.Store(id="cho-visible-store", data=False),
+    dcc.Store(id="atr-visible-store", data=False),
+    dcc.Store(id="cvd-visible-store", data=False),
+    dcc.Store(id="slr-visible-store", data=False),
+    dcc.Store(id="mfi-visible-store", data=False),
+    dcc.Store(id="vwap-visible-store", data=False),
     dcc.Store(id="strategy-visible-store", data=False),
     # ---- Measurement tool stores ----
     dcc.Store(id="measure-mode-store", data=False),
@@ -6021,6 +6184,13 @@ def build_root_layout():
                                 "minWidth": "76px",
                                 "whiteSpace": "nowrap"
                             }),
+                            html.Button("CMF: Off", id="toggle-cmf-btn", title="Toggle Chaikin Money Flow (20)", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
+                            html.Button("CHO: Off", id="toggle-cho-btn", title="Toggle Chaikin Oscillator (3/10)", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
+                            html.Button("ATR: Off", id="toggle-atr-btn", title="Toggle ATR 3 and ATR 30", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
+                            html.Button("CVD: Off", id="toggle-cvd-btn", title="Toggle cumulative volume delta; uses Bybit taker-buy volume when present, otherwise close-direction volume", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
+                            html.Button("SLR: Off", id="toggle-slr-btn", title="Toggle 50-bar linear regression slope percent", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
+                            html.Button("MFI: Off", id="toggle-mfi-btn", title="Toggle Money Flow Index (14)", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
+                            html.Button("VWAP: Off", id="toggle-vwap-btn", title="Toggle session/window VWAP", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "82px", "whiteSpace": "nowrap"}),
                             html.Button("Strategy: Off", id="toggle-strategy-btn", style={
                                 "background": "transparent",
                                 "color": "black",
@@ -9186,6 +9356,13 @@ _CHART_UI_STATE_PATHS = {
     "macd-visible-store": ("panes", "macd"),
     "disparity-visible-store": ("panes", "disparity"),
     "cci-visible-store": ("panes", "cci"),
+    "cmf-visible-store": ("panes", "cmf"),
+    "cho-visible-store": ("panes", "cho"),
+    "atr-visible-store": ("panes", "atr"),
+    "cvd-visible-store": ("panes", "cvd"),
+    "slr-visible-store": ("panes", "slr"),
+    "mfi-visible-store": ("panes", "mfi"),
+    "vwap-visible-store": ("panes", "vwap"),
     "strategy-visible-store": ("overlays", "strategy"),
     "impulse-visible-store": ("overlays", "impulses"),
     "events-visible-store": ("overlays", "events"),
@@ -9225,6 +9402,13 @@ _CHART_RENDER_ACTION_PATHS = {
     ("panes", "macd"): "macd_visible",
     ("panes", "disparity"): "disparity_visible",
     ("panes", "cci"): "cci_visible",
+    ("panes", "cmf"): "cmf_visible",
+    ("panes", "cho"): "cho_visible",
+    ("panes", "atr"): "atr_visible",
+    ("panes", "cvd"): "cvd_visible",
+    ("panes", "slr"): "slr_visible",
+    ("panes", "mfi"): "mfi_visible",
+    ("panes", "vwap"): "vwap_visible",
     ("overlays", "strategy"): "strategy_visible",
     ("overlays", "impulses"): "impulse_visible",
     ("overlays", "events"): "events_visible",
@@ -9422,6 +9606,13 @@ _CHART_TOGGLE_BUTTONS = {
     "toggle-macd-btn": "macd-visible-store",
     "toggle-disparity-btn": "disparity-visible-store",
     "toggle-cci-btn": "cci-visible-store",
+    "toggle-cmf-btn": "cmf-visible-store",
+    "toggle-cho-btn": "cho-visible-store",
+    "toggle-atr-btn": "atr-visible-store",
+    "toggle-cvd-btn": "cvd-visible-store",
+    "toggle-slr-btn": "slr-visible-store",
+    "toggle-mfi-btn": "mfi-visible-store",
+    "toggle-vwap-btn": "vwap-visible-store",
     "toggle-strategy-btn": "strategy-visible-store",
     "toggle-impulses-btn": "impulse-visible-store",
     "toggle-events-btn": "events-visible-store",
@@ -9640,6 +9831,13 @@ def _chart_toggle_button(label, enabled):
     Output("toggle-macd-btn", "children"), Output("toggle-macd-btn", "style"),
     Output("toggle-disparity-btn", "children"), Output("toggle-disparity-btn", "style"),
     Output("toggle-cci-btn", "children"), Output("toggle-cci-btn", "style"),
+    Output("toggle-cmf-btn", "children"), Output("toggle-cmf-btn", "style"),
+    Output("toggle-cho-btn", "children"), Output("toggle-cho-btn", "style"),
+    Output("toggle-atr-btn", "children"), Output("toggle-atr-btn", "style"),
+    Output("toggle-cvd-btn", "children"), Output("toggle-cvd-btn", "style"),
+    Output("toggle-slr-btn", "children"), Output("toggle-slr-btn", "style"),
+    Output("toggle-mfi-btn", "children"), Output("toggle-mfi-btn", "style"),
+    Output("toggle-vwap-btn", "children"), Output("toggle-vwap-btn", "style"),
     Output("toggle-strategy-btn", "children"), Output("toggle-strategy-btn", "style"),
     Output("toggle-impulses-btn", "children"), Output("toggle-impulses-btn", "style"),
     Output("toggle-events-btn", "children"), Output("toggle-events-btn", "style"),
@@ -9650,12 +9848,19 @@ def _chart_toggle_button(label, enabled):
     Input("macd-visible-store", "data"),
     Input("disparity-visible-store", "data"),
     Input("cci-visible-store", "data"),
+    Input("cmf-visible-store", "data"),
+    Input("cho-visible-store", "data"),
+    Input("atr-visible-store", "data"),
+    Input("cvd-visible-store", "data"),
+    Input("slr-visible-store", "data"),
+    Input("mfi-visible-store", "data"),
+    Input("vwap-visible-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
     prevent_initial_call=False,
 )
-def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, cci, strategy, impulses, events):
+def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, cci, cmf, cho, atr, cvd, slr, mfi, vwap, strategy, impulses, events):
     return (
         *_chart_toggle_button("RSI", rsi),
         *_chart_toggle_button("Stoch", stochastic),
@@ -9664,6 +9869,13 @@ def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, c
         *_chart_toggle_button("MACD", macd),
         *_chart_toggle_button("DIX", disparity),
         *_chart_toggle_button("CCI", cci),
+        *_chart_toggle_button("CMF", cmf),
+        *_chart_toggle_button("CHO", cho),
+        *_chart_toggle_button("ATR", atr),
+        *_chart_toggle_button("CVD", cvd),
+        *_chart_toggle_button("SLR", slr),
+        *_chart_toggle_button("MFI", mfi),
+        *_chart_toggle_button("VWAP", vwap),
         *_chart_toggle_button("Strategy", strategy),
         *_chart_toggle_button("Impulses", impulses),
         *_chart_toggle_button("Events", events),
@@ -10821,6 +11033,13 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     State("macd-visible-store", "data"),
     State("disparity-visible-store", "data"),
     State("cci-visible-store", "data"),
+    State("cmf-visible-store", "data"),
+    State("cho-visible-store", "data"),
+    State("atr-visible-store", "data"),
+    State("cvd-visible-store", "data"),
+    State("slr-visible-store", "data"),
+    State("mfi-visible-store", "data"),
+    State("vwap-visible-store", "data"),
     State("strategy-visible-store", "data"),
     State("impulse-visible-store", "data"),
     State("events-visible-store", "data"),
@@ -10833,7 +11052,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     State("chart-render-schema-store", "data"),
     prevent_initial_call=True,
 )
-def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
+def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
     if not task_id:
         return go.Figure(), None, ""
     if ctx.triggered_id == "chart-force-full-render-store":
@@ -10851,6 +11070,13 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         "macd_visible": macd_visible,
         "disparity_visible": disparity_visible,
         "cci_visible": cci_visible,
+        "cmf_visible": cmf_visible,
+        "cho_visible": cho_visible,
+        "atr_visible": atr_visible,
+        "cvd_visible": cvd_visible,
+        "slr_visible": slr_visible,
+        "mfi_visible": mfi_visible,
+        "vwap_visible": vwap_visible,
         "strategy_visible": strategy_visible,
         "impulse_visible": impulse_visible,
         "events_visible": events_visible,
@@ -10865,6 +11091,13 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     macd_visible = render_values["macd_visible"]
     disparity_visible = render_values["disparity_visible"]
     cci_visible = render_values["cci_visible"]
+    cmf_visible = render_values["cmf_visible"]
+    cho_visible = render_values["cho_visible"]
+    atr_visible = render_values["atr_visible"]
+    cvd_visible = render_values["cvd_visible"]
+    slr_visible = render_values["slr_visible"]
+    mfi_visible = render_values["mfi_visible"]
+    vwap_visible = render_values["vwap_visible"]
     strategy_visible = render_values["strategy_visible"]
     impulse_visible = render_values["impulse_visible"]
     events_visible = render_values["events_visible"]
@@ -11115,6 +11348,52 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         target_fig.add_hline(y=0, line_dash="dot", line_color="#999", row=row, col=1)
         target_fig.update_yaxes(title_text="CCI (20)", tickformat=".4~g", row=row, col=1)
 
+    def add_cmf_trace(target_fig, row):
+        values = df['cmf_20']
+        target_fig.add_trace(make_chart_cmf_trace(x=trace_x, y=values, mode='lines', name='CMF 20',
+            line=dict(color='#00695c', width=1.4), connectgaps=True, hovertemplate='CMF 20: %{y:.4f}<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=0, line_dash="dot", line_color="#999", row=row, col=1)
+        target_fig.update_yaxes(title_text="CMF (20)", tickformat=".4~g", row=row, col=1)
+
+    def add_cho_trace(target_fig, row):
+        target_fig.add_trace(make_chart_cho_trace(x=trace_x, y=df['cho_3_10'], mode='lines', name='CHO 3/10',
+            line=dict(color='#ad1457', width=1.4), connectgaps=True, hovertemplate='CHO 3/10: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=0, line_dash="dot", line_color="#999", row=row, col=1)
+        target_fig.update_yaxes(title_text="Chaikin Osc", tickformat=".6~g", row=row, col=1)
+
+    def add_atr_trace(target_fig, row):
+        target_fig.add_trace(make_chart_atr_trace(x=trace_x, y=df['atr_3'], mode='lines', name='ATR 3',
+            line=dict(color='#ef6c00', width=1.3), connectgaps=True, hovertemplate='ATR 3: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_atr_trace(x=trace_x, y=df['atr_30'], mode='lines', name='ATR 30',
+            line=dict(color='#1565c0', width=1.3), connectgaps=True, hovertemplate='ATR 30: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.update_yaxes(title_text="ATR", tickformat=".6~g", row=row, col=1)
+
+    def add_cvd_trace(target_fig, row):
+        target_fig.add_trace(make_chart_cvd_trace(x=trace_x, y=df['cvd'], mode='lines', name='CVD',
+            line=dict(color='#5d4037', width=1.3), connectgaps=True, hovertemplate='CVD: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=0, line_dash="dot", line_color="#999", row=row, col=1)
+        target_fig.update_yaxes(title_text="CVD", tickformat=".6~g", row=row, col=1)
+
+    def add_slr_trace(target_fig, row):
+        target_fig.add_trace(make_chart_slr_trace(x=trace_x, y=df['slr_50'], mode='lines', name='SLR 50',
+            line=dict(color='#4527a0', width=1.3), connectgaps=True, hovertemplate='SLR 50: %{y:.4f}%<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=0, line_dash="dot", line_color="#999", row=row, col=1)
+        target_fig.update_yaxes(title_text="SLR %", tickformat=".4~g", row=row, col=1)
+
+    def add_mfi_trace(target_fig, row):
+        target_fig.add_trace(make_chart_mfi_trace(x=trace_x, y=df['mfi_14'], mode='lines', name='MFI 14',
+            line=dict(color='#2e7d32', width=1.3), connectgaps=True, hovertemplate='MFI 14: %{y:.2f}<extra></extra>'), row=row, col=1)
+        target_fig.add_hline(y=80, line_dash="dash", line_color="red", row=row, col=1)
+        target_fig.add_hline(y=20, line_dash="dash", line_color="green", row=row, col=1)
+        target_fig.update_yaxes(title_text="MFI (14)", range=[0, 100], tickformat=".4~g", row=row, col=1)
+
+    def add_vwap_trace(target_fig, row):
+        target_fig.add_trace(make_chart_vwap_trace(x=trace_x, y=df['vwap'], mode='lines', name='VWAP',
+            line=dict(color='#00897b', width=1.5), connectgaps=True, hovertemplate='VWAP: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.add_trace(make_chart_vwap_trace(x=trace_x, y=df['close'], mode='lines', name='Close',
+            line=dict(color='#90a4ae', width=0.9), connectgaps=True, hovertemplate='Close: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.update_yaxes(title_text="VWAP", tickformat=".6~g", row=row, col=1)
+
     # Low-spec chart cache: cache the period view and compute indicator columns
     # lazily.  Left/right chart navigation often uses only candles; computing
     # every oscillator on every newly opened task made navigation feel slow.
@@ -11176,12 +11455,43 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if cci_visible and not cci_cached:
         df['cci_20'] = compute_chart_cci(df['high'], df['low'], df['close'], 20)
     trace_chart_phase("indicator_cci", enabled=bool(cci_visible), cached=cci_cached)
+    cmf_cached = 'cmf_20' in df.columns
+    if cmf_visible and has_volume and not cmf_cached:
+        df['cmf_20'] = compute_chart_cmf(df['high'], df['low'], df['close'], df['volume'], 20)
+    trace_chart_phase("indicator_cmf", enabled=bool(cmf_visible and has_volume), cached=cmf_cached)
+    cho_cached = 'cho_3_10' in df.columns
+    if cho_visible and has_volume and not cho_cached:
+        df['cho_3_10'] = compute_chart_cho(df['high'], df['low'], df['close'], df['volume'], 3, 10)
+    trace_chart_phase("indicator_cho", enabled=bool(cho_visible and has_volume), cached=cho_cached)
+    atr_cached = {'atr_3', 'atr_30'}.issubset(df.columns)
+    if atr_visible and not atr_cached:
+        df['atr_3'] = compute_chart_atr(df['high'], df['low'], df['close'], 3)
+        df['atr_30'] = compute_chart_atr(df['high'], df['low'], df['close'], 30)
+    trace_chart_phase("indicator_atr", enabled=bool(atr_visible), cached=atr_cached)
+    cvd_cached = 'cvd' in df.columns
+    if cvd_visible and has_volume and not cvd_cached:
+        df['cvd'] = compute_chart_cvd(df)
+    trace_chart_phase("indicator_cvd", enabled=bool(cvd_visible and has_volume), cached=cvd_cached)
+    slr_cached = 'slr_50' in df.columns
+    if slr_visible and not slr_cached:
+        df['slr_50'] = compute_chart_slr(df['close'], 50)
+    trace_chart_phase("indicator_slr", enabled=bool(slr_visible), cached=slr_cached)
+    mfi_cached = 'mfi_14' in df.columns
+    if mfi_visible and has_volume and not mfi_cached:
+        df['mfi_14'] = compute_chart_mfi(df['high'], df['low'], df['close'], df['volume'], 14)
+    trace_chart_phase("indicator_mfi", enabled=bool(mfi_visible and has_volume), cached=mfi_cached)
+    vwap_cached = 'vwap' in df.columns
+    if vwap_visible and has_volume and not vwap_cached:
+        df['vwap'] = compute_chart_vwap(df['high'], df['low'], df['close'], df['volume'])
+    trace_chart_phase("indicator_vwap", enabled=bool(vwap_visible and has_volume), cached=vwap_cached)
     # Build a UI/render model after lazy calculations. This preserves the
     # existing formulas while separating source/data decisions from rendering.
     pane_visibility = {
         "rsi": rsi_visible, "stochastic": stochastic_visible,
         "volume": volume_visible, "adx": adx_visible, "macd": macd_visible,
         "disparity": disparity_visible, "cci": cci_visible,
+        "cmf": cmf_visible, "cho": cho_visible, "atr": atr_visible,
+        "cvd": cvd_visible, "slr": slr_visible, "mfi": mfi_visible, "vwap": vwap_visible,
     }
     timer.check("Lazy indicator preparation")
     chart_model = build_chart_render_model(
@@ -11268,6 +11578,20 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             add_disparity_trace(fig, current_row)
         elif indicator_type == "cci":
             add_cci_trace(fig, current_row)
+        elif indicator_type == "cmf":
+            add_cmf_trace(fig, current_row)
+        elif indicator_type == "cho":
+            add_cho_trace(fig, current_row)
+        elif indicator_type == "atr":
+            add_atr_trace(fig, current_row)
+        elif indicator_type == "cvd":
+            add_cvd_trace(fig, current_row)
+        elif indicator_type == "slr":
+            add_slr_trace(fig, current_row)
+        elif indicator_type == "mfi":
+            add_mfi_trace(fig, current_row)
+        elif indicator_type == "vwap":
+            add_vwap_trace(fig, current_row)
         elif indicator_type == "volume":
             add_volume_trace(fig, row=current_row)
         current_row += 1
