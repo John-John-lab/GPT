@@ -6070,7 +6070,10 @@ def build_chart_indicator_specs(visibility, has_volume, indicator_order=None, co
     """Return visible pane specs in stable/session-selected order for the renderer."""
     specs = []
     registered_keys = list(CHART_INDICATOR_ORDER_KEYS)
-    column_set = set(columns or ())
+    # ``columns`` is usually a pandas Index. Do not use ``columns or ()`` here:
+    # pandas Index truthiness raises ``ValueError: The truth value of a Index is
+    # ambiguous`` and aborts the chart callback before Plotly can render.
+    column_set = set(columns) if columns is not None else set()
     order = [key for key in (indicator_order or []) if key in CHART_INDICATOR_REGISTRY]
     ordered_keys = order + [key for key in registered_keys if key not in order]
     for key in ordered_keys:
