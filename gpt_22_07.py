@@ -853,6 +853,7 @@ CHART_WEBGL_CVD_ENABLED = os.environ.get("GPT_CHART_WEBGL_CVD", "1") == "1"
 CHART_WEBGL_SLR_ENABLED = os.environ.get("GPT_CHART_WEBGL_SLR", "1") == "1"
 CHART_WEBGL_MFI_ENABLED = os.environ.get("GPT_CHART_WEBGL_MFI", "1") == "1"
 CHART_WEBGL_VWAP_ENABLED = os.environ.get("GPT_CHART_WEBGL_VWAP", "1") == "1"
+CHART_WEBGL_OPEN_INTEREST_ENABLED = os.environ.get("GPT_CHART_WEBGL_OPEN_INTEREST", "1") == "1"
 # Encode dense trace timestamps as epoch milliseconds on an explicitly dated
 # Plotly axis. This avoids repeating long ISO timestamp strings in every pane.
 # Disable for an immediate compatibility rollback on an unusual Plotly bundle.
@@ -890,7 +891,7 @@ CHART_FAST_NAV_SUPPORTED_NAMES = frozenset({
     "stoch_14_1_3_d", "stoch_40_1_4_d", "stoch_60_1_10_d", "stoch_300_1_10_d",
     "adx_14_1", "di_14", "macd_hist", "macd_12_26", "signal_9",
     "dix_1_ema_50", "dix_2_ema_25", "dix_3_ema_9", "cci_20",
-    "cmf_20", "cho_3_10", "atr_3", "atr_30", "cvd", "slr_50", "mfi_14", "vwap", "close", "volume",
+    "cmf_20", "cho_3_10", "atr_3", "atr_30", "cvd", "slr_50", "mfi_14", "vwap", "open_interest", "close", "volume",
     "signal_time", "signal_time_marker",
     "dynamic_strategy_entry", "dynamic_strategy_exit",
 })
@@ -982,6 +983,10 @@ def make_chart_mfi_trace(**kwargs):
 
 def make_chart_vwap_trace(**kwargs):
     return make_chart_line_trace(CHART_WEBGL_VWAP_ENABLED, **kwargs)
+
+
+def make_chart_open_interest_trace(**kwargs):
+    return make_chart_line_trace(CHART_WEBGL_OPEN_INTEREST_ENABLED, **kwargs)
 
 
 def compute_chart_macd(close, fast_length=12, slow_length=26, signal_length=9):
@@ -1112,6 +1117,18 @@ def compute_chart_slr(close, period=50):
         base = np.where(np.abs(windows[:, -1]) > 0, windows[:, -1], np.nan)
         slope.iloc[period - 1:] = (raw_slope / base) * 100.0
     return slope
+
+
+def resolve_chart_open_interest_series(df):
+    """Return an open-interest series if this feed provides one."""
+    candidates = (
+        "open_interest", "openInterest", "open_interest_value",
+        "openInterestValue", "oi", "sumOpenInterest", "sum_open_interest",
+    )
+    for column in candidates:
+        if column in df.columns:
+            return pd.to_numeric(df[column], errors="coerce"), column
+    return None, None
 
 
 def _chart_trace_schema_key(trace, occurrence):
@@ -1333,6 +1350,7 @@ def build_fast_candle_navigation_payload(task, task_id, symbol, df, current_sche
         "slr_50": _chart_json_series(df["slr_50"]) if "slr_50" in df else None,
         "mfi_14": _chart_json_series(df["mfi_14"]) if "mfi_14" in df else None,
         "vwap": _chart_json_series(df["vwap"]) if "vwap" in df else None,
+        "open_interest": _chart_json_series(df["open_interest"]) if "open_interest" in df else None,
         "close": close_values,
         "volume": _chart_json_series(df["volume"]) if "volume" in df else None,
         "signal_time": [y_min, y_max],
@@ -4067,6 +4085,7 @@ const chartToggleStores = {
     'toggle-slr-btn': ['slr-visible-store', false],
     'toggle-mfi-btn': ['mfi-visible-store', false],
     'toggle-vwap-btn': ['vwap-visible-store', false],
+    'toggle-open-interest-btn': ['open-interest-visible-store', false],
     'toggle-chart-vline-btn': ['chart-vline-mode-store', false],
     'toggle-strategy-btn': ['strategy-visible-store', false],
     'toggle-chart-info-box-btn': ['chart-info-box-store', false],
@@ -4096,6 +4115,7 @@ const chartToggleActions = {
     'toggle-slr-btn': ['panes', 'slr'],
     'toggle-mfi-btn': ['panes', 'mfi'],
     'toggle-vwap-btn': ['panes', 'vwap'],
+    'toggle-open-interest-btn': ['panes', 'open_interest'],
     'toggle-chart-vline-btn': ['information', 'vertical_lines'],
     'toggle-strategy-btn': ['overlays', 'strategy'],
     'toggle-impulses-btn': ['overlays', 'impulses'],
@@ -4115,18 +4135,18 @@ let chartActionFlushTimer = null;
 window.__gptToolbarRenderPending = false;
 const chartRenderActionPaths = new Set([
     'panes.rsi', 'panes.stochastic', 'panes.volume', 'panes.adx', 'panes.macd', 'panes.disparity', 'panes.cci',
-    'panes.cmf', 'panes.cho', 'panes.atr', 'panes.cvd', 'panes.slr', 'panes.mfi', 'panes.vwap',
+    'panes.cmf', 'panes.cho', 'panes.atr', 'panes.cvd', 'panes.slr', 'panes.mfi', 'panes.vwap', 'panes.open_interest',
     'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry'
 ]);
 const chartPaneOrderRegistry = [
     'rsi', 'stochastic', 'volume', 'adx', 'macd', 'disparity', 'cci',
-    'cmf', 'cho', 'atr', 'cvd', 'slr', 'mfi', 'vwap'
+    'cmf', 'cho', 'atr', 'cvd', 'slr', 'mfi', 'vwap', 'open_interest'
 ];
 const chartPaneTitleKeys = {
-    'rsi (14)': 'rsi', 'stochastic': 'stochastic', 'volume': 'volume',
+    'rsi': 'rsi', 'rsi (14)': 'rsi', 'stoch 14/1/3': 'stochastic', 'stoch 40/1/4': 'stochastic', 'stoch 60/1/10': 'stochastic', 'stoch 300/1/10': 'stochastic', 'stochastic': 'stochastic', 'volume': 'volume',
     'adx / di': 'adx', 'macd (price units)': 'macd', 'cmoa dix': 'disparity',
     'cci (20)': 'cci', 'cmf (20)': 'cmf', 'chaikin osc': 'cho', 'atr': 'atr',
-    'cvd': 'cvd', 'slr %': 'slr', 'mfi (14)': 'mfi', 'vwap': 'vwap'
+    'cvd': 'cvd', 'slr %': 'slr', 'mfi (14)': 'mfi', 'vwap': 'vwap', 'open interest': 'open_interest'
 };
 function getTaskPlot() {
     const holder = document.getElementById('task-chart');
@@ -4205,7 +4225,7 @@ function clearChartSessionVLines() {
 }
 function chartVLineModeEnabled() {
     const button = document.getElementById('toggle-chart-vline-btn');
-    return !!(button && String(button.textContent || '').indexOf('On') >= 0);
+    return Boolean(chartToggleState['toggle-chart-vline-btn']) || !!(button && String(button.textContent || '').indexOf('On') >= 0);
 }
 function installChartVerticalLineDblClick() {
     const gd = getTaskPlot();
@@ -4215,16 +4235,28 @@ function installChartVerticalLineDblClick() {
         if (!chartVLineModeEnabled() || !window.Plotly || !gd._fullLayout || !gd._fullLayout.xaxis) return;
         event.preventDefault();
         event.stopPropagation();
+        if (event.stopImmediatePropagation) event.stopImmediatePropagation();
         const xa = gd._fullLayout.xaxis;
         const rect = gd.getBoundingClientRect();
         const pixel = event.clientX - rect.left - (xa._offset || 0);
         if (pixel < 0 || pixel > (xa._length || gd.clientWidth)) return;
-        const xValue = xa.p2d ? xa.p2d(pixel) : null;
+        let xValue = null;
+        if (xa.p2d) xValue = xa.p2d(pixel);
+        else if (xa.p2l && xa.l2d) xValue = xa.l2d(xa.p2l(pixel));
+        else if (Array.isArray(xa.range) && xa.range.length >= 2) {
+            const start = Date.parse(xa.range[0]);
+            const end = Date.parse(xa.range[1]);
+            if (Number.isFinite(start) && Number.isFinite(end)) xValue = new Date(start + (end - start) * (pixel / (xa._length || gd.clientWidth))).toISOString();
+        }
         if (xValue === null || typeof xValue === 'undefined') return;
         const shapes = ((gd.layout && gd.layout.shapes) || []).slice();
         const existingIndex = shapes.findIndex(function(shape) {
-            if (!shape || shape.name !== 'session_vline' || !xa.d2p) return false;
-            return Math.abs(xa.d2p(shape.x0) - pixel) <= 6;
+            if (!shape || shape.name !== 'session_vline') return false;
+            let shapePixel = null;
+            if (xa.d2p) shapePixel = xa.d2p(shape.x0);
+            else if (xa.d2l && xa.l2p) shapePixel = xa.l2p(xa.d2l(shape.x0));
+            if (!Number.isFinite(shapePixel)) return false;
+            return Math.abs(shapePixel - pixel) <= 6;
         });
         if (existingIndex >= 0) {
             shapes.splice(existingIndex, 1);
@@ -5940,7 +5972,7 @@ def make_chart_request(task_id, context=None):
 # behavior and chart math are unchanged while later phases gain one stable API.
 def make_chart_ui_state(
     rsi=False, stochastic=False, volume=False, adx=False, macd=False,
-    disparity=False, cci=False, cmf=False, cho=False, atr=False, cvd=False, slr=False, mfi=False, vwap=False,
+    disparity=False, cci=False, cmf=False, cho=False, atr=False, cvd=False, slr=False, mfi=False, vwap=False, open_interest=False,
     strategy=False, impulses=False, events=False,
     measure=False, measure_anchor=False, measure_hover=True,
     measure_oscillator_range=False, candle_info=False, oscillator_info=True,
@@ -5953,6 +5985,7 @@ def make_chart_ui_state(
             "disparity": bool(disparity), "cci": bool(cci),
             "cmf": bool(cmf), "cho": bool(cho), "atr": bool(atr),
             "cvd": bool(cvd), "slr": bool(slr), "mfi": bool(mfi), "vwap": bool(vwap),
+            "open_interest": bool(open_interest),
         },
         "overlays": {
             "strategy": bool(strategy), "impulses": bool(impulses),
@@ -5997,6 +6030,11 @@ CHART_INDICATOR_REGISTRY = {
     "slr": {"requires_volume": False, "specs": (("slr", None),)},
     "mfi": {"requires_volume": True, "specs": (("mfi", None),)},
     "vwap": {"requires_volume": True, "specs": (("vwap", None),)},
+    "open_interest": {
+        "requires_volume": False,
+        "requires_any_column": ("open_interest", "openInterest", "open_interest_value", "openInterestValue", "oi", "sumOpenInterest", "sum_open_interest"),
+        "specs": (("open_interest", None),),
+    },
     "volume": {"requires_volume": True, "specs": (("volume", None),)},
 }
 # Indicator-pane maintenance checklist for future agents/AI:
@@ -6016,10 +6054,11 @@ CHART_OVERLAY_REGISTRY = {
 }
 
 
-def build_chart_indicator_specs(visibility, has_volume, indicator_order=None):
+def build_chart_indicator_specs(visibility, has_volume, indicator_order=None, columns=None):
     """Return visible pane specs in stable/session-selected order for the renderer."""
     specs = []
     registered_keys = list(CHART_INDICATOR_ORDER_KEYS)
+    column_set = set(columns or ())
     order = [key for key in (indicator_order or []) if key in CHART_INDICATOR_REGISTRY]
     ordered_keys = order + [key for key in registered_keys if key not in order]
     for key in ordered_keys:
@@ -6027,6 +6066,9 @@ def build_chart_indicator_specs(visibility, has_volume, indicator_order=None):
         if not visibility.get(key, False):
             continue
         if definition["requires_volume"] and not has_volume:
+            continue
+        required_any = definition.get("requires_any_column") or ()
+        if required_any and not any(column in column_set for column in required_any):
             continue
         specs.extend(definition["specs"])
     return specs
@@ -6099,6 +6141,7 @@ def build_root_layout():
     dcc.Store(id="slr-visible-store", data=False),
     dcc.Store(id="mfi-visible-store", data=False),
     dcc.Store(id="vwap-visible-store", data=False),
+    dcc.Store(id="open-interest-visible-store", data=False),
     dcc.Store(id="chart-vline-mode-store", data=False),
     dcc.Store(id="chart-indicator-order-store", storage_type="session", data=[]),
     dcc.Store(id="strategy-visible-store", data=False),
@@ -6335,6 +6378,7 @@ def build_root_layout():
                             html.Button("SLR: Off", id="toggle-slr-btn", title="Toggle 50-bar linear regression slope percent", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
                             html.Button("MFI: Off", id="toggle-mfi-btn", title="Toggle Money Flow Index (14)", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
                             html.Button("VWAP: Off", id="toggle-vwap-btn", title="Toggle session/window VWAP", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "82px", "whiteSpace": "nowrap"}),
+                            html.Button("OI: Off", id="toggle-open-interest-btn", title="Toggle Open Interest when the parquet/feed provides an open-interest column", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
                             html.Button("VLine: Off", id="toggle-chart-vline-btn", title="Double-click any chart pane to add/remove dashed vertical session lines", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "86px", "whiteSpace": "nowrap"}),
                             html.Button("Strategy: Off", id="toggle-strategy-btn", style={
                                 "background": "transparent",
@@ -9484,6 +9528,7 @@ if CHART_UI_STATE_LEGACY_SYNC_ENABLED:
         Input("slr-visible-store", "data"),
         Input("mfi-visible-store", "data"),
         Input("vwap-visible-store", "data"),
+        Input("open-interest-visible-store", "data"),
         Input("strategy-visible-store", "data"),
         Input("impulse-visible-store", "data"),
         Input("events-visible-store", "data"),
@@ -9516,6 +9561,7 @@ _CHART_UI_STATE_PATHS = {
     "slr-visible-store": ("panes", "slr"),
     "mfi-visible-store": ("panes", "mfi"),
     "vwap-visible-store": ("panes", "vwap"),
+    "open-interest-visible-store": ("panes", "open_interest"),
     "strategy-visible-store": ("overlays", "strategy"),
     "impulse-visible-store": ("overlays", "impulses"),
     "events-visible-store": ("overlays", "events"),
@@ -9563,6 +9609,7 @@ _CHART_RENDER_ACTION_PATHS = {
     ("panes", "slr"): "slr_visible",
     ("panes", "mfi"): "mfi_visible",
     ("panes", "vwap"): "vwap_visible",
+    ("panes", "open_interest"): "open_interest_visible",
     ("overlays", "strategy"): "strategy_visible",
     ("overlays", "impulses"): "impulse_visible",
     ("overlays", "events"): "events_visible",
@@ -9767,6 +9814,7 @@ _CHART_TOGGLE_BUTTONS = {
     "toggle-slr-btn": "slr-visible-store",
     "toggle-mfi-btn": "mfi-visible-store",
     "toggle-vwap-btn": "vwap-visible-store",
+    "toggle-open-interest-btn": "open-interest-visible-store",
     "toggle-chart-vline-btn": "chart-vline-mode-store",
     "toggle-strategy-btn": "strategy-visible-store",
     "toggle-impulses-btn": "impulse-visible-store",
@@ -9993,6 +10041,7 @@ def _chart_toggle_button(label, enabled):
     Output("toggle-slr-btn", "children"), Output("toggle-slr-btn", "style"),
     Output("toggle-mfi-btn", "children"), Output("toggle-mfi-btn", "style"),
     Output("toggle-vwap-btn", "children"), Output("toggle-vwap-btn", "style"),
+    Output("toggle-open-interest-btn", "children"), Output("toggle-open-interest-btn", "style"),
     Output("toggle-chart-vline-btn", "children"), Output("toggle-chart-vline-btn", "style"),
     Output("toggle-strategy-btn", "children"), Output("toggle-strategy-btn", "style"),
     Output("toggle-impulses-btn", "children"), Output("toggle-impulses-btn", "style"),
@@ -10011,13 +10060,14 @@ def _chart_toggle_button(label, enabled):
     Input("slr-visible-store", "data"),
     Input("mfi-visible-store", "data"),
     Input("vwap-visible-store", "data"),
+    Input("open-interest-visible-store", "data"),
     Input("chart-vline-mode-store", "data"),
     Input("strategy-visible-store", "data"),
     Input("impulse-visible-store", "data"),
     Input("events-visible-store", "data"),
     prevent_initial_call=False,
 )
-def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, cci, cmf, cho, atr, cvd, slr, mfi, vwap, vline, strategy, impulses, events):
+def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, cci, cmf, cho, atr, cvd, slr, mfi, vwap, open_interest, vline, strategy, impulses, events):
     return (
         *_chart_toggle_button("RSI", rsi),
         *_chart_toggle_button("Stoch", stochastic),
@@ -10033,6 +10083,7 @@ def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, c
         *_chart_toggle_button("SLR", slr),
         *_chart_toggle_button("MFI", mfi),
         *_chart_toggle_button("VWAP", vwap),
+        *_chart_toggle_button("OI", open_interest),
         *_chart_toggle_button("VLine", vline),
         *_chart_toggle_button("Strategy", strategy),
         *_chart_toggle_button("Impulses", impulses),
@@ -10976,7 +11027,7 @@ def build_chart_render_model(task, chart_window, pane_visibility, event_context,
         "source_profile": CHART_SOURCE_PROFILES[source],
         "has_volume": has_volume,
         "ui_state": dict(ui_state or make_chart_ui_state()),
-        "indicator_specs": build_chart_indicator_specs(pane_visibility, has_volume, indicator_order),
+        "indicator_specs": build_chart_indicator_specs(pane_visibility, has_volume, indicator_order, chart_window["df"].columns),
     }
 
 
@@ -11199,6 +11250,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     State("slr-visible-store", "data"),
     State("mfi-visible-store", "data"),
     State("vwap-visible-store", "data"),
+    State("open-interest-visible-store", "data"),
     State("strategy-visible-store", "data"),
     State("impulse-visible-store", "data"),
     State("events-visible-store", "data"),
@@ -11211,7 +11263,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     State("chart-render-schema-store", "data"),
     prevent_initial_call=True,
 )
-def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, indicator_order, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
+def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, indicator_order, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, open_interest_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
     if not task_id:
         return go.Figure(), None, ""
     if ctx.triggered_id == "chart-force-full-render-store":
@@ -11236,6 +11288,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         "slr_visible": slr_visible,
         "mfi_visible": mfi_visible,
         "vwap_visible": vwap_visible,
+        "open_interest_visible": open_interest_visible,
         "strategy_visible": strategy_visible,
         "impulse_visible": impulse_visible,
         "events_visible": events_visible,
@@ -11257,6 +11310,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     slr_visible = render_values["slr_visible"]
     mfi_visible = render_values["mfi_visible"]
     vwap_visible = render_values["vwap_visible"]
+    open_interest_visible = render_values["open_interest_visible"]
     strategy_visible = render_values["strategy_visible"]
     impulse_visible = render_values["impulse_visible"]
     events_visible = render_values["events_visible"]
@@ -11553,6 +11607,11 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             line=dict(color='#90a4ae', width=0.9), connectgaps=True, hovertemplate='Close: %{y:.6g}<extra></extra>'), row=row, col=1)
         target_fig.update_yaxes(title_text="VWAP", tickformat=".6~g", row=row, col=1)
 
+    def add_open_interest_trace(target_fig, row):
+        target_fig.add_trace(make_chart_open_interest_trace(x=trace_x, y=df['open_interest'], mode='lines', name='Open Interest',
+            line=dict(color='#3949ab', width=1.4), connectgaps=True, hovertemplate='Open Interest: %{y:.6g}<extra></extra>'), row=row, col=1)
+        target_fig.update_yaxes(title_text="Open Interest", tickformat=".6~g", row=row, col=1)
+
     # Low-spec chart cache: cache the period view and compute indicator columns
     # lazily.  Left/right chart navigation often uses only candles; computing
     # every oscillator on every newly opened task made navigation feel slow.
@@ -11643,6 +11702,11 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if vwap_visible and has_volume and not vwap_cached:
         df['vwap'] = compute_chart_vwap(df['high'], df['low'], df['close'], df['volume'])
     trace_chart_phase("indicator_vwap", enabled=bool(vwap_visible and has_volume), cached=vwap_cached)
+    open_interest_source, open_interest_column = resolve_chart_open_interest_series(df)
+    open_interest_cached = 'open_interest' in df.columns
+    if open_interest_visible and open_interest_source is not None and not open_interest_cached:
+        df['open_interest'] = open_interest_source
+    trace_chart_phase("indicator_open_interest", enabled=bool(open_interest_visible and open_interest_source is not None), cached=open_interest_cached, column=open_interest_column)
     # Build a UI/render model after lazy calculations. This preserves the
     # existing formulas while separating source/data decisions from rendering.
     pane_visibility = {
@@ -11651,6 +11715,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         "disparity": disparity_visible, "cci": cci_visible,
         "cmf": cmf_visible, "cho": cho_visible, "atr": atr_visible,
         "cvd": cvd_visible, "slr": slr_visible, "mfi": mfi_visible, "vwap": vwap_visible,
+        "open_interest": open_interest_visible,
     }
     timer.check("Lazy indicator preparation")
     chart_model = build_chart_render_model(
@@ -11751,6 +11816,8 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             add_mfi_trace(fig, current_row)
         elif indicator_type == "vwap":
             add_vwap_trace(fig, current_row)
+        elif indicator_type == "open_interest":
+            add_open_interest_trace(fig, current_row)
         elif indicator_type == "volume":
             add_volume_trace(fig, row=current_row)
         current_row += 1
