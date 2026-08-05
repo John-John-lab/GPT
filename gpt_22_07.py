@@ -12114,10 +12114,14 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     if use_incremental_patch:
         g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
         timer.end()
-        return build_incremental_chart_patch(fig), requested_render_schema, no_update
+        return build_incremental_chart_patch(fig), requested_render_schema, ""
     g.chart_callback_ms = round((time.perf_counter() - diagnostic_started) * 1000)
     timer.end()
-    return fig, requested_render_schema, no_update
+    # Full authoritative renders must clear any previous compact payload from
+    # the hidden observer node. Leaving stale JSON there lets a newly mounted
+    # chart re-apply an old task's payload and can make the modal appear as an
+    # empty blue plot while fallback requests race with Plotly.
+    return fig, requested_render_schema, ""
 
 # =============================================================================
 # NOTE: Database-related callbacks have been moved to database.py
