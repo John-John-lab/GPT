@@ -4155,6 +4155,11 @@ function getTaskPlot() {
     const holder = document.getElementById('task-chart');
     return holder ? (holder.querySelector('.js-plotly-plot') || holder) : null;
 }
+function removeIndicatorOrderButtons() {
+    const holder = document.getElementById('task-chart');
+    const scope = holder || document;
+    scope.querySelectorAll('.chart-pane-order-buttons').forEach(function(node) { node.remove(); });
+}
 function publishIndicatorOrder(order) {
     if (!window.dash_clientside || typeof window.dash_clientside.set_props !== 'function') return;
     const clean = [];
@@ -4163,7 +4168,11 @@ function publishIndicatorOrder(order) {
     });
     chartPaneOrderRegistry.forEach(function(key) { if (clean.indexOf(key) < 0) clean.push(key); });
     window.__chartIndicatorOrder = clean;
+    removeIndicatorOrderButtons();
+    markChartRenderRequested('indicator-order');
     window.dash_clientside.set_props('chart-indicator-order-store', {data: clean});
+    window.setTimeout(installChartPaneHelpers, 300);
+    window.setTimeout(installChartPaneHelpers, 900);
     traceUi('indicator order changed', {order: clean});
 }
 function visibleIndicatorPanes(gd) {
@@ -4186,7 +4195,7 @@ function installIndicatorOrderButtons() {
     const parent = gd.parentElement;
     if (!parent) return;
     parent.style.position = parent.style.position || 'relative';
-    parent.querySelectorAll('.chart-pane-order-buttons').forEach(function(node) { node.remove(); });
+    removeIndicatorOrderButtons();
     const panes = visibleIndicatorPanes(gd);
     if (!panes.length) return;
     panes.forEach(function(pane, index) {
