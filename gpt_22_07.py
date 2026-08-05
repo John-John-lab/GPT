@@ -1280,10 +1280,13 @@ def chart_fast_candle_navigation_eligible(current_schema, source, render_values,
         return False
     if current_schema.get("source") != normalized_source:
         return False
-    # Opening a summary row must build the authoritative figure so its initial
-    # entry/exit traces, guides, ranges and source metadata are established.
-    # Only an explicit Previous/Next context may mutate that mounted schema.
-    if normalized_source == "dynamic_oscillator_summary" and not navigation_context:
+    # Opening a chart from a table/strategy row must build the authoritative
+    # figure so the mounted Plotly graph, title, axes, overlays and source
+    # metadata are established. Only explicit Previous/Next navigation carries a
+    # matching navigation token and may use the compact payload. This prevents a
+    # stale schema Store from returning no_update for task-chart.figure while the
+    # browser has no usable plot mounted, which shows as an empty blue chart pane.
+    if not navigation_context:
         return False
     trace_keys = tuple(current_schema.get("trace_keys") or ())
     if not trace_keys:
@@ -5344,6 +5347,11 @@ function submitAdjacentChartNavigation(taskId, direction, buttonId) {
     // Navigation needs only the selected task. Unlike a table Chart action,
     // the modal is already open, so updating chart-click-store merely schedules
     // an additional modal callback while the large figure request is pending.
+    const now = Date.now();
+    window.dash_clientside.set_props('chart-event-context-store', {data: {
+        source: 'main_table', events: [], index: 0, overlay: true,
+        navigation_token: now, navigation_task_id: String(taskId)
+    }});
     window.dash_clientside.set_props('chart-task-id', {data: taskId});
     traceUi('local chart navigation', {direction: direction, taskId: taskId, storeWrites: 1});
     return true;
