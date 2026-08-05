@@ -5087,7 +5087,11 @@ async function applyFastCandleNavigationPayload(rawPayload) {
     let payload = rawPayload;
     try {
         if (typeof payload === 'string') payload = JSON.parse(payload);
-        if (!payload || payload.version !== 4 || !payload.task_id || !Array.isArray(payload.shared_x)) return false;
+        const supportedFastPayloadVersions = [5];
+        if (!payload || !payload.task_id || !Array.isArray(payload.shared_x) || supportedFastPayloadVersions.indexOf(Number(payload.version)) < 0) {
+            if (payload && payload.task_id) requestFullChartFallback(payload.task_id, 'unsupported fast payload version');
+            return false;
+        }
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
         if (!plot || !window.Plotly || !Array.isArray(plot.data)) {
