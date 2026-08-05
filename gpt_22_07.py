@@ -4253,13 +4253,23 @@ function installChartVerticalLineDblClick() {
         }
         if (xValue === null || typeof xValue === 'undefined') return;
         const shapes = ((gd.layout && gd.layout.shapes) || []).slice();
+        const xValueMs = xValue instanceof Date ? xValue.getTime() :
+            (Number.isFinite(Number(xValue)) ? Number(xValue) : Date.parse(xValue));
         const existingIndex = shapes.findIndex(function(shape) {
             if (!shape || shape.name !== 'session_vline') return false;
             let shapePixel = null;
             if (xa.d2p) shapePixel = xa.d2p(shape.x0);
             else if (xa.d2l && xa.l2p) shapePixel = xa.l2p(xa.d2l(shape.x0));
-            if (!Number.isFinite(shapePixel)) return false;
-            return Math.abs(shapePixel - pixel) <= 6;
+            if (Number.isFinite(shapePixel) && Math.abs(shapePixel - pixel) <= 12) return true;
+            const shapeMs = shape.x0 instanceof Date ? shape.x0.getTime() :
+                (Number.isFinite(Number(shape.x0)) ? Number(shape.x0) : Date.parse(shape.x0));
+            if (!Number.isFinite(shapeMs) || !Number.isFinite(xValueMs)) return false;
+            const range = Array.isArray(xa.range) && xa.range.length >= 2 ? xa.range : [];
+            const startMs = Number.isFinite(Number(range[0])) ? Number(range[0]) : Date.parse(range[0]);
+            const endMs = Number.isFinite(Number(range[1])) ? Number(range[1]) : Date.parse(range[1]);
+            const msPerPixel = Number.isFinite(startMs) && Number.isFinite(endMs) && xa._length ?
+                Math.abs(endMs - startMs) / Math.max(1, xa._length) : 0;
+            return msPerPixel > 0 && Math.abs(shapeMs - xValueMs) <= msPerPixel * 12;
         });
         if (existingIndex >= 0) {
             shapes.splice(existingIndex, 1);
