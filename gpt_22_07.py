@@ -4233,11 +4233,22 @@ function chartSessionVLineShapes(gd) {
     const shapes = ((gd && gd.layout && gd.layout.shapes) || []).slice();
     return shapes.filter(function(shape) { return shape && shape.name === 'session_vline'; });
 }
+function preserveChartSessionVLinesForResize() {
+    const gd = getTaskPlot();
+    if (!gd || !gd.layout) return;
+    const taskId = String(((gd.layout.meta || {}).task_id) || '');
+    window.__taskChartResizeVLines = chartSessionVLineShapes(gd).map(function(shape) {
+        return Object.assign({}, shape, {line: Object.assign({}, shape.line || {})});
+    });
+    window.__taskChartResizeVLineTaskId = taskId;
+}
 function clearChartSessionVLines() {
     const gd = getTaskPlot();
     if (!gd || !window.Plotly) return;
     const shapes = ((gd.layout && gd.layout.shapes) || []).filter(function(shape) { return !(shape && shape.name === 'session_vline'); });
     window.Plotly.relayout(gd, {shapes: shapes});
+    window.__taskChartResizeVLines = [];
+    window.__taskChartResizeVLineTaskId = '';
     traceUi('vertical session lines cleared');
 }
 function chartVLineModeEnabled() {
@@ -4295,6 +4306,12 @@ function installChartVerticalLineDblClick() {
             });
         }
         window.Plotly.relayout(gd, {shapes: shapes});
+        window.__taskChartResizeVLines = shapes.filter(function(shape) {
+            return shape && shape.name === 'session_vline';
+        }).map(function(shape) {
+            return Object.assign({}, shape, {line: Object.assign({}, shape.line || {})});
+        });
+        window.__taskChartResizeVLineTaskId = String(((gd.layout || {}).meta || {}).task_id || '');
         traceUi('vertical session line toggled', {count: shapes.filter(function(shape) { return shape && shape.name === 'session_vline'; }).length});
     }, true);
 }
@@ -4650,6 +4667,12 @@ function applyLocalToolbarInteraction(button) {
     }
     if (button.id === 'toggle-osc-chart-size-btn') {
         button.textContent = active ? 'Osc Size: Full' : 'Osc Size: Reduced';
+    }
+    if (button.id === 'toggle-main-chart-size-btn' || button.id === 'toggle-osc-chart-size-btn') {
+        // The size change rebuilds only layout, but the authoritative server
+        // figure cannot contain browser-created session lines. Stash them once
+        // and replay them on the resized figure for this same task.
+        preserveChartSessionVLinesForResize();
     }
     if (button.id !== 'toggle-measure-btn') {
         traceUi('local toolbar pending', {id: button.id, active: active});
@@ -10384,6 +10407,15 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
         }, 120);
     }
     const figureTaskId = String((figure.layout.meta || {}).task_id || chartTaskId || '');
+    if (window.__taskChartResizeVLineTaskId && window.__taskChartResizeVLineTaskId !== figureTaskId) {
+        window.__taskChartResizeVLines = [];
+        window.__taskChartResizeVLineTaskId = '';
+    }
+    const savedSessionVLines = (
+        window.__taskChartResizeVLineTaskId === figureTaskId && Array.isArray(window.__taskChartResizeVLines)
+    ) ? window.__taskChartResizeVLines.map(function(shape) {
+        return Object.assign({}, shape, {line: Object.assign({}, shape.line || {})});
+    }) : [];
     if (window.__taskChartMeasureTaskId && window.__taskChartMeasureTaskId !== figureTaskId) {
         window.__taskChartMeasureShapes = [];
         // Measurements belong to one coin/timeframe. Remove the previous
@@ -10394,10 +10426,12 @@ function(measureMode, measureHover, oscillatorRange, candleInfo, oscillatorInfo,
     window.__taskChartMeasureTaskId = figureTaskId;
     const savedMeasureShapes = uniqueMeasureShapes(window.__taskChartMeasureShapes || []);
     window.__taskChartMeasureShapes = savedMeasureShapes.map(function(shape) { return Object.assign({}, shape); });
-    if (savedMeasureShapes.length) {
+    if (savedSessionVLines.length || savedMeasureShapes.length) {
         const baseShapes = (plot.layout.shapes || []).slice(0, plot.__dashBaseShapeCount);
-        window.Plotly.relayout(plot, {shapes: baseShapes.concat(savedMeasureShapes)});
-        window.setTimeout(function() { if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup(); }, 40);
+        window.Plotly.relayout(plot, {shapes: baseShapes.concat(savedSessionVLines, savedMeasureShapes)});
+        if (savedMeasureShapes.length) {
+            window.setTimeout(function() { if (window.showNativeMeasureResultAfterMouseup) window.showNativeMeasureResultAfterMouseup(); }, 40);
+        }
     }
 
     const candleTemplate = '<b>%{x|%Y-%m-%d %H:%M}</b><br>Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<extra></extra>';
