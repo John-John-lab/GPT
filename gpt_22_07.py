@@ -4090,6 +4090,7 @@ const chartToggleStores = {
     'toggle-vwap-btn': ['vwap-visible-store', false],
     'toggle-open-interest-btn': ['open-interest-visible-store', false],
     'toggle-main-chart-size-btn': ['main-chart-full-height-store', false],
+    'toggle-osc-chart-size-btn': ['osc-chart-full-height-store', false],
     'toggle-chart-vline-btn': ['chart-vline-mode-store', false],
     'toggle-strategy-btn': ['strategy-visible-store', false],
     'toggle-chart-info-box-btn': ['chart-info-box-store', false],
@@ -4121,6 +4122,7 @@ const chartToggleActions = {
     'toggle-vwap-btn': ['panes', 'vwap'],
     'toggle-open-interest-btn': ['panes', 'open_interest'],
     'toggle-main-chart-size-btn': ['viewport', 'main_full_height'],
+    'toggle-osc-chart-size-btn': ['viewport', 'osc_full_height'],
     'toggle-chart-vline-btn': ['information', 'vertical_lines'],
     'toggle-strategy-btn': ['overlays', 'strategy'],
     'toggle-impulses-btn': ['overlays', 'impulses'],
@@ -4142,7 +4144,7 @@ const chartRenderActionPaths = new Set([
     'panes.rsi', 'panes.stochastic', 'panes.volume', 'panes.adx', 'panes.macd', 'panes.disparity', 'panes.cci',
     'panes.cmf', 'panes.cho', 'panes.atr', 'panes.cvd', 'panes.slr', 'panes.mfi', 'panes.vwap', 'panes.open_interest',
     'overlays.strategy', 'overlays.impulses', 'overlays.events', 'information.candle', 'viewport.focus_entry',
-    'viewport.main_full_height'
+    'viewport.main_full_height', 'viewport.osc_full_height'
 ]);
 const chartPaneOrderRegistry = [
     'rsi', 'stochastic', 'volume', 'adx', 'macd', 'disparity', 'cci',
@@ -4627,6 +4629,9 @@ function applyLocalToolbarInteraction(button) {
     if (button.id === 'toggle-main-chart-size-btn') {
         chartToggleState[button.id] = String(button.textContent || '').indexOf(': Full') >= 0;
     }
+    if (button.id === 'toggle-osc-chart-size-btn') {
+        chartToggleState[button.id] = String(button.textContent || '').indexOf(': Full') >= 0;
+    }
     const active = !Boolean(chartToggleState[button.id]);
     chartToggleState[button.id] = active;
     button.__gptOptimisticActive = active;
@@ -4642,6 +4647,9 @@ function applyLocalToolbarInteraction(button) {
     }
     if (button.id === 'toggle-main-chart-size-btn') {
         button.textContent = active ? 'Main Size: Full' : 'Main Size: Reduced';
+    }
+    if (button.id === 'toggle-osc-chart-size-btn') {
+        button.textContent = active ? 'Osc Size: Full' : 'Osc Size: Reduced';
     }
     if (button.id !== 'toggle-measure-btn') {
         traceUi('local toolbar pending', {id: button.id, active: active});
@@ -4752,6 +4760,7 @@ function applyChartToggleImmediately(button) {
         if (button.id === 'toggle-chart-extend-x-btn') chartToggleState[button.id] = label.indexOf('Extend X: On') >= 0;
         if (button.id === 'toggle-chart-focus-entry-btn') chartToggleState[button.id] = label.indexOf('Focus Entry: On') >= 0;
         if (button.id === 'toggle-main-chart-size-btn') chartToggleState[button.id] = label.indexOf('Main Size: Full') >= 0;
+        if (button.id === 'toggle-osc-chart-size-btn') chartToggleState[button.id] = label.indexOf('Osc Size: Full') >= 0;
         if (button.id === 'toggle-measure-oscillator-range-btn') chartToggleState[button.id] = label.indexOf('Osc Range: On') >= 0;
         if (chartToggleLabels[button.id]) chartToggleState[button.id] = label.indexOf(': On') >= 0;
         active = !Boolean(chartToggleState[button.id]);
@@ -4809,6 +4818,7 @@ function applyChartToggleImmediately(button) {
     }
     if (button.id === 'toggle-chart-focus-entry-btn') button.textContent = active ? 'Focus Entry: On' : 'Focus Entry: Off';
     if (button.id === 'toggle-main-chart-size-btn') button.textContent = active ? 'Main Size: Full' : 'Main Size: Reduced';
+    if (button.id === 'toggle-osc-chart-size-btn') button.textContent = active ? 'Osc Size: Full' : 'Osc Size: Reduced';
     if (button.id === 'toggle-measure-oscillator-range-btn') {
         button.textContent = active ? 'Osc Range: On' : 'Osc Range: Off';
         window.__taskChartOscillatorRangeEnabled = active;
@@ -6062,7 +6072,7 @@ def make_chart_ui_state(
     measure=False, measure_anchor=False, measure_hover=True,
     measure_oscillator_range=False, candle_info=False, oscillator_info=True,
     oscillator_sync=False, vertical_lines=False, extend_x=False, focus_entry=False,
-    main_full_height=False,
+    main_full_height=False, osc_full_height=False,
 ):
     return {
         "panes": {
@@ -6090,26 +6100,45 @@ def make_chart_ui_state(
         "viewport": {
             "extend_x": bool(extend_x), "focus_entry": bool(focus_entry),
             "main_full_height": bool(main_full_height),
+            "osc_full_height": bool(osc_full_height),
         },
     }
 
 
 def build_chart_row_layout(indicator_count, stochastic_visible=False, main_full_height=False,
-                           compact_height=None):
+                           osc_full_height=False, compact_height=None):
     """Return subplot row weights, spacing, and figure height.
 
     Reduced mode deliberately preserves the established compact chart geometry.
-    Full-main mode adds document height instead of taking pixels away from the
-    candle pane, so oscillator panes remain below it and are reached with the
-    normal page scrollbar.  This helper changes layout only; traces, strategy
-    marks, measurement shapes, and indicator calculations are untouched.
+    The two expanded modes independently choose the candle-pane and oscillator
+    pixel heights. They add document height instead of taking pixels from the
+    other pane type, so every oscillator remains below the candle chart and is
+    reached with the normal page scrollbar. This helper changes layout only;
+    traces, marks, measurement shapes, and calculations are untouched.
     """
     count = max(0, int(indicator_count or 0))
     if not count:
         return [1.0], 0.0, 500
-    if main_full_height:
-        main_pixels = 400.0
-        indicator_pixels = 135.0
+    indicator_height = 0.12 if stochastic_visible else 0.18
+    compact_row_heights = [max(0.42, 1.0 - indicator_height * count)]
+    compact_row_heights.extend([indicator_height] * count)
+    if compact_height is None:
+        compact_height = 980 if stochastic_visible else (780 if count >= 2 else 700)
+    if main_full_height or osc_full_height:
+        # Derive each reduced pixel height from the exact compact layout. Thus
+        # changing the oscillator button cannot silently resize the main pane,
+        # and changing the main button cannot resize oscillator panes.
+        compact_inner_pixels = max(1.0, float(compact_height) - 100.0)
+        available_ratio = max(0.1, 1.0 - 0.035 * count)
+        weight_total = sum(compact_row_heights)
+        compact_main_pixels = (
+            compact_inner_pixels * available_ratio * compact_row_heights[0] / weight_total
+        )
+        compact_indicator_pixels = (
+            compact_inner_pixels * available_ratio * indicator_height / weight_total
+        )
+        main_pixels = 400.0 if main_full_height else compact_main_pixels
+        indicator_pixels = 300.0 if osc_full_height else compact_indicator_pixels
         gap_pixels = 14.0
         plot_pixels = main_pixels + count * indicator_pixels + count * gap_pixels
         return (
@@ -6117,12 +6146,7 @@ def build_chart_row_layout(indicator_count, stochastic_visible=False, main_full_
             gap_pixels / plot_pixels,
             int(plot_pixels + 100),
         )
-    indicator_height = 0.12 if stochastic_visible else 0.18
-    row_heights = [max(0.42, 1.0 - indicator_height * count)]
-    row_heights.extend([indicator_height] * count)
-    if compact_height is None:
-        compact_height = 980 if stochastic_visible else (780 if count >= 2 else 700)
-    return row_heights, 0.035, int(compact_height)
+    return compact_row_heights, 0.035, int(compact_height)
 
 
 # Declarative registry for chart panes and overlays.  Values are UI/rendering
@@ -6265,9 +6289,10 @@ def build_root_layout():
     dcc.Store(id="mfi-visible-store", data=False),
     dcc.Store(id="vwap-visible-store", data=False),
     dcc.Store(id="open-interest-visible-store", data=False),
-    # Session storage keeps the preferred candle-pane size across main-table,
-    # strategy-result, and Next/Previous chart opens without per-task writes.
+    # Session storage keeps both independent pane-size preferences across main
+    # table, strategy-result, and Next/Previous opens without per-task writes.
     dcc.Store(id="main-chart-full-height-store", storage_type="session", data=False),
+    dcc.Store(id="osc-chart-full-height-store", storage_type="session", data=False),
     dcc.Store(id="chart-vline-mode-store", data=False),
     dcc.Store(id="chart-indicator-order-store", storage_type="session", data=[]),
     dcc.Store(id="strategy-visible-store", data=False),
@@ -6506,6 +6531,7 @@ def build_root_layout():
                             html.Button("VWAP: Off", id="toggle-vwap-btn", title="Toggle session/window VWAP", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "82px", "whiteSpace": "nowrap"}),
                             html.Button("OI: Off", id="toggle-open-interest-btn", title="Toggle Open Interest when the parquet/feed provides an open-interest column", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "76px", "whiteSpace": "nowrap"}),
                             html.Button("Main Size: Reduced", id="toggle-main-chart-size-btn", title="Keep the main candle pane full size and place oscillators below it for page scrolling", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "126px", "whiteSpace": "nowrap"}),
+                            html.Button("Osc Size: Reduced", id="toggle-osc-chart-size-btn", title="Give every oscillator pane full height while keeping it below the main chart for page scrolling", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "120px", "whiteSpace": "nowrap"}),
                             html.Button("VLine: Off", id="toggle-chart-vline-btn", title="Double-click any chart pane to add/remove dashed vertical session lines", style={"background": "transparent", "color": "black", "border": "1px solid black", "padding": "6px 10px", "cursor": "pointer", "fontSize": "12px", "minWidth": "86px", "whiteSpace": "nowrap"}),
                             html.Button("Strategy: Off", id="toggle-strategy-btn", style={
                                 "background": "transparent",
@@ -9670,6 +9696,7 @@ if CHART_UI_STATE_LEGACY_SYNC_ENABLED:
         Input("chart-extend-x-store", "data"),
         Input("chart-focus-entry-store", "data"),
         Input("main-chart-full-height-store", "data"),
+        Input("osc-chart-full-height-store", "data"),
         prevent_initial_call=False,
     )(sync_chart_ui_state)
 
@@ -9704,6 +9731,7 @@ _CHART_UI_STATE_PATHS = {
     "chart-extend-x-store": ("viewport", "extend_x"),
     "chart-focus-entry-store": ("viewport", "focus_entry"),
     "main-chart-full-height-store": ("viewport", "main_full_height"),
+    "osc-chart-full-height-store": ("viewport", "osc_full_height"),
 }
 
 
@@ -9745,6 +9773,7 @@ _CHART_RENDER_ACTION_PATHS = {
     ("information", "candle"): "candle_info_enabled",
     ("viewport", "focus_entry"): "focus_entry",
     ("viewport", "main_full_height"): "main_full_height",
+    ("viewport", "osc_full_height"): "osc_full_height",
 }
 
 
@@ -9946,6 +9975,7 @@ _CHART_TOGGLE_BUTTONS = {
     "toggle-vwap-btn": "vwap-visible-store",
     "toggle-open-interest-btn": "open-interest-visible-store",
     "toggle-main-chart-size-btn": "main-chart-full-height-store",
+    "toggle-osc-chart-size-btn": "osc-chart-full-height-store",
     "toggle-chart-vline-btn": "chart-vline-mode-store",
     "toggle-strategy-btn": "strategy-visible-store",
     "toggle-impulses-btn": "impulse-visible-store",
@@ -10230,9 +10260,23 @@ def update_chart_toggle_buttons(rsi, stochastic, volume, adx, macd, disparity, c
 )
 def update_main_chart_size_button(full_height):
     """Show the session-persistent main-pane sizing mode."""
-    label, style = _chart_toggle_button("Main Size", full_height)
+    _label, style = _chart_toggle_button("Main Size", full_height)
     return ("Main Size: Full" if full_height else "Main Size: Reduced"), {
         **style, "minWidth": "126px",
+    }
+
+
+@app.callback(
+    Output("toggle-osc-chart-size-btn", "children"),
+    Output("toggle-osc-chart-size-btn", "style"),
+    Input("osc-chart-full-height-store", "data"),
+    prevent_initial_call=False,
+)
+def update_osc_chart_size_button(full_height):
+    """Show the session-persistent oscillator-pane sizing mode."""
+    _label, style = _chart_toggle_button("Osc Size", full_height)
+    return ("Osc Size: Full" if full_height else "Osc Size: Reduced"), {
+        **style, "minWidth": "120px",
     }
 
 @app.callback(
@@ -11383,6 +11427,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     Input("chart-force-full-render-store", "data"),
     Input("chart-indicator-order-store", "data"),
     Input("main-chart-full-height-store", "data"),
+    Input("osc-chart-full-height-store", "data"),
     State("rsi-visible-store", "data"),
     State("stochastic-visible-store", "data"),
     State("volume-visible-store", "data"),
@@ -11410,7 +11455,7 @@ def add_source_trade_overlay(fig, event, to_datetime, y_min, y_max):
     State("chart-render-schema-store", "data"),
     prevent_initial_call=True,
 )
-def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, indicator_order, main_full_height, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, open_interest_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
+def update_task_chart(task_id, chart_action, chart_event_context, force_full_render, indicator_order, main_full_height, osc_full_height, rsi_visible, stochastic_visible, volume_visible, adx_visible, macd_visible, disparity_visible, cci_visible, cmf_visible, cho_visible, atr_visible, cvd_visible, slr_visible, mfi_visible, vwap_visible, open_interest_visible, strategy_visible, impulse_visible, events_visible, focus_entry, candle_info_enabled, chart_request, chart_ui_state, chart_view_state, measure_mode, current_render_schema):
     if not task_id:
         return go.Figure(), None, ""
     if ctx.triggered_id == "chart-force-full-render-store":
@@ -11443,6 +11488,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         "candle_info_enabled": candle_info_enabled,
         "measure_mode": measure_mode,
         "main_full_height": main_full_height,
+        "osc_full_height": osc_full_height,
     }, chart_action)
     rsi_visible = render_values["rsi_visible"]
     stochastic_visible = render_values["stochastic_visible"]
@@ -11466,6 +11512,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
     candle_info_enabled = render_values["candle_info_enabled"]
     measure_mode = render_values["measure_mode"]
     main_full_height = render_values["main_full_height"]
+    osc_full_height = render_values["osc_full_height"]
     task = tm.get_task(task_id)
     diagnostic_id = request.headers.get("X-GPT-Chart-Trace", "server")
     diagnostic_started = diagnostic_last = time.perf_counter()
@@ -11931,7 +11978,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
         (780 if legacy_compact_count >= 2 else (700 if legacy_compact_count else 500))
     )
     row_heights, vertical_spacing, chart_height = build_chart_row_layout(
-        len(indicator_specs), stochastic_visible, main_full_height,
+        len(indicator_specs), stochastic_visible, main_full_height, osc_full_height,
         compact_height=legacy_compact_height,
     )
     if total_rows == 1:
@@ -11941,7 +11988,11 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             rows=total_rows, cols=1, shared_xaxes=True,
             vertical_spacing=vertical_spacing, row_heights=row_heights
         )
-    trace_chart_phase("make_subplots", rows=total_rows, main_full_height=bool(main_full_height), height=chart_height)
+    trace_chart_phase(
+        "make_subplots", rows=total_rows,
+        main_full_height=bool(main_full_height), osc_full_height=bool(osc_full_height),
+        height=chart_height,
+    )
     add_main_candles(fig)
     trace_chart_phase("main_traces", traces=len(fig.data))
 
@@ -12179,6 +12230,7 @@ def update_task_chart(task_id, chart_action, chart_event_context, force_full_ren
             "signal_price": float(signal_price),
             "measurement": chart_model["ui_state"].get("measurement", {}),
             "main_full_height": bool(main_full_height),
+            "osc_full_height": bool(osc_full_height),
         },
         # Keep Plotly zoom/pan stable while toggles, measuring, table refreshes,
         # or marker overlays rebuild this figure.  The key changes only when a
