@@ -4886,6 +4886,30 @@ function installChartCrosshairFallback() {
         if (left === null) return low;
         return Math.abs(left - target) <= Math.abs(right - target) ? low - 1 : low;
     }
+    function formatSynchronizedValue(trace, value) {
+        if (!Number.isFinite(value)) return 'n/a';
+        // Match the trace's own Plotly hover precision so the value printed in
+        // Osc All is directly comparable with the label on the oscillator line.
+        const template = String((trace && trace.hovertemplate) || '');
+        const formatMatch = template.match(/%[{]y:([^}]+)[}]/);
+        const format = formatMatch ? formatMatch[1] : '';
+        const fixedMatch = format.match(/,?[.]([0-9]+)f$/);
+        if (fixedMatch) {
+            const digits = Math.max(0, Math.min(12, Number(fixedMatch[1])));
+            return format.indexOf(',') >= 0
+                ? value.toLocaleString(undefined, {minimumFractionDigits: digits, maximumFractionDigits: digits})
+                : value.toFixed(digits);
+        }
+        const generalMatch = format.match(/[.]([0-9]+)g$/);
+        if (generalMatch) {
+            const precision = Math.max(1, Math.min(12, Number(generalMatch[1])));
+            return value.toPrecision(precision).replace(/([.][0-9]*?[1-9])0+(e|$)/i, '$1$2').replace(/[.]0+(e|$)/i, '$1');
+        }
+        const magnitude = Math.abs(value);
+        return magnitude !== 0 && magnitude < 0.01
+            ? value.toPrecision(5)
+            : value.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4);
+    }
     document.addEventListener('mousemove', function(event) {
         const root = document.getElementById('task-chart');
         const plot = root ? (root.querySelector('.js-plotly-plot') || root) : null;
@@ -4909,39 +4933,48 @@ function installChartCrosshairFallback() {
         const svgRect = svg ? svg.getBoundingClientRect() : rect;
         const axisLeft = svgRect.left + Number(xaxis._offset || 0);
         const axisWidth = Math.max(1, Number(xaxis._length || rect.width));
-        const axisRatio = Math.max(0, Math.min(1, (event.clientX - axisLeft) / axisWidth));
+        const pointerPixel = Math.max(0, Math.min(axisWidth, event.clientX - axisLeft));
+        const axisRatio = pointerPixel / axisWidth;
         // Mousemove runs before Plotly refreshes `_hoverdata` when crossing
         // from the candle pane into an oscillator pane. Reusing that stale
         // point made Osc All show the preceding pane's timestamp. Resolve the
         // timestamp solely from the shared x-axis geometry instead.
-        const index = nearestIndex(firstTrace.x, start + (end - start) * axisRatio);
-        if (index === null) return;
+        const geometryTarget = start + (end - start) * axisRatio;
+        const convertedTarget = typeof xaxis.p2d === 'function' ? asMillis(xaxis.p2d(pointerPixel)) : null;
+        const targetTimestamp = convertedTarget === null ? geometryTarget : convertedTarget;
+        if (!Number.isFinite(targetTimestamp)) return;
         if (window.getComputedStyle(root).position === 'static') root.style.position = 'relative';
         const valuesByAxis = {};
         plot.data.forEach(function(trace, curveNumber) {
             const fullTrace = plot._fullData && plot._fullData[curveNumber];
-            const valueSeries = (fullTrace && fullTrace.y) || (trace && trace.y);
+            // `plot.data` is replaced by the fast Plotly.react path and is the
+            // authoritative array for the displayed coin. `_fullData` can lag
+            // one render in ScatterGL on some Plotly/browser combinations.
+            const valueSeries = (trace && trace.y) || (fullTrace && fullTrace.y);
+            const xSeries = (trace && trace.x) || (fullTrace && fullTrace.x) || firstTrace.x;
             const axisId = trace && trace.yaxis ? trace.yaxis : 'y';
             const name = trace && trace.name ? String(trace.name) : '';
-            if (!trace || axisId === 'y' || !valueSeries || trace.visible === false || name.startsWith('_')) return;
+            if (!trace || axisId === 'y' || !valueSeries || !xSeries || trace.visible === false || name.startsWith('_')) return;
+            // Resolve every trace at the shared timestamp rather than reusing
+            // the candle-array index. This remains correct for shorter,
+            // filtered, or independently encoded indicator arrays.
+            const traceIndex = nearestIndex(xSeries, targetTimestamp);
+            if (traceIndex === null) return;
             // The current trace array is authoritative after Plotly.react.
             // ScatterGL calcdata and _hoverdata may still describe the prior
             // pointer event; use them only when Dash left a non-indexable
             // encoded array instead of a normal/typed array.
             const hovered = (plot._hoverdata || []).find(function(point) {
-                return point && Number(point.curveNumber) === curveNumber && Number(point.pointNumber) === index;
+                return point && Number(point.curveNumber) === curveNumber && Number(point.pointNumber) === traceIndex;
             });
-            const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][index];
-            const rawValue = valueSeries[index] != null
-                ? valueSeries[index]
+            const calcPoint = plot.calcdata && plot.calcdata[curveNumber] && plot.calcdata[curveNumber][traceIndex];
+            const rawValue = valueSeries[traceIndex] != null
+                ? valueSeries[traceIndex]
                 : (calcPoint && calcPoint.y != null
                     ? calcPoint.y
                     : (hovered && hovered.y != null ? hovered.y : null));
             const value = Number(rawValue);
-            const magnitude = Math.abs(value);
-            const formatted = Number.isFinite(value)
-                ? (magnitude !== 0 && magnitude < 0.01 ? value.toPrecision(5) : value.toFixed(magnitude >= 100 ? 1 : magnitude >= 1 ? 2 : 4))
-                : 'n/a';
+            const formatted = formatSynchronizedValue(trace, value);
             (valuesByAxis[axisId] || (valuesByAxis[axisId] = [])).push((name || 'Value') + ': ' + formatted);
         });
         const activeAxes = new Set(Object.keys(valuesByAxis));
